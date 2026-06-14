@@ -1,0 +1,94 @@
+{
+  "manifestVersion": "1.0.0",
+  "name": "AmazonSPAPI",
+  "displayName": "Amazon SP-API 店铺分析插件",
+  "version": "0.2.0",
+  "description": "通过 Amazon Selling Partner API 只读获取店铺、商品、价格、订单、库存、销售指标、目录商品、费用预估、财务事件、报表和FBA入仓数据，供 AI 进行运营分析。默认不请求 RDT，不读取买家 PII。",
+  "author": "VCP Team",
+  "pluginType": "synchronous",
+  "entryPoint": {
+    "type": "nodejs",
+    "command": "node AmazonSPAPI.js"
+  },
+  "communication": {
+    "protocol": "stdio",
+    "timeout": 120000
+  },
+  "configSchema": {
+    "AMAZON_SPAPI_LWA_CLIENT_ID": {
+      "type": "string",
+      "description": "LWA Client ID / 客户端编码。",
+      "required": true
+    },
+    "AMAZON_SPAPI_LWA_CLIENT_SECRET": {
+      "type": "string",
+      "description": "LWA Client Secret / 客户端密钥。",
+      "required": true
+    },
+    "AMAZON_SPAPI_REFRESH_TOKEN": {
+      "type": "string",
+      "description": "自授权后生成的 Refresh Token。",
+      "required": true
+    },
+    "AMAZON_SPAPI_ENDPOINT": {
+      "type": "string",
+      "description": "SP-API endpoint。北美: https://sellingpartnerapi-na.amazon.com，欧洲: https://sellingpartnerapi-eu.amazon.com，远东: https://sellingpartnerapi-fe.amazon.com。",
+      "default": "https://sellingpartnerapi-na.amazon.com"
+    },
+    "AMAZON_SPAPI_MARKETPLACE_IDS": {
+      "type": "string",
+      "description": "默认 marketplaceId，多个用英文逗号分隔。美国站: ATVPDKIKX0DER。",
+      "default": "ATVPDKIKX0DER"
+    },
+    "AMAZON_SPAPI_SELLER_ID": {
+      "type": "string",
+      "description": "Seller ID / Merchant Token。Listing API 需要。",
+      "default": ""
+    },
+    "AMAZON_SPAPI_USER_AGENT": {
+      "type": "string",
+      "description": "SP-API User-Agent。",
+      "default": "VCP-AmazonSPAPI/0.1"
+    },
+    "AMAZON_SPAPI_TIMEOUT_MS": {
+      "type": "integer",
+      "description": "单次 HTTP 请求超时时间。",
+      "default": 60000
+    },
+    "AMAZON_SPAPI_MAX_RESULT_BYTES": {
+      "type": "integer",
+      "description": "返回给 AI 的最大 JSON 字节数，超出会截断。",
+      "default": 200000
+    },
+    "AMAZON_SPAPI_MAX_DOWNLOAD_BYTES": {
+      "type": "integer",
+      "description": "报表文档下载最大字节数。",
+      "default": 5242880
+    },
+    "AMAZON_SPAPI_STATE_DIR": {
+      "type": "string",
+      "description": "AmazonSPAPI 本地状态目录，用于保存 Reports API 任务和下载归档。",
+      "default": "Plugin/AmazonSPAPI/state"
+    },
+    "AMAZON_SPAPI_DEBUG": {
+      "type": "boolean",
+      "description": "是否在错误中附带更多调试信息。不会输出密钥。",
+      "default": false
+    }
+  },
+  "capabilities": {
+    "invocationCommands": [
+      {
+        "commandIdentifier": "AmazonSPAPI",
+        "description": "调用 Amazon Selling Partner API 读取店铺运营数据。默认只读，不请求 RDT，不读取买家 PII。\n参数:\n- command/action (string, 必需): get_status、get_marketplace_participations、get_orders、get_order_metrics、get_inventory_summaries、search_listings_items、get_listings_item、get_pricing、get_competitive_pricing、search_catalog_items、get_catalog_item、get_my_fees_estimate_for_sku、get_my_fees_estimate_for_asin、get_my_fees_estimates、list_financial_events、list_financial_event_groups、get_financial_events_for_order、create_report、get_report、get_reports、get_report_document、download_report_document、get_report_and_download、list_inbound_shipments、list_inbound_shipment_items、get_inbound_shipment_items、raw_get。\n- marketplaceIds (string|array, 可选): marketplaceId，默认使用 AMAZON_SPAPI_MARKETPLACE_IDS。美国站为 ATVPDKIKX0DER。\n- sellerId (string, Listing 命令可选): Seller ID，默认使用 AMAZON_SPAPI_SELLER_ID。\n- maxResults/pageSize (integer, 可选): 列表类接口返回数量上限。\n常用: get_order_metrics 看销售聚合，get_inventory_summaries 看库存，search_listings_items 看Listing，get_my_fees_estimate_for_sku 做费用预估，list_financial_events 看费用/退款/服务费，create_report/get_report_and_download 处理异步报表。\n调用格式示例:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」AmazonSPAPI「末」,\ncommand:「始」get_marketplace_participations「末」\n<<<[END_TOOL_REQUEST]>>>"
+      }
+    ]
+  },
+  "dependencies": {
+    "npm": [],
+    "system": []
+  },
+  "compatibility": {
+    "nodeVersion": ">=18.0.0"
+  }
+}

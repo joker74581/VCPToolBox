@@ -1,0 +1,116 @@
+# AmazonSPAPI ToolBox
+
+`AmazonSPAPI` is a read-only Amazon Selling Partner API plugin for seller operations analysis. It does not request Restricted Data Tokens by default and should not read buyer PII.
+
+## Safety
+
+- Do not reveal LWA client secrets, refresh tokens, access tokens, seller IDs, or raw config files.
+- Do not assume a default store or brand.
+- Use marketplace IDs, not seller IDs, for `marketplaceIds`.
+- Keep list queries small at first.
+
+## Common Commands
+
+- `get_status`
+- `get_marketplace_participations`
+- `get_order_metrics`
+- `get_orders`
+- `get_inventory_summaries`
+- `search_listings_items`
+- `get_listings_item`
+- `get_pricing`
+- `get_competitive_pricing`
+- `search_catalog_items`
+- `get_catalog_item`
+- `get_my_fees_estimate_for_sku`
+- `get_my_fees_estimate_for_asin`
+- `list_financial_events`
+- `create_report`
+- `get_report`
+- `get_report_and_download`
+- `list_inbound_shipments`
+- `get_inbound_shipment_items`
+
+## Health Check
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonSPAPI「末」,
+command:「始」get_status「末」,
+validate:「始」true「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## Store Check
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonSPAPI「末」,
+command:「始」get_marketplace_participations「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## Sales Metrics
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonSPAPI「末」,
+command:「始」get_order_metrics「末」,
+dateFrom:「始」2026-01-01「末」,
+dateTo:「始」2026-01-07「末」,
+granularity:「始」Day「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## Inventory
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonSPAPI「末」,
+command:「始」get_inventory_summaries「末」,
+details:「始」true「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## Listings
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonSPAPI「末」,
+command:「始」search_listings_items「末」,
+pageSize:「始」20「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+Single SKU:
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonSPAPI「末」,
+command:「始」get_listings_item「末」,
+sku:「始」<YOUR_SKU>「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## Fee Estimate
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonSPAPI「末」,
+command:「始」get_my_fees_estimate_for_sku「末」,
+sku:「始」<YOUR_SKU>「末」,
+listingPrice:「始」29.99「末」,
+currency:「始」USD「末」,
+isAmazonFulfilled:「始」true「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## Recommended Workflows
+
+- Store health: `get_marketplace_participations -> get_order_metrics -> get_inventory_summaries -> search_listings_items`
+- Sales trend: `get_order_metrics`
+- Inventory risk: `get_inventory_summaries + get_order_metrics`
+- Listing audit: `search_listings_items -> get_listings_item`
+- Pricing check: `get_pricing -> get_competitive_pricing`
+- Fee estimate: `get_my_fees_estimate_for_sku`
+- Reports: `create_report -> get_report -> get_report_and_download`

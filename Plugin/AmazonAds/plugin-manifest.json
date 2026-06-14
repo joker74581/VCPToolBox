@@ -1,0 +1,318 @@
+{
+  "manifestVersion": "1.0.0",
+  "name": "AmazonAds",
+  "version": "1.0.0",
+  "displayName": "Amazon Ads 原生 MCP 插件",
+  "description": "通过官方 Amazon Ads MCP Server 获取广告账户、广告活动和报表数据。第一版只做只读分析，agent 不需要直接拼 MCPO/OpenAPI 参数。",
+  "author": "VCP Team",
+  "pluginType": "hybridservice",
+  "entryPoint": {
+    "type": "nodejs",
+    "script": "lib/service.js"
+  },
+  "communication": {
+    "protocol": "direct",
+    "timeout": 600000
+  },
+  "configSchema": {
+    "AMAZON_ADS_MCP_CONFIG_PATH": {
+      "type": "string",
+      "description": "Amazon Ads MCP 配置文件路径。默认复用 MCPO custom-mcp-config/mcp-config.json。",
+      "default": "Plugin/MCPO/custom-mcp-config/mcp-config.json"
+    },
+    "AMAZON_ADS_MCP_SERVER_NAME": {
+      "type": "string",
+      "description": "mcp-config.json 里的 Amazon Ads MCP server 名称。",
+      "default": "amazon_ads"
+    },
+    "AMAZON_ADS_SAFE_MODE": {
+      "type": "boolean",
+      "description": "安全模式。第一版应保持 true，只允许只读查询和报表。",
+      "default": true
+    },
+    "AMAZON_ADS_REQUEST_TIMEOUT_MS": {
+      "type": "number",
+      "description": "单次 Amazon Ads MCP 请求超时。",
+      "default": 120000
+    },
+    "AMAZON_ADS_REPORT_POLL_INTERVAL_MS": {
+      "type": "number",
+      "description": "报表轮询间隔。",
+      "default": 30000
+    },
+    "AMAZON_ADS_REPORT_MAX_POLL_MS": {
+      "type": "number",
+      "description": "报表最长轮询时间。",
+      "default": 600000
+    },
+    "AMAZON_ADS_REPORT_CREATE_MIN_INTERVAL_MS": {
+      "type": "number",
+      "description": "两次创建 Amazon Ads 报表任务之间的最小间隔，用于降低 429 限流风险。",
+      "default": 3000
+    },
+    "AMAZON_ADS_PROBE_MAX_CANDIDATE_FIELDS": {
+      "type": "number",
+      "description": "probe_report_fields 单次最多探测的候选字段数量。超过数量会自动截断并提示后续串行探测。",
+      "default": 4
+    },
+    "AMAZON_ADS_MAX_DOWNLOAD_BYTES": {
+      "type": "number",
+      "description": "单个报表下载预览的最大字节数。",
+      "default": 5242880
+    },
+    "AMAZON_ADS_DEFAULT_ACCOUNT_NAME": {
+      "type": "string",
+      "description": "默认广告账户名称。",
+      "default": "<YOUR_ACCOUNT_NAME>"
+    },
+    "AMAZON_ADS_DEFAULT_ACCOUNT_ID": {
+      "type": "string",
+      "description": "默认 Amazon Ads global advertising account id。",
+      "default": "<YOUR_ADS_ACCOUNT_ID>"
+    },
+    "AMAZON_ADS_DEFAULT_PROFILE_ID": {
+      "type": "string",
+      "description": "默认 profileId。",
+      "default": "<YOUR_PROFILE_ID>"
+    },
+    "AMAZON_ADS_DEFAULT_ENTITY_ID": {
+      "type": "string",
+      "description": "默认 entityId。",
+      "default": "<YOUR_ENTITY_ID>"
+    },
+    "AMAZON_ADS_DEFAULT_MARKETPLACE": {
+      "type": "string",
+      "description": "默认 marketplace。",
+      "default": "US"
+    },
+    "AMAZON_ADS_STATE_DIR": {
+      "type": "string",
+      "description": "AmazonAds 运行状态目录，用于保存报表字段白名单缓存、报表任务索引和物理归档。",
+      "default": "Plugin/AmazonAds/state"
+    },
+    "AMAZON_ADS_OPERATION_PASSWORD": {
+      "type": "string",
+      "description": "AmazonAds 插件自己的写操作口令。留空时 apply_* 真实写操作全部拒绝；查询和 propose 不受影响。",
+      "default": ""
+    },
+    "AMAZON_ADS_ENABLE_TOKEN_REFRESH": {
+      "type": "boolean",
+      "description": "是否允许 AmazonAds 插件执行 refresh_token 并写回 MCP 配置文件。默认关闭；开启后仍需配置 Amazon OAuth 凭据。",
+      "default": false
+    },
+    "AMAZON_ADS_AUTO_REFRESH_TOKEN": {
+      "type": "boolean",
+      "description": "是否在插件初始化后自动刷新 token，并按 AMAZON_ADS_TOKEN_REFRESH_INTERVAL_SECONDS 定时刷新。仅在 AMAZON_ADS_ENABLE_TOKEN_REFRESH=true 时生效。",
+      "default": false
+    },
+    "AMAZON_ADS_TOKEN_REFRESH_INTERVAL_SECONDS": {
+      "type": "number",
+      "description": "插件内置自动刷新 token 的间隔秒数。Amazon access token 通常 3600 秒过期，默认 3000 秒。",
+      "default": 3000
+    },
+    "AMAZON_CLIENT_ID": {
+      "type": "string",
+      "description": "Amazon OAuth client_id，用于插件内置 refresh_token。也会写入 Amazon Ads MCP headers 的 ClientId。",
+      "default": ""
+    },
+    "AMAZON_CLIENT_SECRET": {
+      "type": "string",
+      "description": "Amazon OAuth client_secret，用于插件内置 refresh_token。不要提交真实值。",
+      "default": ""
+    },
+    "AMAZON_REFRESH_TOKEN": {
+      "type": "string",
+      "description": "Amazon OAuth refresh_token，用于换取短期 access token。插件不会把该值写入 MCP 配置文件。",
+      "default": ""
+    },
+    "AMAZON_ADS_TOKEN_REFRESH_PASSWORD": {
+      "type": "string",
+      "description": "可选的插件内置 token 刷新口令。留空时只要开启刷新且配置凭据即可调用 refresh_token。",
+      "default": ""
+    },
+    "AMAZON_ADS_CONTEXT_MODE": {
+      "type": "string",
+      "description": "刷新 token 时写入 MCP headers 的账户上下文模式。FIXED 会写入默认 profile/account；其他值会移除固定账户 headers。",
+      "default": "FIXED"
+    },
+    "AMAZON_ADS_MANAGER_ACCOUNT_ID": {
+      "type": "string",
+      "description": "可选 manager account id；仅 AMAZON_ADS_CONTEXT_MODE=FIXED 时写入 header。",
+      "default": ""
+    },
+    "AMAZON_ADS_TOKEN_URL": {
+      "type": "string",
+      "description": "Amazon OAuth token endpoint。通常无需修改。",
+      "default": "https://api.amazon.com/auth/o2/token"
+    },
+    "DebugMode": {
+      "type": "boolean",
+      "description": "是否开启 AmazonAds 插件调试日志。",
+      "default": false
+    }
+  },
+  "capabilities": {
+    "invocationCommands": [
+      {
+        "command": "get_status",
+        "description": "检查 AmazonAds 插件配置、原生 MCP 初始化状态、固定账户上下文和默认账户。不会打印 access token。"
+      },
+      {
+        "command": "refresh_token",
+        "description": "可选内置 token 刷新。仅 AMAZON_ADS_ENABLE_TOKEN_REFRESH=true 且配置 Amazon OAuth 凭据后可用；写回 MCP 配置文件，不返回 access token。"
+      },
+      {
+        "command": "list_capabilities",
+        "description": "列出 AmazonAds 当前开放的站内广告查询、报表、操作能力，以及每类能力的风险和确认要求。"
+      },
+      {
+        "command": "list_accounts",
+        "description": "只读获取当前 token 可访问的 Amazon Ads 广告账户列表。可选 maxResults、nextToken。"
+      },
+      {
+        "command": "get_account",
+        "description": "只读获取指定广告账户详情。默认使用配置中的 AMAZON_ADS_DEFAULT_ACCOUNT_NAME；可传 adsAccountId/accountId。"
+      },
+      {
+        "command": "call_read_tool",
+        "description": "受限原始只读入口。只允许内部 read whitelist 工具，用于官方新增工具未封装时临时查询。"
+      },
+      {
+        "command": "list_campaigns",
+        "description": "只读查询广告活动列表。默认使用配置中的账户和 marketplace，默认 adProduct=SPONSORED_PRODUCTS。若配置为 Fixed Account Context，插件不会在 body 里重复传 accessRequestedAccount。可传 maxResults、state、campaignId。"
+      },
+      {
+        "command": "list_ad_groups",
+        "description": "只读查询广告组。支持 campaignId、state、maxResults。"
+      },
+      {
+        "command": "list_ads",
+        "description": "只读查询广告。支持 campaignId、adGroupId、state、maxResults。"
+      },
+      {
+        "command": "list_targets",
+        "description": "只读查询 target/关键词/商品投放。支持 campaignId、adGroupId、targetId、state、keyword、maxResults。"
+      },
+      {
+        "command": "check_product_eligibility",
+        "description": "只读检查商品广告资格，用于排查 ASIN/SKU 为什么不能投放。"
+      },
+      {
+        "command": "get_billing_status",
+        "description": "只读查询账单/支付状态通知，用于排查广告投放受限原因。"
+      },
+      {
+        "command": "list_account_users",
+        "description": "只读列出广告账户用户。"
+      },
+      {
+        "command": "create_report",
+        "description": "只读创建 Amazon Ads 报表任务。默认使用配置中的账户，需传 fields 时必须使用 Amazon Ads MCP 字段格式，例如 date.value、campaign.id、metric.clicks。"
+      },
+      {
+        "command": "retrieve_report",
+        "description": "只读查询报表状态。传 reportId 或 reportIds。PENDING/PROCESSING 不是失败。可传 download=true，在报表完成后下载并解析 GZIP_JSON。默认返回紧凑 agent 负载：summary_markdown、report_jobs、下载摘要和导出文件路径；原始 MCP 响应/下载预览仅在 result_mode=debug/full/raw 或 include_debug=true 时返回。"
+      },
+      {
+        "command": "list_report_jobs",
+        "description": "列出本地物理报表任务索引。支持按 jobId、reportId、status、reportCommand、preset、marketplace、日期范围、limit 过滤；只返回轻量摘要，不读取全量数据。"
+      },
+      {
+        "command": "get_report_job",
+        "description": "读取单个本地报表任务摘要。传 jobId 或 reportId；不会读取 rows.jsonl 全量数据。"
+      },
+      {
+        "command": "continue_report_job",
+        "description": "跨对话续查已有报表任务。传 jobId 或 reportId，查询 Amazon 报表状态；完成后下载并写入本地 JSON/Markdown 归档。有 rows 时会自动导出 xlsx/csv。默认只返回紧凑 agent 摘要、row_summary、导出文件路径和下一步；原始下载 rows/preview 仅在 debug/raw 模式返回。"
+      },
+      {
+        "command": "read_report_artifact",
+        "description": "按需读取本地报表归档。artifact 可选 summary、rows、metadata、request、report、downloads；rows 默认分页且返回紧凑业务字段，单次最多 500 行；downloads 默认只返回摘要，只有 format=raw/debug 才返回完整调试归档。"
+      },
+      {
+        "command": "export_report_artifact",
+        "description": "把已完成的本地报表导出为人类可读文件。传 jobId 或 reportId，format 可选 xlsx/csv/all；默认导出 xlsx，使用紧凑业务字段，避免重复别名字段。"
+      },
+      {
+        "command": "get_report_data",
+        "description": "推荐给 Agent 的高层取数入口。按 reportKind、dateFrom/dateTo、dataNeed 先查归档、再续查处理中任务、最后创建新报表。默认返回 summary_markdown + 紧凑 report_result，不直接塞原始 rows/downloads；分析行数据用 read_report_artifact artifact=rows 或 aggregate_report_archives。reportKind=placement 表示广告位表现；keyword/target 表示投放关键词或 Target 表现；完整客户搜索词/关键词成交报表请用 reportKind=search_term dataNeed=keyword_report_full。"
+      },
+      {
+        "command": "find_report_archives",
+        "description": "按语义查找本地报表归档。支持 reportKind=campaign/plan/placement/keyword/target/search_term/keyword_report/all、dateFrom/dateTo、status、marketplace、reportCommand；keyword_report 兼容后台关键词报表的 target/search term 混合口径；返回去重后的候选 jobId，不读取大文件。"
+      },
+      {
+        "command": "build_report_context",
+        "description": "为分析任务构建干净上下文包。按 reportKind 和日期范围读取匹配归档的 summary，可选 includeRows/mode=summary_with_rows 分页附带少量 rows；过滤掉 request/report/downloads 等重复元信息。归档读取层支持字段别名模糊匹配。"
+      },
+      {
+        "command": "aggregate_report_archives",
+        "description": "汇总多个已归档报表的 rows。支持 groupBy、metrics、dateFrom/dateTo、reportKind，自动排除重复 jobKey 并按行指纹去重，返回干净聚合表。groupBy/metrics 支持字段别名模糊匹配并返回 field_mapping。"
+      },
+      {
+        "command": "list_report_presets",
+        "description": "列出报表 preset、已验证字段和候选字段。"
+      },
+      {
+        "command": "probe_report_fields",
+        "description": "用短日期报表探测候选字段，成功字段写入本地白名单缓存，失败字段返回明确原因。"
+      },
+      {
+        "command": "get_report_status",
+        "description": "retrieve_report 的别名，只查询报表状态。"
+      },
+      {
+        "command": "download_report",
+        "description": "retrieve_report download=true 的别名，在报表完成后下载并解析。"
+      },
+      {
+        "command": "get_campaign_performance",
+        "description": "只读获取最近 N 天 Campaign 表现。默认快速创建/复用报表并返回紧凑 reportId/status/summary_markdown，不长时间阻塞；再次用相同参数或传 reportId 可继续查询并在完成后下载。完成后自动导出 xlsx/csv；原始下载预览只在 debug/raw 模式返回。"
+      },
+      {
+        "command": "get_placement_performance",
+        "description": "只读获取 Sponsored Products 广告位 / Campaign Placement 表现，使用 placement_basic preset。字段包含 placementClassification，可用于查看 Top of Search、Product Pages、Rest of Search 等广告位表现。默认返回紧凑摘要，完成后自动导出 xlsx/csv。"
+      },
+      {
+        "command": "get_target_performance",
+        "description": "只读获取 target/关键词/商品投放表现，使用 target_basic preset。要拿关键词或目标 ASIN 明细，必须先用 probe_report_fields 验证 target.value/target.matchType 等维度，并在 fields 中显式传入；否则默认字段不能当作 target 粒度数据。默认返回紧凑摘要，完成后自动导出 xlsx/csv。"
+      },
+      {
+        "command": "get_search_term_performance",
+        "description": "只读获取搜索词表现，使用 search_term_basic preset。要拿搜索词明细，必须先用 probe_report_fields 验证 searchTerm.value/searchTerm.text/customerSearchTerm.value 等维度，并在 fields 中显式传入。默认返回紧凑摘要，完成后自动导出 xlsx/csv。"
+      },
+      {
+        "command": "propose_bid_changes",
+        "description": "只生成出价调整建议，不执行 Amazon Ads 写操作。"
+      },
+      {
+        "command": "propose_state_changes",
+        "description": "只生成暂停/启用建议，不执行 Amazon Ads 写操作。"
+      },
+      {
+        "command": "propose_budget_changes",
+        "description": "只生成预算调整建议，不执行 Amazon Ads 写操作。"
+      },
+      {
+        "command": "apply_target_bid_changes",
+        "description": "确认后执行 target 出价调整。默认 dryRun；真实执行必须 dryRun=false，且 requireAdmin 等于插件配置的 AMAZON_ADS_OPERATION_PASSWORD。"
+      },
+      {
+        "command": "apply_entity_state_changes",
+        "description": "确认后执行 campaign/target 状态调整。默认 dryRun；真实执行必须 dryRun=false，requireAdmin 等于插件操作口令，且 doubleConfirm=true。"
+      },
+      {
+        "command": "apply_campaign_budget_changes",
+        "description": "确认后执行 campaign 预算调整。默认 dryRun；真实执行必须 dryRun=false，requireAdmin 等于插件操作口令，且 doubleConfirm=true。"
+      },
+      {
+        "command": "list_official_mcp_guides",
+        "description": "通过原生 MCP prompts/list 探测 Amazon Ads 官方 Skill/Prompt 指南。若官方暂不支持，会返回 not_supported，不影响工具调用。"
+      },
+      {
+        "command": "get_official_mcp_guide",
+        "description": "通过原生 MCP prompts/get 获取指定官方 Skill/Prompt。先调用 list_official_mcp_guides 获取名称。"
+      }
+    ]
+  }
+}

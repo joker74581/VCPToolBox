@@ -1,0 +1,244 @@
+# MCPO 插件调用手册
+
+MCPO 的职责是作为 VCP 内部的 MCP 工具桥接层。Agent 直接调用 `MCPO` 插件，再通过 `action` 去发现、查询、调用和管理 MCP 工具。
+
+## 核心规则
+
+- 插件入口写法固定为 `tool_name:「始」MCPO「末」`。
+- 所有参数值都要用新的括号：`「始」...「末」`。
+- `call_tool` 的 `arguments` 必须是 JSON 字符串，不是 JSON 对象。
+- 如果不确定工具参数，先用 `get_tool_info`。
+- 配置改动后，优先用 `discover_tools`；热重载关闭时再用 `manage_server restart`。
+
+## 默认可见的 MCP 服务
+
+当前 `Plugin/MCPO/mcp-config.json` 默认会加载这些服务：
+
+- `time`
+- `context7`
+- `amazon_ads`
+
+其中前两个工具名通常比较稳定，`amazon_ads` 以实际 `list_tools` 的结果为准。
+
+## 基本调用模板
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」list_tools「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## 1. 查看所有可用 MCP 工具
+
+当你想知道当前 MCPO 暴露了哪些工具时，先这样调用：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」list_tools「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+返回内容会包含工具名、简介、参数信息和对应服务名。
+
+## 2. 查看单个工具详情
+
+当你已经知道工具名，但不确定参数时，用 `get_tool_info`。
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」get_tool_info「末」,
+tool_name_param:「始」time_get_current_time「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+适合在正式调用前确认：
+
+- 参数名
+- 必填字段
+- 默认值
+- 工具说明
+
+## 3. 调用具体 MCP 工具
+
+`tool_name_param` 必须写成 `server_工具名`。
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」call_tool「末」,
+tool_name_param:「始」time_get_current_time「末」,
+arguments:「始」{"timezone":"Asia/Shanghai"}「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+### 3.1 时间服务
+
+`time` 服务里常见的工具是：
+
+- `time_get_current_time`
+- `time_convert_time`
+
+获取当前时间：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」call_tool「末」,
+tool_name_param:「始」time_get_current_time「末」,
+arguments:「始」{"timezone":"Asia/Shanghai"}「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+时区转换：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」call_tool「末」,
+tool_name_param:「始」time_convert_time「末」,
+arguments:「始」{"source_timezone":"Asia/Shanghai","time":"14:30","target_timezone":"UTC"}「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+### 3.2 Context7 文档服务
+
+`context7` 服务里常见的工具是：
+
+- `context7_resolve-library-id`
+- `context7_get-library-docs`
+
+先解析库 ID：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」call_tool「末」,
+tool_name_param:「始」context7_resolve-library-id「末」,
+arguments:「始」{"libraryName":"react"}「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+再取文档：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」call_tool「末」,
+tool_name_param:「始」context7_get-library-docs「末」,
+arguments:「始」{"context7CompatibleLibraryID":"/facebook/react","topic":"hooks","tokens":4000}「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+### 3.3 Amazon Ads 服务
+
+`amazon_ads` 的具体工具名取决于外部 MCP 服务本身。正确流程是：
+
+1. 先执行 `list_tools`
+2. 找到以 `amazon_ads_` 开头的工具名
+3. 再用 `call_tool` 调用
+
+不要在手册里硬写未知参数，先查 `get_tool_info`。
+
+## 4. 管理 MCPO 服务
+
+`manage_server` 用于控制 MCPO 进程状态。
+
+可用操作：
+
+- `start`
+- `stop`
+- `restart`
+- `status`
+- `reload_config`
+
+查看状态：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」manage_server「末」,
+operation:「始」status「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+启动服务：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」manage_server「末」,
+operation:「始」start「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+重启服务：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」manage_server「末」,
+operation:「始」restart「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+重新加载配置：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」manage_server「末」,
+operation:「始」reload_config「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## 5. 重新发现工具
+
+当 `mcp-config.json` 改了，或者新增/删除了 MCP 服务时，用这个动作刷新工具列表。
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」discover_tools「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## 6. 列出可用配置文件
+
+用于确认当前 MCPO 正在使用哪个配置文件，以及系统里还有哪些可选配置。
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」list_configs「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## 7. 健康检查
+
+用于快速确认 MCPO 服务和已加载 MCP 工具是否正常。
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」MCPO「末」,
+action:「始」health_check「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## 常见用法顺序
+
+- 先看服务是否活着：`health_check`
+- 再列出工具：`list_tools`
+- 不确定参数时：`get_tool_info`
+- 真正执行时：`call_tool`
+- 改配置后：`discover_tools`
+- 需要重启服务时：`manage_server`
+
+## 注意事项
+
+- 这是单插件说明，不要把它写入 `toolbox_map.json`。
+- 不要把真实密钥写进手册。
+- `call_tool` 的参数必须是可解析的 JSON 字符串。
+- 如果工具名带下划线，仍然按完整的 `server_工具名` 传入，不要手动拆分。

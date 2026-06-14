@@ -18,5 +18,29 @@
   "VCPContactToolBox": {
     "file": "ContactToolBox.txt",
     "description": "该收纳箱收纳了各种通讯、社交、消息推送，话题管理，日程管理，日常小工具相关的工具，用于动态向 Agent 提供说明。"
+  },
+  "CommunicationToolbox": {
+    "file": "CommunicationToolbox.txt",
+    "description": "这里收纳了用于自进化追踪、跨话题通讯及日常提醒的核心工具。"
+  },
+  "VCPChromebridgeToolBox": {
+    "file": "ChromebridgeToolBox.txt",
+    "description": "ChromeBridge 是底层真实浏览器桥接工具，用于通用网页观察、点击、输入、等待、下载和调试。ProductSelector 等业务插件内部会调用 ChromeBridge；选品、关键词、Amazon 评论任务优先调用业务插件，不直接调用 ChromeBridge。"
+  },
+  "VCPProductSelectorToolBox": {
+    "file": "ProductSelectorToolBox.txt",
+    "description": "ProductSelector 选品数据入口，用于产品调研、关键词研究、ASIN 页面信息和评论分析。自动选品编排请使用 VCPAutoProductSelectionToolBox。"
+  },
+  "VCPAutoProductSelectionToolBox": {
+    "file": "AutoProductSelectionToolBox.txt",
+    "description": "AutoProductSelection 自动选品状态机、runs 队列、锁、AgentAssistant 派发与归档说明。"
+  },
+  "VCPAmazonAdsToolBox": {
+    "file": "AmazonAdsToolBox.txt",
+    "description": "AmazonAds 原生 MCP 广告分析插件说明，用于广告账户、活动列表、最近 N 天 Campaign 表现报表、官方 MCP Skill/Prompt 探测和只读分析。"
+  },
+  "VCPAmazonSPAPIToolBox": {
+    "file": "AmazonSPAPIToolBox.txt",
+    "description": "AmazonSPAPI 店铺运营分析插件说明，用于 Amazon SP-API 店铺、订单、库存、Listing、价格和销售聚合指标的只读分析。"
   }
 }

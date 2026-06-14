@@ -1,0 +1,216 @@
+# ChromeBridge 浏览器桥接工具箱
+
+ChromeBridge 是底层真实 Chrome 浏览器桥接工具，用于通用网页观察和操作。
+
+重要分工：
+
+- ProductSelector 已经在插件内部调用 ChromeBridge。做卖家精灵选品、关键词选品、Amazon 评论抓取时，优先调用 `ProductSelector`，不要让 agent 直接调用 ChromeBridge 去开页面、读整页、抽评论。
+- 只有在用户明确要求“操作浏览器 / 查看当前网页 / 点击页面 / 登录网页 / 下载网页文件 / 调试页面 DOM”时，才直接使用 ChromeBridge。
+- ChromeBridge 返回的 `page_info` 可能很长；业务插件能结构化处理时，优先用业务插件，不要让 agent 从完整页面文本里手工提取。
+
+最小规则：
+
+- 每一轮默认只发送 1 个 ChromeBridge 工具请求。
+- 必须等待返回结果，再决定下一步。
+- 先观察，再操作。页面变化后旧 `vcp-id-*` 可能失效。
+- 遇到验证码、短信码、MFA、风控提示时暂停，让用户人工处理。
+
+[===vcp_fold:0.25::desc:ChromeBridge 浏览器 网页 操作 open_url get_page_info 点击 输入 vcp-id 页面观察 远程浏览器===]
+
+## 基础浏览器操作
+
+打开页面：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ChromeBridge「末」
+command:「始」open_url「末」
+url:「始」https://www.example.com「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+`open_url` 默认会等待页面内容返回，后面不要立刻追加 `get_page_info`。
+
+获取当前页面：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ChromeBridge「末」
+command:「始」get_page_info「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+仅在没有最新页面内容、页面状态不确定、或旧 `vcp-id` 失效时调用。
+
+输入文本：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ChromeBridge「末」
+command:「始」type「末」
+target:「始」vcp-id-3「末」
+text:「始」关键词「末」
+mode:「始」replace「末」
+blur_after:「始」true「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+点击：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ChromeBridge「末」
+command:「始」click「末」
+target:「始」vcp-id-5「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+复杂页面优先使用最新 `vcp-id-*`，避免文本 target 命中隐藏重复按钮。点击返回后先看 `page_state`。
+
+选择下拉选项：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ChromeBridge「末」
+command:「始」select_option「末」
+target:「始」vcp-id-8「末」
+option:「始」家居厨房「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+[===vcp_fold:0.35::desc:ChromeBridge 等待 页面状态 wait_for_text wait_for_title wait_for_url wait_for_element 登录 跳转 状态确认===]
+
+## 等待与状态确认
+
+等待命令必须单独调用，不要和点击/输入同时发送。
+
+优先看上一条动作返回的 `page_state.title/url/is_login_like/errors`。如果仍不确定，再调用等待命令。
+
+等待标题：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ChromeBridge「末」
+command:「始」wait_for_title「末」
+text:「始」卖家精灵后台「末」
+timeout:「始」20000「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+等待 URL：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ChromeBridge「末」
+command:「始」wait_for_url「末」
+text:「始」dashboard「末」
+timeout:「始」20000「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+等待元素：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ChromeBridge「末」
+command:「始」wait_for_element「末」
+target:「始」vcp-id-3「末」
+timeout:「始」15000「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+登录推荐节奏：
+
+1. 单独 `open_url` 打开登录页。
+2. 读取账号框、密码框、登录按钮的最新 `vcp-id`。
+3. 输入账号、输入密码、点击登录可以作为一个短事务，但前提是 DOM 稳定且 vcp-id 是最新的。
+4. 返回后先看 `page_state.title/url/errors/is_login_like`。
+5. 不确定时再单独 `wait_for_title`、`wait_for_url` 或 `get_page_info`。
+
+[===vcp_fold:0.45::desc:ChromeBridge 表格 抽取 extract_table DOM HTML 下载 download_click 清理标签 close_tabs_opened_by_bridge===]
+
+## 表格、下载和标签页
+
+表格结构化抽取：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ChromeBridge「末」
+command:「始」extract_table「末」
+selector:「始」table「末」
+max_rows:「始」20「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+当页面存在稳定表格 DOM，且需要行列绑定结果时，优先用 `extract_table`，不要从 `page_info` Markdown 里手工切表格。
+
+卖家精灵表格一般不要由 agent 直接抽取，优先调用 ProductSelector；只有调试 ProductSelector 解析器时才直接用 ChromeBridge。
+
+下载：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ChromeBridge「末」
+command:「始」download_click「末」
+target:「始」导出「末」
+timeout:「始」120000「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+清理由 ChromeBridge 打开的标签页：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ChromeBridge「末」
+command:「始」close_tabs_opened_by_bridge「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+低 token 参数：
+
+- `max_rows`：限制行数。
+- `columns` / `fields`：只保留指定列名或 1-based 列号。
+- `max_cell_chars`：限制每格文本长度。
+- `include_links=false`：默认不带链接明细。
+- `include_html=false`：默认不返回 HTML；只在调试解析器时使用。
+
+[===vcp_fold:0.65::desc:ChromeBridge 批量命令 command1 command2 on_error 短事务 禁止连续 open_url click wait_for_text===]
+
+## 批量命令限制
+
+默认不要批量。只有在以下条件同时满足时才允许使用批量：
+
+- 已经从上一条返回的 `page_info` 拿到了最新 `vcp-id`。
+- 所有步骤都发生在同一个稳定页面 DOM 上。
+- 不包含 `open_url`、`get_page_info`、`wait_for_text`、`wait_for_title`、`wait_for_url`。
+- 每一步目标明确，且失败时应立即中断。
+
+登录页允许的短事务示例：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ChromeBridge「末」
+command1:「始」type「末」
+target1:「始」vcp-id-12「末」
+text1:「始」账号「末」
+command2:「始」type「末」
+target2:「始」vcp-id-13「末」
+text2:「始」密码「末」
+command3:「始」click「末」
+target3:「始」vcp-id-16「末」
+on_error:「始」return_page_info「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+禁止模式：
+
+- `open_url` 后同一轮继续 `get_page_info`。
+- `open_url` 后同一轮继续输入、点击。
+- `click` 后同一轮继续 `wait_for_text`。
+- 先用文本 target 点击失败后，不观察页面就继续复用同一个文本 target。
+
+`on_error`：
+
+- `stop`：默认，失败即中断。
+- `return_page_info`：失败即中断，并尽量返回当前页面内容。
+- `continue`：继续后续步骤，只用于非关键清理动作。

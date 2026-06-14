@@ -1,0 +1,57 @@
+# Auto Product Selection Strategy Profile Example
+
+Copy this file to `AutoSelectionStrategyProfile.md` and customize it for your marketplace and workflow. Do not commit private brand, supplier, account, or budget details.
+
+## Marketplace
+
+- `marketplace`: Amazon US
+- `price_band`: 25-150 USD
+- `capital_style`: small team, light inventory, low initial risk
+- `target_candidate_window`: 1-3
+
+## Search Direction
+
+- `scan_theme`: broad product discovery inside safe and compliant categories
+- `strategic_angle`: products with clear use cases and improvement opportunities
+- `why_now`: quickly identify ideas worth deeper validation
+
+## Preferred Scenarios
+
+- home organization
+- kitchen utility
+- home office productivity
+- travel convenience
+- pet home convenience
+- gardening or hobby accessories
+
+## Seed Keyword Rules
+
+- Use at least three English seed keywords.
+- Mix scenario terms, pain-point terms, product-form terms, and user terms.
+- Avoid repeated synonyms.
+
+## Positive Signals
+
+- clear use case
+- meaningful review complaints
+- manageable logistics
+- visible differentiation path
+- price supports margin
+- evidence is traceable
+
+## Negative Signals
+
+- low price with no margin
+- heavy or fragile item
+- regulated or medical claims
+- dominated by strong brands
+- requires complex after-sales support
+- weak evidence
+
+## Report Style
+
+- one-sentence conclusion first
+- short candidate table
+- evidence links or source notes
+- real risks
+- recommended next validation step

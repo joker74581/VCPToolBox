@@ -1,0 +1,123 @@
+# AmazonAds ToolBox
+
+`AmazonAds` reads Amazon Ads account structure and report data through an Amazon Ads MCP configuration. This toolbox is account-neutral. Use placeholders until the user has configured their own account.
+
+## Safety
+
+- Do not reveal access tokens, refresh tokens, client secrets, MCP headers, or signed report URLs.
+- Do not assume a default seller account. Ask the user to configure or confirm `accountName`, `profileId`, and `marketplace`.
+- Do not create duplicate reports for the same account, date range, report kind, and field set.
+- Write operations must use `propose_*` first and require explicit user approval plus the plugin operation password before `apply_*`.
+
+## Default Placeholders
+
+```text
+accountName: <YOUR_ACCOUNT_NAME>
+adsAccountId: <YOUR_ADS_ACCOUNT_ID>
+profileId: <YOUR_PROFILE_ID>
+entityId: <YOUR_ENTITY_ID>
+marketplace: US
+```
+
+## Basic Checks
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_status「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_capabilities「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_accounts「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## Direct Structure Queries
+
+Use these when the user asks what is currently configured:
+
+- `list_campaigns`
+- `list_ad_groups`
+- `list_ads`
+- `list_targets`
+- `check_product_eligibility`
+- `get_billing_status`
+- `list_account_users`
+
+Example:
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_campaigns「末」,
+accountName:「始」<YOUR_ACCOUNT_NAME>「末」,
+marketplace:「始」US「末」,
+maxResults:「始」50「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+Direct structure queries do not answer historical performance questions.
+
+## Report Queries
+
+Use reports for impressions, clicks, cost, sales, orders, ACOS, ROAS, placements, targets, and search terms.
+
+Preferred high-level command:
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_report_data「末」,
+reportKind:「始」campaign「末」,
+dateFrom:「始」2026-01-01「末」,
+dateTo:「始」2026-01-07「末」,
+accountName:「始」<YOUR_ACCOUNT_NAME>「末」,
+marketplace:「始」US「末」,
+mode:「始」get_or_create「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+Common `reportKind` values:
+
+- `campaign`
+- `placement`
+- `target`
+- `search_term`
+- `keyword`
+
+Useful archive commands:
+
+- `list_report_jobs`
+- `read_report_artifact`
+- `export_report_artifact`
+- `aggregate_report_archives`
+
+## Field Probe Rule
+
+Only probe fields when the user asks, when Amazon rejects a field, or when schema uncertainty blocks the task. Keep probe batches small.
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」probe_report_fields「末」,
+preset:「始」campaign_basic「末」,
+candidateFields:「始」budgetCurrency.value,metric.sales「末」,
+days:「始」1「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## Token Refresh
+
+Call `refresh_token` only if plugin token refresh is enabled and the user requests it, or if a 401/token error occurs and `get_status` says refresh is available.
+
+If `tokenRefresh.enabled=false`, tell the user to check the external token refresher or MCP config.

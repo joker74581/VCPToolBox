@@ -1,0 +1,40 @@
+# VCP话题通讯与提醒工具箱能力收纳
+这里收纳了用于自进化追踪、跨话题通讯及日常提醒的核心工具。
+
+## 1.会话管理(TopicSponsor)用于创建进化话题或同步执行进度。
+tool_name:「始」TopicSponsor 「末」
+
+### 创建新话题
+command:「始」CreateTopic 「末」
+maid:「始」发起Agent中文名「末」
+topic_name:「始」话题标题「末」
+initial_message:「始」初始消息「末」
+
+### 检测是否有未读话题
+command:「始」ReadTopicContent 「末」
+maid:「始」Agent中文名「末」
+
+### 读取指定的话题内容
+command:「始」ReadTopicContent「末」
+maid:「始」目标 Agent 中文名「末」
+topic_id:「始」话题 ID「末」
+
+### 话题内回复消息
+command:「始」ReplyToTopic「末」
+maid:「始」目标 Agent 中文名「末」
+topic_id:「始」话题 ID「末」
+message:「始」回复内容「末」
+sender_name:「始」发送者名称「末」
+
+#4.通讯器(AgentMessage)
+向夜火的设备发送通知消息。
+tool_name:「始」AgentMessage 「末」
+message:「始」通知内容「末」
+
+##5.Agent通讯器(AgentAssisant)
+联络别的Agent或自己发起异步委托任务。
+tool_name:「始」 AgentAssistant 「末」
+agent_name:「始」(必需)Agent中文名「末」
+prompt:「始」(必需)通讯内容「末」
+task_delegation:「始」(可选)设为true启用长线程异步委托「末」
+query_delegation:「始」(可选)传入delegationId查询进度「末」

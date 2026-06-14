@@ -1,0 +1,108 @@
+# AutoProductSelection ToolBox
+
+`AutoProductSelection` manages the automated product-selection state machine. It does not scrape product data itself. Use `ProductSelector` or another data plugin for marketplace evidence.
+
+## Runtime Directory
+
+```text
+Plugin/AutoProductSelection/runs/
+  brief/
+  raw/
+  scored/
+  failed/
+  archived/
+  locks/
+```
+
+`runs/` is runtime data. Do not commit real run outputs to a public repository.
+
+## Roles
+
+- Coordinator: creates briefs, dispatches workers, reads queue state, archives outcomes.
+- Scout worker (`worker=hawkeye`): reads brief and writes raw or failed.
+- Reviewer worker (`worker=forge`): reads raw and writes scored or failed.
+
+AgentAssistant names are configured with:
+
+```text
+AUTO_SELECTION_SCOUT_AGENT_NAME
+AUTO_SELECTION_REVIEWER_AGENT_NAME
+```
+
+## Strategy File
+
+The strategy file is not a run file:
+
+```text
+Plugin/AutoProductSelection/AutoSelectionStrategyProfile.md
+```
+
+Read it with a normal file-read tool before creating a new SelectionBrief. Do not call `auto_selection_read_run_file` for the strategy file.
+
+## Queue Status
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_queue_status「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## Write A Brief
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_write_run_file「末」,
+stage:「始」brief「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」,
+content:「始」# SelectionBrief
+...
+「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## Dispatch Scout
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_prepare_dispatch「末」,
+worker:「始」hawkeye「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+Immediately call AgentAssistant with the returned `agent_assistant_request`.
+
+## Dispatch Reviewer
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_prepare_dispatch「末」,
+worker:「始」forge「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## Read Handoff File
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_read_run_file「末」,
+stage:「始」raw「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## Cleanup
+
+- `auto_selection_move_run_file`
+- `auto_selection_delete_run_file`
+- `auto_selection_cleanup_run`
+- `auto_selection_mark_worker_missing_output`
+- `auto_selection_clear_locks`
+
+Use `auto_selection_mark_worker_missing_output` when queue status reports a worker completed without writing the expected raw/scored/failed file.

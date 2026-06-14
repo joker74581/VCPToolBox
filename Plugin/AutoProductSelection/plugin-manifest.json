@@ -1,0 +1,88 @@
+{
+  "manifestVersion": "1.0.0",
+  "name": "AutoProductSelection",
+  "version": "1.0.0",
+  "displayName": "自动选品编排插件",
+  "description": "独立承载自动选品 runs 文件状态机、交接队列、锁管理和可配置 AgentAssistant 派发提示。底层数据抓取仍由 ProductSelector 完成。",
+  "author": "VCP Team",
+  "pluginType": "hybridservice",
+  "entryPoint": {
+    "type": "nodejs",
+    "script": "AutoProductSelection.js"
+  },
+  "communication": {
+    "protocol": "direct",
+    "timeout": 60000
+  },
+  "configSchema": {
+    "DebugMode": {
+      "type": "boolean",
+      "description": "是否开启 AutoProductSelection 调试日志。",
+      "default": false
+    },
+    "AUTO_SELECTION_SCOUT_AGENT_NAME": {
+      "type": "string",
+      "description": "负责读取 brief 并调用 ProductSelector 取证的 AgentAssistant 名称。",
+      "default": "ProductSelectionScout"
+    },
+    "AUTO_SELECTION_REVIEWER_AGENT_NAME": {
+      "type": "string",
+      "description": "负责读取 raw 并输出 scored/failed 的 AgentAssistant 名称。",
+      "default": "ProductSelectionReviewer"
+    },
+    "AUTO_SELECTION_SCOUT_TASK_PREFIXES": {
+      "type": "string",
+      "description": "用于识别 scout AgentTask 归档文件的逗号分隔前缀。",
+      "default": "APS_SCOUT_,ProductSelectionScout_"
+    },
+    "AUTO_SELECTION_REVIEWER_TASK_PREFIXES": {
+      "type": "string",
+      "description": "用于识别 reviewer AgentTask 归档文件的逗号分隔前缀。",
+      "default": "APS_REVIEWER_,ProductSelectionReviewer_"
+    }
+  },
+  "capabilities": {
+    "invocationCommands": [
+      {
+        "command": "auto_selection_queue_status",
+        "description": "Inspect the automated product-selection handoff queue. Returns files in failed/scored/raw/brief/locks/archived, derived active_briefs/stale_briefs/valid_locks/malformed_locks/worker_missing_outputs, worker_timeout_minutes, and next_action_hint. Optional include_content=true includes content for failed/scored/raw files. Optional worker_timeout_minutes defaults to 60."
+      },
+      {
+        "command": "auto_selection_write_run_file",
+        "description": "Write a scoped automated product-selection handoff file. Parameters: stage brief|raw|scored|archived|failed|locks, run_id/runId, content, overwrite=false default. When stage=locks, lock_name is required and must be hawkeye or forge."
+      },
+      {
+        "command": "auto_selection_read_run_file",
+        "description": "Read a scoped automated product-selection handoff file under runs/. Parameters: stage, run_id/runId, optional lock_name for locks. Do not use this for AutoSelectionStrategyProfile.md; read that plugin-root strategy file with ServerFileOperator.ReadFile."
+      },
+      {
+        "command": "auto_selection_prepare_dispatch",
+        "description": "Prepare a worker dispatch. Parameters: worker hawkeye|forge, run_id/runId. For hawkeye, optional brief_content/content writes the brief before dispatch; otherwise an existing brief is required. For forge, an existing raw file is required. Creates the correct worker lock and returns agent_assistant_request fields. Hawkeye is injected with AutoProductSelection and ProductSelector; Forge is injected with AutoProductSelection. Use the returned fields to call AgentAssistant."
+      },
+      {
+        "command": "auto_selection_move_run_file",
+        "description": "Move a handoff file between runs stages. Parameters: from_stage/fromStage, to_stage/toStage, run_id/runId, optional lock names for lock files. Moving to archived also cleans same-run residue."
+      },
+      {
+        "command": "auto_selection_delete_run_file",
+        "description": "Delete a handoff file. Parameters: stage brief|raw|scored|archived|failed, run_id/runId. Use auto_selection_clear_locks for locks."
+      },
+      {
+        "command": "auto_selection_cleanup_run",
+        "description": "Clean non-archived residue for one run_id. Removes brief/raw/scored/failed files and locks for the run, but keeps archived final files."
+      },
+      {
+        "command": "auto_selection_mark_worker_missing_output",
+        "description": "Convert a detected worker_missing_output item into a standardized failed handoff file and clear the run locks. Parameters: optional run_id/runId, optional worker_timeout_minutes, overwrite=false default. Use when queue_status.next_action_hint=handle_worker_missing_output."
+      },
+      {
+        "command": "auto_selection_clear_locks",
+        "description": "Delete lock files for a given run_id/runId."
+      },
+      {
+        "command": "get_status",
+        "description": "Return AutoProductSelection status and queue directory."
+      }
+    ]
+  }
+}

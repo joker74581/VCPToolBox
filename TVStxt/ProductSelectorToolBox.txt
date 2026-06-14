@@ -1,0 +1,529 @@
+# ProductSelector 选品数据分析总册
+
+ProductSelector 是选品数据抓取与分析插件，统一使用：
+
+```text
+tool_name:「始」ProductSelector「末」
+```
+
+它当前包含七类核心能力：
+1. **产品选品 (Product Research)**：通过卖家精灵爬取关键词或行业类目的热门商品候选及其指标。
+2. **查竞品 (Competitor Lookup)**：通过卖家精灵按 ASIN、品牌、卖家、关键词查看竞品基础数据，输出字段与产品选品一致。
+3. **关键词选品 (Keyword Research)**：获取关键词或类目下的市场搜索量、购买量、ABA/PPC 竞争等宏观指标。
+4. **关键词转化率 (Keyword Conversion Rate)**：读取商机探测器/ABA 的关键词行业平均搜索、点击、购买、点击转化率、PPC、CPA、ACOS 与价格参考。
+5. **关键词反查 (Keyword Reverse)**：输入 ASIN 反查该产品的流量词、自然词、广告词占比、搜索量及排名等指标。
+6. **Amazon 商品页信息 (Amazon Product Info)**：提取 ASIN 商品页标题、价格、评分、基础信息、五点描述、评分分布和页面 top reviews。
+7. **Amazon 评论抓取 (Amazon Reviews)**：提取特定商品 ASIN 的评论，进行消费者反馈、痛点分析及卖点提炼。
+
+与 ChromeBridge 的关系：
+- ProductSelector 内部自动调用 ChromeBridge，无需 Agent 额外手动控制浏览器或在 `page_info` 中提取字段。
+- 只有在执行通用网页抓取或调试拦截时，才参考 `{{VCPChromebridge}}`。
+
+[===vcp_fold:0.35::desc:ProductSelector 选品分析 通用指南 映射 基本原则 口径 合规 应对 异常处理 get_status login===]
+
+## 通用调用与分析指南
+
+ProductSelector 只负责选品数据抓取与证据分析。自动选品的 runs 队列、状态机、锁、AgentAssistant 派发与归档规则请参考 `{{VCPAutoProductSelectionToolBox}}`；这里不规定固定流水线，Agent 应根据用户问题先判断要验证什么，再选择最相关、足够可靠的工具组合。
+
+### 基本原则
+- **先定义问题，再选工具**：例如“找候选产品”“验证关键词需求”“判断广告利润”“看竞品流量词”“看 Listing 和评论痛点”是不同问题，应选择不同入口。
+- **数据命令必须串行**：卖家精灵/Amazon 页面类命令一次只调用 1 个。等待工具返回、阅读结果、形成下一步判断后，再调用下一个。不要在同一轮回复里同时输出多个 ProductSelector 数据查询请求。
+- **不预设固定查询总次数**：长流程可按证据需要继续串行取证；每完成约 3-5 个数据命令做一次检查点判断，证据足够、连续出错、上下文过重或遇到额度/页面阻断时停止。
+- **可靠性优先**：可以考虑调用成本，但不能为了省调用而放弃关键证据。若单一工具无法回答问题，应换用或补充其他工具。
+- **证据可追溯**：ASIN、关键词、类目、价格、销量、评论、PPC、CPA、ACOS 等结论必须来自本轮工具返回或用户明确输入，不得编造。
+- **空结果不是失败结论**：某个工具返回空，只说明该入口或筛选条件下没有拿到数据。应说明原因，并考虑换关键词、放宽条件、改用竞品/关键词/Listing/评论入口。
+- **不要越界读取**：默认 compact 结果以 `summary_markdown` 为主，不要期待完整 `candidates` JSON；只有排障或确实需要机器消费字段时才使用 `result_mode=debug/full` 或 `include_candidates=true`。
+
+### 常见问题到工具的映射
+- 找产品、扫品、看某类目/关键词下有哪些商品：用 `run_sellersprite_research`。
+- 查某个 ASIN、品牌、卖家或关键词下的竞品基础盘面：用 `run_sellersprite_competitor_lookup`。
+- 看关键词搜索量、购买量、需供比、PPC、ABA 集中度、均价、评论均值：用 `run_sellersprite_keyword_research`。
+- 看关键词行业平均转化、点击、购买、PPC、CPA、ACOS、广告预算、ABA 点击/转化集中度：用 `run_sellersprite_keyword_conversion_rate`。
+- 反查某个 ASIN 的流量词、自然/广告排名、流量占比：用 `run_sellersprite_keyword_reverse`。
+- 看某个 ASIN 的标题、价格、五点、基础参数、评分分布、商品页 top reviews：用 `fetch_amazon_product_info`。
+- 看评论、差评、用户痛点、变体问题、买家反馈：用 `fetch_amazon_reviews`。
+
+### 抽象需求的自主处理
+- 当用户只给出抽象方向时，Agent 可以自主选择入口，不要机械追问参数。
+- 如果需要类目参数，优先调用 `get_status` 查看 `supported_categories`，只使用支持的顶层类目或插件内置别名，不要自造 nodeId。
+- 产品选品可无关键词：`run_sellersprite_research` 可以省略 `keywords`，只传合法 `categories` 和必要筛选条件。
+- 关键词选品可无关键词：`run_sellersprite_keyword_research` 可以省略 `includeKeywords`，只传 `departments` 和必要筛选条件。
+- 涉及月份趋势时，`month` 使用 `YYYYMM`。没有明确月份时，优先使用上一个已完整结算的数据月份；若用户明确问未来月份，可参考往年同期或最近完整月份，并在结论中说明口径。
+
+### 可选研究路径示例
+以下只是研究路径示例，不是固定顺序：
+- 从关键词开始：关键词选品 -> 关键词转化率 -> 产品选品/竞品 lookup -> Listing/评论。
+- 从产品开始：产品选品 -> 选择有来源 ASIN -> 关键词反查 -> 关键词转化率 -> Listing/评论。
+- 从竞品开始：竞品 lookup -> 关键词反查 -> 关键词选品/转化率 -> 产品页与评论验证。
+- 从痛点开始：商品页/评论 -> 提炼关键词或差异化假设 -> 关键词/产品/竞品数据验证。
+
+### 口径与安全
+- 关键词转化率是关键词行业平均参考，不代表单一 ASIN 真实转化。
+- 关键词反查一次只支持 1 个 ASIN；多个 ASIN 必须拆成多次调用。
+- 如果返回 `credential_error=true`、`page_blocked=true`、`needs_manual_action=true`、`page_dogged=true` 或 `page_mismatch=true`，不要循环重试，应说明状态并停止或请求人工处理。Amazon 当前页变成 `/error/500`、`/sorry`、登录页或验证码页时，也按错页/阻断处理。
+- 如果返回 `plugin_error=browser_busy` 或 `busy=true`，说明已有 ProductSelector 页面任务正在执行或刚被并发触发。不要继续追加查询；等待当前工具返回后再做下一步，或把本轮写为 partial/blocked。
+
+### 错误与空结果的通用应对
+所有命令都可能返回 `warnings`、`error`、`next_actions`。Agent 必须优先读取这些字段，不要用模型常识补齐缺失数据。
+
+| 功能 | 插件已有回退 | 空结果/错误时怎么做 |
+|---|---|---|
+| 产品选品 `run_sellersprite_research` | 登录失效时可强制重登一次；DOM 表格失败或只抽到 ASIN 时回退 Markdown/page_info；无结果返回 `no_results/empty_result`。 | 空结果时放宽价格、销量、评论、类目或关键词；不要声称市场不存在。若有页面结果但未解析，改用 `result_mode=debug` 排障。 |
+| 查竞品 `run_sellersprite_competitor_lookup` | 与产品选品同口径：登录重试、DOM 表格到 Markdown 回退、空结果标记。 | 空结果时换查询入口：ASIN、品牌、卖家、关键词不能互相替代；先确认至少一个查询条件有效。 |
+| 关键词选品 `run_sellersprite_keyword_research` | 登录重试；表格解析失败时回退页面文本；无结果返回 `no_results/empty_result`。 | 空结果时放宽搜索量、购买量、PPC、需供比、类目和月份；不要把空结果解释成“无需求”。 |
+| 关键词转化率 `run_sellersprite_keyword_conversion_rate` | 登录重试；商机探测器无数据时返回空结果；表格失败时检查页面文本是否为空结果。 | 空结果时换关键词、减少筛选、改 `reverseType=W/90D` 或换匹配方式；不要编造 CPA/ACOS/PPC。 |
+| 关键词反查 `run_sellersprite_keyword_reverse` | 登录重试；表格解析失败时回退页面文本；参数层会拒绝多个 ASIN。 | 空结果时确认 ASIN、站点、月份和 `badges`；可放宽流量来源标签。一次只重试不同参数，不要同参循环。 |
+| Amazon 商品页 `fetch_amazon_product_info` | DOM 定点抽取失败时回退 Markdown page_info；DOM 旧模式会触发 page_info 回退；校验目标 ASIN。 | `page_mismatch/page_dogged/page_blocked` 时停止该 ASIN 页面证据；可换 ASIN 或等待人工处理验证码。不能解析疑似旧页。 |
+| Amazon 评论 `fetch_amazon_reviews` | 评论 DOM 抽取失败时回退 Markdown page_info；汇总评分 DOM 单独补采；校验目标 ASIN。 | 评论为空只表示未抓到评论样本，不代表无痛点。`page_mismatch/page_dogged/page_blocked` 时停止该评论路径；可用商品页 top reviews 作为低样本 Listing 证据，但必须标明不是系统评论抓取。 |
+
+阻断优先级：
+- `credential_error`：账号配置问题，立即停止。
+- `page_blocked` / `needs_manual_action`：需要人工处理验证码或拦截，停止重试。
+- `page_mismatch` / Amazon `/error/500` / `/sorry` / 登录页：错页，不能使用页面内容。
+- `page_dogged`：ASIN 疑似下架或不存在，停止该 ASIN 路径。
+- `no_results` / `empty_result`：不是系统故障，只能说明当前筛选条件没有结果；应换条件或换入口。
+
+[===vcp_fold:0.50::desc:ProductSelector 卖家精灵 产品选品 查竞品 run_sellersprite_research run_sellersprite_competitor_lookup 抓取商品 候选ASIN 物理指标 配送费 毛利率===]
+
+## 产品选品工具细则 (`run_sellersprite_research`)
+
+用于卖家精灵 `product-research` 页面，根据产品关键词或大类，返回候选 ASIN 和竞争指标。
+
+### 常用调用示例
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」run_sellersprite_research「末」
+keywords:「始」mushroom lamp「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+### 关键规则
+- **匹配模式**：默认 `selectType=3`（词组匹配）。可选 `2`（模糊）、`4`（精准）。
+- **结果数**：默认且推荐 `size=20`。在需要大量样本时允许传入 `60` 或 `100`。
+- **避免过度筛选**：用户无明确要求时，**不要**为了“精确”盲目限制价格、销量或评分，以免漏掉重要商机。
+- **默认读取方式**：默认 compact 返回以 `summary_markdown` 的合并 ASIN 表为主。Agent 应直接读取合并表做筛选和对比，不要期待默认返回完整 `candidates` JSON。
+- **调试/机器消费**：只有排查字段映射或确实需要结构化对象时，才传 `result_mode=debug/full` 或 `include_candidates=true` 获取完整 `candidates`。
+
+### 常用参数说明
+- `keywords` (String): 包含的关键词（若为全类目调研可省略）。
+- `market` (String): 站点，常用 `US`。
+- `size` (Number): 页面拉取条数，只允许 `20` / `60` / `100`。
+- `categories` (String): 顶层大类名/英文名/nodeId，必须来自 `get_status.supported_categories`。
+- `minPrice` / `maxPrice` (Number): 价格范围。
+- `minReviews` / `maxReviews` (Number): 评论数范围。
+- `minSales` / `maxSales` (Number): 月销量范围。
+- `putawayMonth` (String): 上架时间（如 `3` 表示近3个月，`36-48`等）。
+- `sellerTypes` (String): 配送方式，如 `FBA`。
+- `sellerNationList` (String): 卖家所在地代码，如 `CN`。
+- `productTags` (String): 标签过滤，如 `Best Seller`、`Amazon's Choice`、`New Release`。
+
+### 默认 `summary_markdown` 合并表核心列
+默认结果会把候选商品合并为一张 ASIN 表，核心列包括：`asin`、`category_bsr` (大类BSR)、`parent_sales` (父体月销量)、`parent_sales_growth_rate` (月销量增长率)、`revenue` (月销售额)、`child_sales`、`child_revenue`、`variations` (变体数)、`price` (价格)、`qa_count` (Q&A数)、`review_count` (总留评数)、`monthly_new_reviews`、`rating` (评分值)、`review_rate`、`fba_fee` (FBA费用)、`profit_margin` (毛利率)、`putaway_date` (上架日期)、`seller_count` (卖家数)、`category_top/category_path`。
+
+完整 `candidates` JSON 默认不返回；如需字段级排障，传 `include_candidates=true` 或 `result_mode=debug/full`。
+
+---
+
+## 调试命令 (`build_sellersprite_url`)
+仅生成对应的卖家精灵选品 URL 以验证参数映射，**不打开浏览器**。
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」build_sellersprite_url「末」
+keywords:「始」mushroom lamp「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+
+## 卖家精灵查竞品细则 (`run_sellersprite_competitor_lookup`)
+
+用于 SellerSprite `competitor-lookup` 页面，按 ASIN / Amazon 商品链接、关键词、品牌或卖家查看竞品基础数据。它的默认 `summary_markdown` 合并表字段与 `run_sellersprite_research` 保持一致，适合让 Agent 快速查看某个 ASIN、某个品牌、某个关键词下的产品基础盘面。
+
+### 常用调用示例
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」run_sellersprite_competitor_lookup「末」
+asin:「始」B0GN2YJ9KV「末」
+keywords:「始」granny「末」
+brand:「始」trutob「末」
+seller:「始」Mapille「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+### 关键规则
+- **至少一个查询条件**：`asin/asins/product_url`、`keywords`、`brand/includeBrands`、`seller/includeSellers` 至少传一个。
+- **默认口径**：`market=US`，`monthName=bsr_sales_nearly`（最近30天），`nodeIdPaths=[]`（不选类目），`size=60`，按 `amz_unit` 倒序。
+- **ASIN 提取**：可直接传 ASIN，也可传 Amazon 商品链接；插件会自动提取 ASIN。
+- **类目**：用户明确要求限定类目时才传 `categories` 或 `nodeIdPaths`；类目仍必须来自 `get_status.supported_categories`。
+- **返回字段**：读取方式与产品选品完全一致。默认读取 `summary_markdown` 合并表；不要期待默认返回完整 `candidates`、`title`、`brand`、图片或详情链接。排障时才传 `include_candidates=true` 或 `result_mode=debug/full`。
+
+### 常用参数说明
+- `asin` / `asins` (String/Array): 父体或子体 ASIN。
+- `product_url` / `url` (String): Amazon 商品链接，如 `https://www.amazon.com/dp/B0GN2YJ9KV?th=1`。
+- `keywords` (String): 关键词。
+- `brand` / `includeBrands` (String): 包含品牌。
+- `seller` / `includeSellers` (String): 包含卖家。
+- `market` (String): 站点，默认 `US`。
+- `size` (Number): 页面拉取条数，默认 `60`，允许 `20` / `60` / `100`。
+- `maxCandidates` (Number): 返回候选数量上限。
+
+### 调试命令 (`build_sellersprite_competitor_url`)
+仅生成卖家精灵查竞品 URL，**不打开浏览器**。
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」build_sellersprite_competitor_url「末」
+asin:「始」B0GN2YJ9KV「末」
+keywords:「始」granny「末」
+brand:「始」trutob「末」
+seller:「始」Mapille「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+[===vcp_fold:0.65::desc:ProductSelector 卖家精灵 关键词选品 关键词研究 行业转化率 商机探测器 搜索量 购买量 需供比 ABA集中度 PPC 竞价 ACOS CPA 广告预算===]
+
+## 关键词选品工具细则 (`run_sellersprite_keyword_research`)
+
+用于卖家精灵 `keyword-research` 页面，获取关键词或品类大盘的搜索量、购买量、ABA及PPC竞争等宏观指标。
+
+### 常用调用示例
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」run_sellersprite_keyword_research「末」
+station:「始」US「末」
+includeKeywords:「始」mushroom lamp「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+### 关键规则
+- **关键词输入**：仅使用 `includeKeywords`（包含词）和 `excludeKeywords`（排除词），不要与产品选品的 `keywords` 搞混。
+- **新兴市场**：只有在用户显式要求“寻找今年新出的词”或“新细分市场”时，才设置 `withYearlyGrowth=true`。
+- **排序**：默认按 `searches` (月搜索量) 降序排列。
+
+### 常用参数说明
+- `station` / `market` (String): 站点，默认 `US`。
+- `month` (String): 数据月份，格式 `YYYYMM`（例如 `"202506"`）。
+- `departments` (String): 关键词页支持的类目，可传 `all`（全部）或具体名称（如 `sporting`）。
+- `includeKeywords` (String): 包含的关键词。
+- `minSearches` / `maxSearches` (Number): 月搜索量区间。
+- `minPurchases` / `maxPurchases` (Number): 月购买量区间。
+- `minGrowth` / `maxGrowth` (Number): 月搜索量环比增长率。
+- `minSupplyDemandRatio` / `maxSupplyDemandRatio` (Number): 需供比（搜索量 / 商品数，越大说明竞争越小）。
+- `minAvgPrice` / `maxAvgPrice` (Number): 平均价格区间。
+- `minAvgReviews` / `maxAvgReviews` (Number): 平均评论数区间。
+- `minBid` / `maxBid` (Number): PPC竞价区间。
+
+### 默认 `summary_markdown` 合并表核心列
+默认结果会把关键词合并为一张表，Agent 应优先读取 `summary_markdown`。核心列包括：`keyword` (关键词)、`translation` (中文翻译)、`monthly_searches` (月搜索量)、`monthly_purchases` (月购买量)、`purchase_rate` (购买率)、`avg_price`、`avg_rating`、`spr`、`supply_demand_ratio` (需供比)、`products` (在线商品数)、`clicks`、`conversion_rate`。
+
+完整 `candidates` JSON 默认不返回；只有 `result_mode=debug/full` 时才用于排障。
+
+---
+
+## 调试命令 (`build_sellersprite_keyword_url`)
+仅生成卖家精灵关键词选品 URL 供验证，**不打开浏览器**。
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」build_sellersprite_keyword_url「末」
+includeKeywords:「始」mushroom lamp「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+---
+
+
+## 关键词转化率工具细则 (`run_sellersprite_keyword_conversion_rate`)
+
+用于卖家精灵 `keyword-conversion-rate` 页面，读取亚马逊商机探测器/ABA 关键词行业平均搜索、点击、购买、转化率，以及 PPC、CPA、ACOS、产品均价等广告利润模型指标。
+
+### 常用调用示例
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」run_sellersprite_keyword_conversion_rate「末」
+keywords:「始」gaming desk,desk「末」
+reverseType:「始」W「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+### 关键规则
+- **关键词输入**：默认按“单词单查”执行。使用 `keywordList` 或 `keywords` 时，一次优先只传 1 个关键词；如果要比较多个词，请拆成多次串行调用。只有在你明确接受 SellerSprite 多词同查不稳定的风险时，才传 `allow_multi_keywords=true`。
+- **时间口径**：`reverseType=W` 表示按周；`reverseType=90D` 表示近90天。默认 `W`。
+- **PPC匹配方式**：`bidMatchType=1/2/3` 分别表示精准/词组/广泛，也可直接传 `精准`、`词组`、`广泛`。
+- **默认站点**：`marketId=1`，即美国站。
+- **结果数**：默认最多读取 50 条；单个词可能拓展出相关关键词。商机探测器无数据时返回空结果。
+- **稳定性提示**：SellerSprite 在两个差异较大的词同查时，可能只返回其中一个词的结果。为了降低漏数风险，本插件默认把多词同查视为需要澄清；自动选品应拆成多次单词查询。
+- **指标口径**：关键词转化率是行业平均点击与购买行为参考值，不代表单一商品真实转化表现。Agent 必须把它当作趋势和利润模型输入，不要当作某个 ASIN 的真实转化率。
+- **默认读取方式**：默认 compact 返回 `summary_markdown` 与 `metric_notes`。不要期待默认返回完整 `candidates` JSON；排障时才传 `result_mode=debug/full`。
+
+### 常用参数说明
+- `keywords` / `keywordList` (String/Array): 查询关键词列表。
+- `market` / `station` / `marketId`: 站点，默认 US / `1`。
+- `reverseType` / `type` / `period`: `W` 或 `90D`。
+- `bidMatchType`: PPC竞价匹配方式，`1=精准`、`2=词组`、`3=广泛`。
+- `keywordMatchType`: 默认 `all`。
+- `minSearches` / `maxSearches`: 搜索量区间。
+- `minClicks` / `maxClicks`: 点击量区间。
+- `minPurchases` / `maxPurchases`: 购买量区间。
+- `minSearchConvRate` / `maxSearchConvRate`: 搜索转化率区间。
+- `minClickConvRate` / `maxClickConvRate`: 点击转化率区间。
+- `minPpc` / `maxPpc`: PPC竞价区间。
+- `minCpa` / `maxCpa`: CPA区间。CPA = Cost Per Action，即平均每笔广告订单的推广成本。
+- `minProductPrice` / `maxProductPrice`: 产品均价区间。
+- `minAcos` / `maxAcos`: ACOS区间。
+- `minClickingRate` / `maxClickingRate`: 点击占比区间。
+- `minConversionRate` / `maxConversionRate`: 转化占比区间。
+- `minPhraseCount` / `maxPhraseCount`: 词组个数区间。
+
+### 默认 `summary_markdown` 合并表核心列
+默认结果会把关键词合并为一张表。核心列包括：`keyword`、`period_searches`、`period_clicks`、`period_purchases`、`search_conversion_rate`、`click_conversion_rate`、`ppc_bid low/mid/high`、`cpa low/mid/high`、`product_price low/avg/high`、`acos max/avg/min`、`ad_budget`、`aba_concentration click/conversion`、`top_clicked_asins`。
+
+`metric_notes` 会解释 CPA、PPC匹配、产品均价、ACOS、ABA集中度等字段，Agent 应优先结合这些注释解读结果。
+
+### 调试命令 (`build_sellersprite_keyword_conversion_rate_url`)
+仅生成卖家精灵关键词转化率 URL 供验证，**不打开浏览器**。
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」build_sellersprite_keyword_conversion_rate_url「末」
+keywords:「始」gaming desk,desk「末」
+reverseType:「始」90D「末」
+bidMatchType:「始」词组「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+---
+
+[===vcp_fold:0.80::desc:ProductSelector 卖家精灵 关键词反查 流量反查 流量词 自然词 广告词 排名 流量占比 Amazon商品页 Listing 评论抓取 fetch_amazon_product_info fetch_amazon_reviews 差评 痛点 卖点===]
+
+## 关键词反查工具细则 (`run_sellersprite_keyword_reverse`)
+
+用于卖家精灵 `keyword-reverse` 页面，输入 ASIN 反查竞争对手的流量词及各项指标。
+
+### 常用调用示例
+
+- 基础反查（查询全部流量维度）：
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」run_sellersprite_keyword_reverse「末」
+asin:「始」B0DM4JLGVF「末」
+market:「始」US「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+- 仅查询广告词/投放词：
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」run_sellersprite_keyword_reverse「末」
+asin:「始」B0DM4JLGVF「末」
+badges:「始」广告「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+- 仅查询自然搜索词（针对特定月份如 2026年4月）：
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」run_sellersprite_keyword_reverse「末」
+asin:「始」B0DM4JLGVF「末」
+date:「始」202604「末」
+badges:「始」自然搜索词「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+### 常用参数说明
+- `asin` / `q` (String): 需要反查的单个竞品 ASIN。关键词反查一次只支持 1 个 ASIN；需要深挖多个 ASIN 时，必须拆成多次调用，不要使用 `asins` 数组或把多个 ASIN 写在同一个参数里。
+- `market` / `station` (String): 站点，默认 `US` (对应 marketId=1)。
+- `date` (String): 月份口径，支持 `YYYYMM` 或 `YYYY-MM` 格式（例如 `"202604"` 或 `"2026-04"`，插件会自动转换和规范。若为空则取系统最新）。
+- `badges` (String/Array): 流量类型标签。默认全部。支持传入单项或组合别名：
+  - `广告`/`广告词`/`投放`/`投放词` -> 自动映射为 `SPONSOR_BRAND,SPONSOR_VIDEO,ADS` (包含全部品牌/视频/SP广告)
+  - `自然搜索`/`自然搜索词`/`自然词` -> 自动映射为 `NATURAL_SEARCHING,AMAZON_CHOICE,EDITORIAL_RECOMMENDATIONS,FOUR_STAR,HIGHLY_RATED` (包含全部自然位置)
+  - `sp`/`sp广告`/`ads` -> `ADS`
+  - `品牌`/`品牌广告`/`sb` -> `SPONSOR_BRAND`
+  - `视频`/`视频广告`/`video` -> `SPONSOR_VIDEO`
+  - `ac`/`ac推荐`/`ac推荐词` -> `AMAZON_CHOICE`
+  系统会自动规范、平铺展开并去重合并。
+
+### 默认 `summary_markdown` 合并表核心列
+默认结果会把反查关键词合并为一张表，并附带总词数、自然排名、Top 搜索量等摘要。Agent 应优先读取 `summary_markdown`，核心列包括：`keyword` (关键词)、`translation` (中文释义)、`monthly_searches` (月搜索量)、`organic_rank` (自然排名)、`ad_rank` (广告排名)、`traffic_share` (流量占比)、`monthly_purchases` (月购买量)、`purchase_rate` (购买率/转化率)、`supply_demand_ratio` (需供比)、`aba_click_share`、`aba_conversion_share`、`spr`、`products`。
+
+完整 `candidates` JSON 默认不返回；只有 `result_mode=debug/full` 时才用于排障。不要读取原始 DOM 表或页面文本做常规分析。
+
+### 调试命令 (`build_sellersprite_keyword_reverse_url`)
+仅生成卖家精灵关键词反查 URL 供验证，**不打开浏览器**。
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」build_sellersprite_keyword_reverse_url「末」
+asin:「始」B0DM4JLGVF「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+
+## Amazon 商品页信息抓取细则 (`fetch_amazon_product_info`)
+
+用于根据 ASIN 打开 Amazon 商品页 `https://www.amazon.com/dp/{ASIN}?th=1`，提取 Listing 基础信息。适合在竞品分析中快速查看商品标题、价格、评分、基础参数、五点描述、评分分布和商品页 top reviews。
+
+### 常用调用示例
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」fetch_amazon_product_info「末」
+asin:「始」B0GN2YJ9KV「末」
+maxReviews:「始」5「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+### 关键规则
+- **目标 URL**：默认构造 `https://www.amazon.com/dp/{{asin}}?th=1`。
+- **页面身份校验**：如果当前页面 URL 不匹配目标 ASIN，会返回 `page_mismatch=true`，Agent 不得使用疑似旧页面内容。
+- **默认 compact**：默认返回结构化字段，不返回完整 HTML、浏览器执行结果或大段页面文本。
+- **评论用途**：商品页 top reviews 只适合快速判断卖点/痛点；需要系统分析评论时仍调用 `fetch_amazon_reviews`。
+- **拦截处理**：如果返回 `page_blocked=true` / `needs_manual_action=true`，停止重试，请主人在浏览器中人工处理验证码。
+
+### 常用参数说明
+- `asin` (String): Amazon 商品 ASIN。
+- `url` / `product_url` (String): Amazon 商品页 URL（传入时会自动解析 ASIN）。
+- `market` (String): 默认 `US`。
+- `maxReviews` (Number): 商品页 top reviews 抓取上限，默认 `5`，最大 `50`。
+- `result_mode` (String): 默认 `compact`。排查页面结构时可传 `debug` 或 `full`。
+- `cleanup_tabs_after` / `cleanupTabsAfter` (Boolean): 默认 `false`，通常保持不传。
+
+### 返回字段说明
+- 商品基础字段：`asin`、`title`、`rating`、`review_count`、`price`、`basic_info`、`feature_bullets`。
+- 评分汇总字段：`average_rating`、`global_rating_count`、`total_review_count`、`rating_breakdown`。
+- 页面评论字段：`top_review_count`、`reviews`。compact 模式下 reviews 与评论抓取的 compact 字段一致。
+
+### 调试命令 (`build_amazon_product_url`)
+仅生成 Amazon 商品页 URL，**不打开浏览器**。
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」build_amazon_product_url「末」
+asin:「始」B0GN2YJ9KV「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+
+## Amazon 评论抓取细则 (`fetch_amazon_reviews`)
+
+用于根据 ASIN 直接抓取 Amazon 评论页。
+
+### 常用调用示例
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」fetch_amazon_reviews「末」
+asin:「始」B07ZPKN6PB「末」
+maxReviews:「始」15「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+### 返回字段一致性规则 (重要)
+根据不同 `result_mode`，返回的 reviews 列表字段有严格区别：
+- **`compact` 模式（默认模式）**：
+  为节省 Token，此模式下会**剥离/不返回**重量级和低价值字段 `author`、`region`、`image_urls`。
+  实际仅返回以下干净的精简字段，Agent 读取时必须遵守此结构，不得尝试读取缺失字段：
+  ```json
+  {
+    "review_id": "RXXXXXXXXXXXXX",
+    "rating": 5,
+    "title": "评论标题",
+    "body": "评论正文...",
+    "date": "May 20, 2026",
+    "review_type": "verified_purchase", // "verified_purchase" 或 "direct_review"
+    "variant": { "Size": "Large", "Color": "Red" }, // 仅包含 format-strip 提取的 Size/Color 信息
+    "helpful_count": 3,
+    "image_count": 2
+  }
+  ```
+- **`full` / `debug` 模式**：
+  只有当显式传入 `result_mode: "full"` 或 `result_mode: "debug"` 时，才会完整保留 `author` (评论作者名)、`region` (评论地区) 和 `image_urls` (真实的买家图片链接数组)。除非排查数据缺失或验证码拦截，否则默认不要开启这些模式。
+
+### 常用参数说明
+- `asin` (String): Amazon 商品 ASIN。
+- `url` / `review_url` (String): Amazon 商品页或评论页 URL（传入时将自动解析提取 ASIN）。
+- `market` (String): 默认 `US` (即 `www.amazon.com`)。
+- `maxReviews` (Number): 抓取的最大评论条数，默认 `10`，最大支持 `50`。
+- `sort_by` (String): 排序方式。`recent` / `newest` (最新) 或 `helpful` / `top` (最有用)。
+- `filter_by_star` (String): 星级过滤。可选 `all`, `5`, `4`, `3`, `2`, `1`, `positive`, `critical`。
+- `result_mode` (String): 默认 `compact`。调试或排查时可传 `debug` 或 `full`。
+- `cleanup_tabs_after` / `cleanupTabsAfter` (Boolean): 默认 `false`。是否在本次评论抓取完毕后立即关闭当前抓取网页。默认不关闭，以便于主人检查和调试网页内容；但**下一次调用任何网页任务前，插件会自动清理此前打开的所有残留页面**。
+
+### 汇总信息说明
+评分汇总字段 `average_rating` / `global_rating_count` / `total_review_count` / `rating_breakdown` 均直接从页面 DOM 定点提取。若被拦截或提取不到，这些值会保持为 `null`，Agent **严禁使用首条评论或整页内容瞎猜**。
+
+### ⚠️ 工具能力局限与调用限制 (非常重要)
+1. **单次抓取与翻页局限**：`fetch_amazon_reviews` 工具单次调用仅能提取当前第一页的页面数据（默认前 10 条评论，`maxReviews` 最大上限为 50 条）。**工具本身不支持自动翻页或多页自动拼接深度抓取**。
+2. **严禁提出超能力的数据要求**：
+   - 熔炉在制定补采建议时，**绝对禁止提出违背工具物理上限的“脑补”要求**（例如：“要求鹰眼去抓取 30 个、50 个或 100 个差评”）。
+   - 熔炉正确的缺口指令应仅限定在单次获取范围内，例如：“抓取该 ASIN 最新/最有用的前 10 条差评（1-3星星级过滤）”。
+   - 鹰眼只需执行一次并返回结果即可，即便页面中可抓留评数少于 10 条、甚至完全没有差评，也代表工具已正常执行并尽力交付。
+   - 枢纽与熔炉应直接以本次返回的样本量进行最终判定，**严禁**因为样本数未达到想象中的数字（如没有满 30 条）而重复将任务打回补采。
+
+---
+
+## 调试命令 (`build_amazon_reviews_url`)
+仅生成 Amazon 评论页 URL，**不打开浏览器**。
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」build_amazon_reviews_url「末」
+asin:「始」B07ZPKN6PB「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+[===vcp_fold:0.95::desc:ProductSelector 卖家精灵登录 状态获取 get_status login_sellersprite 类目白名单 验证码 账号配置 阻断 安全规则===]
+
+## 卖家精灵登录 (`login_sellersprite`)
+
+当需要单独执行登录操作、或者检查/刷新登录态时，可调用此命令：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」login_sellersprite「末」
+force_login:「始」false「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+### 关键规则：
+- `force_login` (Boolean): 默认 `false`。如果设置为 `true`，则不管最近是否成功登录过，都会强制重新执行登录操作。
+- 插件会自动尝试读取本地 `config.env` 的 `SELLERSPRITE_USERNAME` 和 `SELLERSPRITE_PASSWORD` 执行登录。
+- **无需账号密码亦可成功**：若用户已经在浏览器中手动登录过了，插件在检测到已登录后会直接返回成功，并支持复用该会话。
+
+
+## 状态获取与配置安全 (`get_status`)
+
+要查看插件当前状态、可用类目白名单、登录缓存新鲜度以及任务队列深度：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」get_status「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+### 通用安全与运行规则：
+1. **单独登录与状态刷新 (`login_sellersprite`)**：如果查询遇到登录态失效，或要确保卖家精灵处于已登录状态，可调用单独的 `login_sellersprite` 指令。如果浏览器中已手动登录，插件会直接复用该登录会话。
+2. **类目参数与禁止拼接小类目**：
+   - 卖家精灵类目库庞大而复杂，Agent **严禁自行拼接或计算细分小类目参数**。
+   - 在调用时，仅需通过参数传入标准顶层大类目别名或名称（例如 `["sporting"]` 对应 `Sports & Outdoors`，该映射已由插件内置处理），插件会自动完成符合卖家精灵 URL 规范的 departments 索引拼接。
+3. **亚马逊页面变狗/ASIN 下架检测 (`page_dogged`)**：
+   - 当调用 `fetch_amazon_product_info` 或 `fetch_amazon_reviews` 时，若 ASIN 疑似已被下架或不存在（即显示 404 或俗称“变狗”），插件会返回 `success: false` 并且 `page_dogged: true`。
+   - Agent 必须捕捉该状态，明确判定为商品下架/不存在，并告知用户商品已变狗/下架，停止重试。
+4. **账号密码错误**：如果返回结果包含 `credential_error=true`，说明系统配置的卖家精灵账号信息有误，必须立即终止调用并通知用户。
+5. **拦截与验证码**：如果调用任何抓取任务返回 `page_blocked=true` 或 `needs_manual_action=true`，说明页面触发了验证码。**此时不要重试或死循环调用**，应当请求主人在远程浏览器页面中进行人工滑块解锁。
+6. **类目参数限制**：产品选品和查竞品的 `categories` 只能传入 `get_status` 接口返回的 `supported_categories` 的 `nodeId`、英文名或中文名，禁止随意虚构不支持的类目名称。

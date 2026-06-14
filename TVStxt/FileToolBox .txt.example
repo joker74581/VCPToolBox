@@ -1,36 +1,24 @@
 # VCP 文件管理与系统控制工具箱能力收纳
 这里收纳了文件搜索、读写、批量操作及系统命令行工具。
-# 物理环境判别准则：
-1. 凡是涉及 VCP 系统逻辑、插件配置、日志文件、/home/your-user/ 路径的操作，均判定为【服务器后端】。
-2. 凡是涉及 历史记录.json、E:\ 盘符、或用户明确提到的“本地”操作，均判定为【本地前端】。
 
 ## 1. PowerShell 命令行工具 (PowerShellExecutor)
-PowerShellExecutor/ServerPowerShellExecutor 是 Windows PowerShell 工具，会启动 powershell.exe；Ubuntu 服务器后端不要使用 ServerPowerShellExecutor。
-- 操控【Ubuntu服务器后端】Linux Shell：tool_name:「始」LinuxShellExecutor「末」
-- 操控【Windows本地前端】PowerShell：tool_name:「始」PowerShellExecutor「末」
-- LinuxShellExecutor 必须显式传 hostId；操作当前 Ubuntu 服务器一律使用 hostId:「始」local「末」。除非用户明确指定远程资产并确认 SSH 可用，不要选择 DB1、DE-server 等发现列表里的 SSH 主机。
-- LinuxShellExecutor 不用于读取/搜索文件；如确需执行只读命令，避免使用重定向符号、2>&1、后台 &、分号 ;。
-- LinuxShellExecutor 只读检索命令应优先写成安全管道，例如 `grep -rn "关键词" /path/to/VCPToolBox/Plugin/ | head -n 100`、`find /path/to/VCPToolBox/Plugin -type f -mmin -120 -maxdepth 2 | head -n 100`。不要使用 `2>/dev/null` 或 `|| true`。
+直接调用并获取运行结果。支持 VCP-CLI (前端) 和紧凑的后端命令行。
+tool_name:「始」PowerShellExecutor「末」, // 使用 ServerPowerShellExecutor 运行后端版本
 command:「始」Get-ChildItem「末」,
-hostId:「始」local「末」, // 仅 LinuxShellExecutor 场景必填；当前服务器固定 local
 executionType:「始」blocking/background「末」, // 默认blocking。background用于长时任务。
 newSession:「始」true「末」, // 仅前端，代表新建窗口。
-requireAdmin:「始」true「末」 // 仅 PowerShellExecutor 场景；LinuxShellExecutor 使用 requireAdmin 传授权码。
+requireAdmin:「始」true「末」 // 提升权限。Server版需输入6位安全码。 // 例如tool_password:「始」123456「末」
 
-## 2. 文件快速搜索（环境路由强协议）
-- 搜索【Windows本地前端】：tool_name:「始」LocalSearchController「末」。该工具依赖 Windows Everything HTTP Server，query 支持 Everything 语法。
-- 搜索【Ubuntu服务器后端】：当前 ServerSearchController 仍是 Everything HTTP 兼容实现，会访问服务器本机 http://127.0.0.1:8025；除非已确认服务器端部署了兼容服务，否则不要调用 ServerSearchController。
-- 服务器端搜索优先策略：已知路径直接用 ServerFileOperator 的 ReadFile/FileInfo；已知目录用 ServerFileOperator 的 ListDirectory/SearchFiles；搜索 VCP 源码内容用 ServerCodeSearcher；必须执行 Linux 命令时才用 LinuxShellExecutor。
-- 查询 /home/your-user/、Plugin/、TVStxt/、config.env、日志文件等服务器文件时，禁止调用 LocalSearchController，也不要用 LinuxShellExecutor 代替文件读取/搜索。
+## 2. 文件快速搜索 (LocalSearchController)
+基于 Everything 模块实现秒级搜索。
+tool_name:「始」LocalSearchController「末」, // ServerSearchController 代表操作服务器
 command:「始」search「末」,
-query:「始」搜索关键词 (LocalSearchController 支持 Everything 语法；服务器端默认不要假设 Everything 可用)「末」,
+query:「始」搜索关键词 (支持Everything语法)「末」,
 maxResults:「始」50「末」
 
-## 3. 基础文件阅读 (环境路由强协议)
-- 操作【Ubuntu服务器后端】(路径如 /home/your-user/... 或系统配置)，必须使用 tool_name:「始」ServerFileOperator「末」
-- 操作【Windows本地前端】(路径如 E:\VCPchat\... 或本地历史记录)，才使用 tool_name:「始」FileOperator「末」
-- 服务器端“查看某个文件/搜索某个文件/查看日志内容”属于文件操作，不属于 Shell 操作；不要先试 LinuxShellExecutor。
-tool_name:「始」FileOperator 或 ServerFileOperator「末」, // 严格按上述环境选择
+## 3. 基础文件阅读 (FileOperator)
+阅读电脑内任何区域的文件，支持富文本/多媒体。
+tool_name:「始」FileOperator「末」, // ServerFileOperator 代表服务器文件
 command:「始」ReadFile「末」,   
 filePath:「始」/path/to/your/document.pdf「末」
 
@@ -71,43 +59,38 @@ showHidden:「始」false「末」 //是否返回隐藏文件
 ⑥查询文件元数据（如大小、创建时间、修改时间、是否是目录等）
 command:「始」FileInfo「末」,
 filePath:「始」/path/to/your/file.txt「末」
-⑦递归搜索文件或目录（服务器端/前端均优先使用对应 FileOperator，而不是 Shell）
-command:「始」SearchFiles「末」,
-searchPath:「始」/path/to/search「末」,
-pattern:「始」*.log「末」,
-options:「始」{"caseSensitive": false, "fileType": "file"}「末」
-⑧复制文件
+⑦复制文件
 command:「始」CopyFile「末」,
 sourcePath:「始」/path/to/source.txt「末」,
 destinationPath:「始」/path/to/destination.txt「末」
-⑨移动文件
+⑧移动文件
 command:「始」MoveFile「末」,
 sourcePath:「始」/path/to/source.txt「末」,
 destinationPath:「始」/path/to/new_directory/source.txt「末」
-⑩重命名文件
+⑨重命名文件
 command:「始」RenameFile「末」,
 sourcePath:「始」/path/to/old_name.txt「末」,
 destinationPath:「始」/path/to/new_name.txt「末」
-11.删除文件
+⑩删除文件
 command:「始」DeleteFile「末」,
 filePath:「始」/path/to/deletable_file.txt「末」
-12.创建文件夹
+11.创建文件夹
 command:「始」CreateDirectory「末」,
 directoryPath:「始」/path/to/new_folder/sub_folder「末」
-13.差分化编辑文件，适合对文件内进行部分修改
+12.差分化编辑文件，适合对文件内进行部分修改
 command:「始」ApplyDiff「末」,
 filePath:「始」/path/to/your/file.txt「末」,
 searchString:「始」旧内容「末」,
 replaceString:「始」新内容「末」
-14.阅读网络文件，多媒体文件同样可以理解base64！
+13.阅读网络文件，多媒体文件同样可以理解base64！
 command:「始」WebReadFile「末」,
 url:「始」https://example.com/sample.jpg「末」
-15.下载文件（支持自定义保存路径和文件名）
+14.下载文件（支持自定义保存路径和文件名）
 command:「始」DownloadFile「末」,
 url:「始」http://example.com/archive.zip「末」,
 downloadDir:「始」(可选) 自定义下载目录绝对路径「末」,
 fileName:「始」(可选) 自定义保存文件名，如 my_file.zip「末」
-16.聊天历史编辑器。安全可靠的编辑.json格式的聊天历史文件，有健全的兜底机制避免json文件被损毁。
+15.聊天历史编辑器。安全可靠的编辑.json格式的聊天历史文件，有健全的兜底机制避免json文件被损毁。
 command:「始」UpdateHistory「末」,
 filePath:「始」H:\path\to\your\history.json「末」,
 searchString:「始」这是我想修改的旧内容。「末」,
@@ -144,18 +127,10 @@ fileName:「始」new_canvas.js「末」,
 content:「始」console.log('Hello, Canvas!');「末」
 
 ## 8. 代码检索器 (CodeSearcher)
-在 VCP 服务器后端源码中搜索指定的代码片段或关键词。支持正则表达式。搜索 `server.js`、`Plugin.js`、`modules/`、`routes/`、`Plugin/`、`TVStxt/` 等 VCP 项目文件时，优先使用本工具，不要改用 LinuxShellExecutor。
-tool_name:「始」ServerCodeSearcher「末」, // VCP 后端源码搜索固定使用 ServerCodeSearcher；不要写 CodeSearcher
+在VCP项目源码中搜索指定的代码片段或关键词。支持正则表达式。
+tool_name:「始」ServerCodeSearcher「末」, // VCP 后端源码搜索固定使用 ServerCodeSearcher
 query:「始」(必需) 关键词或正则表达式「末」,
 search_path:「始」(可选) 指定搜索的相对路径「末」,
 case_sensitive:「始」(可选) true/false，默认false「末」,
 whole_word:「始」(可选) true/false，默认false「末」,
 context_lines:「始」(可选) 匹配行前后显示的上下文行数，默认2「末」
-
-示例：
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」ServerCodeSearcher「末」,
-query:「始」admin_api/server/restart「末」,
-search_path:「始」Plugin「末」,
-context_lines:「始」2「末」
-<<<[END_TOOL_REQUEST]>>>

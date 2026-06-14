@@ -1,0 +1,40 @@
+# Auto Product Selection Strategy Profile
+
+This is a generic public strategy profile for creating SelectionBrief files. Customize a private local copy for your own marketplace, brand, supplier, or budget constraints.
+
+## Default Bounds
+
+- `marketplace`: Amazon US
+- `price_band`: 25-150 USD
+- `capital_style`: small team, light inventory, limited upfront risk
+- `target_candidate_window`: 1-3
+
+## Search Direction
+
+- `scan_theme`: broad product opportunity discovery inside safe and compliant categories
+- `strategic_angle`: clear use cases, review pain points, and feasible differentiation
+- `why_now`: quickly decide whether an idea deserves deeper validation
+
+## Positive Signals
+
+- clear use case
+- review complaints suggest concrete improvements
+- manageable logistics
+- price supports margin
+- evidence is traceable
+- not completely dominated by strong brands
+
+## Negative Signals
+
+- low price and weak margin
+- heavy, fragile, regulated, or high-liability item
+- requires complex certification or support
+- weak or anecdotal evidence
+
+## Report Style
+
+- one-sentence conclusion first
+- strengths and real risks for each candidate
+- evidence quality
+- next validation step
+- elimination log for rejected sub-directions

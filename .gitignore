@@ -140,18 +140,28 @@ dist
 
 # Custom VCPToolBox ignores
 
+# ===== 私有本地资料 =====
+.private/
+Plugin/**/.private/
+
 # ===== 环境配置文件 =====
 # 所有插件的实际 config.env（保留 .example）
 config.env
+config_old.env
+config*.bak*
+config - 副本.env
 config.env.local
 **/config.env
 !**/config.env.example
+**/*credentials*.env
+**/*token*.env
 
 # 有 .example 对应的运行时配置
 ModelRedirect.json
 agent_map.json
 preprocessor_order.json
 tag-processor-config.env
+sarprompt.json
 
 # ===== 运行时数据 / 缓存 =====
 *.sqlite
@@ -163,10 +173,37 @@ dailynote/*
 !dailynote/VCP桌面知识/
 ip_blacklist.json
 /VectorStore
+/VectorStoreTDB/
+/VCPAsyncResults/
+/file/
+/bak/
 
 # 插件缓存文件
+Plugin/*/.backup/
+Plugin/*/temp/
+Plugin/*/__pycache__/
+Plugin/**/*.pyc
+Plugin/**/runs/**
+!Plugin/**/runs/
+!Plugin/**/runs/**/
+!Plugin/**/runs/**/.gitkeep
 Plugin/ArtistMatcher/artist_cache.json
 Plugin/DailyHot/dailyhot_cache.md
+Plugin/AgentAssistant/agent_scores.json
+Plugin/AgentAssistant/config.json
+Plugin/AgentDream/dream_logs/
+Plugin/AgentDream/dream_schedule_state.json
+Plugin/VCPTaskAssistant/task-center-data.json
+Plugin/AmazonAds/state/
+Plugin/AmazonSPAPI/state/
+Plugin/AmazonSPAPI/**/state/
+Plugin/MCPO/amazon_ads_credentials.env
+Plugin/MCPO/mcp-config.json
+Plugin/MCPO/custom-mcp-config/mcp-config.json
+Plugin/MCPO/custom-mcp-config/*.backup*.json
+Plugin/mcp-config.json
+Plugin/VCPTavern/access_logs.json
+Plugin/DoubaoGen/.doubao_api_cache.json
 Plugin/EmojiListGenerator/generated_lists/
 Plugin/FRPSInfoProvider/frps_info_cache.txt
 Plugin/ImageProcessor/image_cache.json
@@ -188,6 +225,10 @@ Plugin/WeatherReporter/weather_cache.txt
 Plugin/WeatherReporter/city_cache.txt
 ToolConfigs/dynamic_tool_catalog.json
 ToolConfigs/dynamic_tool_categories.json
+Plugin/VCPBridgeServer/bridge-config.json
+TVStxt/bak/
+*.bak
+*.bak.*
 
 # ===== 图片 / 媒体 =====
 # 忽略通用表情包目录下的所有内容...
@@ -218,6 +259,8 @@ Thumbs.db
 
 # ===== 编译产物 =====
 rust-vexus-lite/target/
+venv/
+.venv/
 Plugin/DailyNoteSearcher/src/target/
 
 # ==== 分布式开发 ====

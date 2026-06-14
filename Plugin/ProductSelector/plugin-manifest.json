@@ -1,0 +1,107 @@
+{
+  "manifestVersion": "1.0.0",
+  "name": "ProductSelector",
+  "version": "1.2.0",
+  "displayName": "选品插件",
+  "description": "面向卖家精灵与 Amazon 的通用选品数据插件。支持 SellerSprite 产品研究、查竞品、关键词研究、关键词转化率，以及 Amazon 商品页和评论抓取。",
+  "author": "VCP Team",
+  "pluginType": "hybridservice",
+  "entryPoint": {
+    "type": "nodejs",
+    "script": "ProductSelector.js"
+  },
+  "communication": {
+    "protocol": "direct",
+    "timeout": 180000
+  },
+  "configSchema": {
+    "SELLERSPRITE_USERNAME": {
+      "type": "string",
+      "description": "卖家精灵登录账号。只应配置在插件本地 config.env 中。",
+      "default": ""
+    },
+    "SELLERSPRITE_PASSWORD": {
+      "type": "string",
+      "description": "卖家精灵登录密码。只应配置在插件本地 config.env 中。",
+      "default": ""
+    },
+    "SELLERSPRITE_LOGIN_TTL_HOURS": {
+      "type": "number",
+      "description": "卖家精灵登录状态复用时长，单位小时。默认 4；设为 0 表示每次都重新确认。",
+      "default": 4
+    },
+    "DebugMode": {
+      "type": "boolean",
+      "description": "是否开启 ProductSelector 调试日志。",
+      "default": false
+    }
+  },
+  "capabilities": {
+    "invocationCommands": [
+      {
+        "command": "run_sellersprite_research",
+        "description": "Run SellerSprite product-research: normalize product filters, reuse or confirm login, open the product-research URL through ChromeBridge, extract structured product candidates, and return a token-efficient merged ASIN table in summary_markdown. Key parameters: keywords, selectType, size, market, categories, minPrice/maxPrice, minReviews/maxReviews, minReviewRating/maxReviewRating, minSales/maxSales, putawayMonth, sellerTypes, sellerNationList, maxCandidates, result_mode. Categories must come from get_status.supported_categories. Compact summary includes asin, category_bsr, parent_sales, parent_sales_growth_rate, revenue, child_sales, child_revenue, variations, price, qa_count, review_count, monthly_new_reviews, rating, review_rate, fba_fee, profit_margin, putaway_date, seller_count, category fields. Debug/full or include_candidates=true returns raw candidate JSON and extra evidence."
+      },
+      {
+        "command": "build_sellersprite_url",
+        "description": "Build a SellerSprite product-research URL without opening Chrome. Use this only to debug product filter mapping."
+      },
+      {
+        "command": "run_sellersprite_competitor_lookup",
+        "description": "Run SellerSprite competitor-lookup: build https://www.sellersprite.com/v3/competitor-lookup with market, monthName default bsr_sales_nearly, ASIN/product URL, keywords, includeBrands, includeSellers, optional nodeIdPaths, then open through ChromeBridge and return the same token-efficient merged ASIN table as run_sellersprite_research. Key parameters: asin/asins/product_url, keywords, brand/includeBrands, seller/includeSellers, market, size, maxCandidates, result_mode. Debug/full or include_candidates=true returns raw candidate JSON."
+      },
+      {
+        "command": "build_sellersprite_competitor_url",
+        "description": "Build a SellerSprite competitor-lookup URL without opening Chrome. Use this to debug ASIN/brand/seller/keyword mapping."
+      },
+      {
+        "command": "run_sellersprite_keyword_research",
+        "description": "Run SellerSprite keyword-research: normalize keyword filters, reuse or confirm login, open the keyword-research URL through ChromeBridge, prefer DOM table extraction, and return compact keyword market metrics. Key parameters: station/market, month, departments/categories, includeKeywords, excludeKeywords, search/purchase/product/impression/growth/SPR/PPC/price/review/rating filters, withYearlyGrowth, maxCandidates, result_mode."
+      },
+      {
+        "command": "build_sellersprite_keyword_url",
+        "description": "Build a SellerSprite keyword-research URL without opening Chrome. Use this only to debug keyword filter mapping."
+      },
+      {
+        "command": "run_sellersprite_keyword_reverse",
+        "description": "Run SellerSprite keyword-reverse (competitor keyword lookup): build https://www.sellersprite.com/v3/keyword-reverse with market/marketId, date, badges (traffic source tags/groups, default all, e.g. '广告' for SB+Video+SP ads, '自然搜索' for organic), one ASIN only (asin/q), then open through ChromeBridge, extract the keyword table and return parsed competitor keyword metrics: rank, keyword, translation, traffic_share, traffic_count, traffic_type, organic_share, ad_share, organic_rank, ad_rank, aba_week_rank, monthly_searches, daily_searches, spr, title_density, monthly_purchases, purchase_rate, impressions, clicks, supply_demand_ratio, products, ad_competitors, aba_click_share, aba_conversion_share, ppc_bid. Key parameters: asin/q, market/station, date, badges, maxCandidates, result_mode. For multiple ASINs, call this command once per ASIN."
+      },
+      {
+        "command": "build_sellersprite_keyword_reverse_url",
+        "description": "Build a SellerSprite keyword-reverse URL without opening Chrome. Use this to debug ASIN, market, date, and badges mapping."
+      },
+      {
+        "command": "run_sellersprite_keyword_conversion_rate",
+        "description": "Run SellerSprite keyword-conversion-rate: build https://www.sellersprite.com/v3/keyword-conversion-rate with marketId, reverseType W/90D, keywordList, PPC bid match type exact/phrase/broad, optional searches/clicks/purchases/searchConv/clickConv/PPC/CPA/productPrice/ACOS/clickingRate/conversionRate/phraseCount filters, then open through ChromeBridge and return compact keyword conversion metrics. Default safety rule is one keyword per call because SellerSprite multi-keyword queries can drop terms; pass allow_multi_keywords=true only if you explicitly accept that risk. Compact summary includes period_searches, period_clicks, period_purchases, search_conversion_rate, click_conversion_rate, ppc_bid low/mid/high, CPA low/mid/high, product_price low/avg/high, ACOS max/avg/min, ad_budget, ABA click/conversion concentration, and top clicked ASIN shares. Metric notes explain that the values are industry keyword-level references from Amazon ABA/Opportunity Explorer and not single-product real conversion."
+      },
+      {
+        "command": "build_sellersprite_keyword_conversion_rate_url",
+        "description": "Build a SellerSprite keyword-conversion-rate URL without opening Chrome. Use this to debug keywordList, marketId, reverseType W/90D, bidMatchType, keywordMatchType, and conversion/profit-model filter mapping."
+      },
+      {
+        "command": "fetch_amazon_reviews",
+        "description": "Open an Amazon product review page through ChromeBridge, then ProductSelector extracts compact review data from #cm_cr-review_list HTML first and falls back to Markdown page_info parsing. ChromeBridge remains only the browser transport layer. Parameters: asin or url/review_url, market/station default US, maxReviews max 50, page_number/pageNumber/page, sort_by/sortBy recent|newest|helpful|top, filter_by_star/filterByStar/star all|5|4|3|2|1|positive|critical, cleanup_tabs, result_mode. Results include reviews with review_id, rating, title, body, author, date, region, verified_purchase, variant, helpful_count, image_urls; aggregate rating/count fields plus rating_breakdown when parseable. Compact mode omits raw page_info."
+      },
+      {
+        "command": "build_amazon_reviews_url",
+        "description": "Build the Amazon review URL only; does not open Chrome. US default format is https://www.amazon.com/product-reviews/{ASIN}. Optional query parameters are pageNumber, sortBy, filterByStar, and reviewerType."
+      },
+      {
+        "command": "fetch_amazon_product_info",
+        "description": "Open an Amazon /dp/{ASIN}?th=1 product page through ChromeBridge and extract compact listing information: title, rating, review_count, price, basic_info table, feature_bullets, rating_breakdown, and top review samples from the detail page. Parameters: asin or url/product_url, market/station default US, maxReviews, cleanup_tabs, result_mode."
+      },
+      {
+        "command": "build_amazon_product_url",
+        "description": "Build the Amazon product detail URL only; does not open Chrome. US default format is https://www.amazon.com/dp/{ASIN}?th=1."
+      },
+      {
+        "command": "login_sellersprite",
+        "description": "Open SellerSprite login through ChromeBridge and use ProductSelector/config.env credentials. Password is never returned."
+      },
+      {
+        "command": "get_status",
+        "description": "Return ProductSelector status, supported sites, supported SellerSprite top-level category whitelist, ChromeBridge readiness, SellerSprite login cache state, and recent run summary."
+      }
+    ]
+  }
+}

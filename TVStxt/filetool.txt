@@ -1,12 +1,23 @@
 四.文件管理
-1.文件搜索，基于Everything模块实现。
-tool_name:「始」LocalSearchController「末」,
+# 物理环境判别准则：
+## 凡是涉及 VCP 系统逻辑、插件配置、日志文件、/home/your-user/ 路径的操作，均判定为【服务器后端】。
+## 凡是涉及 历史记录.json、E:\ 盘符、或用户明确提到的“本地”操作，均判定为【本地前端】。
+
+1.文件搜索（环境差异强协议）。
+- 搜索【Windows本地前端】(路径如 E:\VCPchat\...)，使用 tool_name:「始」LocalSearchController「末」。该工具依赖 Windows Everything HTTP Server，query 支持 Everything 语法。
+- 搜索【Ubuntu服务器后端】(路径如 /home/your-user/...)：当前 ServerSearchController 仍是 Everything HTTP 兼容实现，会访问服务器本机 http://127.0.0.1:8025；除非已确认服务器端部署了兼容服务，否则不要调用 ServerSearchController。
+- 服务器端搜索优先策略：已知路径直接用 ServerFileOperator 的 ReadFile/FileInfo；已知目录用 ServerFileOperator 的 ListDirectory/SearchFiles；搜索 VCP 源码内容用 ServerCodeSearcher；必须执行 Linux 命令时才用 LinuxShellExecutor。
+- 查询 /home/your-user/、Plugin/、TVStxt/、config.env、日志文件等服务器文件时，禁止调用 LocalSearchController，也不要用 LinuxShellExecutor 代替文件读取/搜索。
+  tool_name:「始」LocalSearchController「末」, // 仅限 Windows 本地前端；ServerSearchController 仅在服务器端兼容服务已确认可用时使用
 command:「始」search「末」,
-query:「始」VCP a.txt「末」, //语法和Everything一致，支持高级语法，支持多tag混合搜索。
+query:「始」VCP a.txt「末」, // LocalSearchController 的语法和 Everything 一致；服务器端默认不要假设 Everything 可用。
 maxResults:「始」50「末」
 
-2.文件管理器。可以管理用户指定文件区域，也可以阅读全局文件。支持富文本格式读取。
-tool_name:「始」FileOperator「末」,
+2.2.文件管理器。【环境路由强协议】：
+- 操作【Ubuntu服务器后端】(路径如 /home/your-user/... 或VCP核心系统文件如dailynote、Plugin)，必须使用 tool_name:「始」ServerFileOperator「末」
+- 操作【Windows本地前端】(路径如 E:\VCPchat\... 或本地历史记录)，才使用 tool_name:「始」FileOperator「末」
+- 服务器端“查看某个文件/搜索某个文件/查看日志内容”属于文件操作，不属于 Shell 操作；不要先试 LinuxShellExecutor。
+tool_name:「始」FileOperator 或 ServerFileOperator「末」, // 严格按上述物理环境选择
 ①查看工作目录下所有文件列表。
 command:「始」ListAllowedDirectories「末」
 ②阅读文件，支持阅读电脑里任何区域文件，支持阅读多媒体文件，word/pdf文档等等富格式文件。
@@ -22,7 +33,7 @@ command:「始」AppendFile「末」,
 filePath:「始」/path/to/your/log.txt「末」,
 content:「始」
 在文件末尾追加内容「末」
-⑤编辑文件，编辑后会覆盖已有内容
+⑤编辑文件，编辑后会完全覆盖已有内容
 command:「始」EditFile「末」,
 filePath:「始」/path/to/existing_file.txt「末」,
 content:「始」这是覆盖后的新内容。「末」
@@ -33,36 +44,48 @@ showHidden:「始」false「末」 //是否返回隐藏文件
 ⑦查询文件元数据（如大小、创建时间、修改时间、是否是目录等）
 command:「始」FileInfo「末」,
 filePath:「始」/path/to/your/file.txt「末」
-⑧复制文件
+⑧递归搜索文件或目录（服务器端/前端均优先使用对应 FileOperator，而不是 Shell）
+command:「始」SearchFiles「末」,
+searchPath:「始」/path/to/search「末」,
+pattern:「始」*.log「末」,
+options:「始」{"caseSensitive": false, "fileType": "file"}「末」
+⑨复制文件
 command:「始」CopyFile「末」,
 sourcePath:「始」/path/to/source.txt「末」,
 destinationPath:「始」/path/to/destination.txt「末」
-⑨移动文件
+⑩移动文件
 command:「始」MoveFile「末」,
 sourcePath:「始」/path/to/source.txt「末」,
 destinationPath:「始」/path/to/new_directory/source.txt「末」
-⑩重命名文件
+11.重命名文件
 command:「始」RenameFile「末」,
 sourcePath:「始」/path/to/old_name.txt「末」,
 destinationPath:「始」/path/to/new_name.txt「末」
-11.删除文件
+12.删除文件
 command:「始」DeleteFile「末」,
 filePath:「始」/path/to/deletable_file.txt「末」
-12.创建文件夹
+13.创建文件夹
 command:「始」CreateDirectory「末」,
 directoryPath:「始」/path/to/new_folder/sub_folder「末」
-13.编辑文件
+14.差分化编辑文件，适合对文件内进行部分修改
 command:「始」ApplyDiff「末」,
 filePath:「始」/path/to/your/file.txt「末」,
 searchString:「始」旧内容「末」,
 replaceString:「始」新内容「末」
-14.阅读网络文件
+15.阅读网络文件
 command:「始」WebReadFile「末」,
 url:「始」https://example.com/sample.jpg「末」
-15.下载文件
+16.下载文件
 command:「始」DownloadFile「末」,
 url:「始」http://example.com/archive.zip「末」
-16.构建批量指令——FileOperator支持批量指令例如：
+17.聊天历史编辑器。安全可靠的编辑.json格式的聊天历史文件，有健全的兜底机制避免json文件被损毁。
+command:「始」UpdateHistory「末」,
+filePath:「始」H:\path\to\your\history.json「末」,
+searchString:「始」这是我想修改的旧内容。「末」,
+replaceString:「始」这是替换后的新内容。「末」,
+archery:「始」no_reply「末」  // 可选，更新上下文不需要工具回执。
+
+18.构建批量指令——FileOperator支持批量指令例如：
 <<<[TOOL_REQUEST]>>>
 tool_name:「始」FileOperator「末」,
 command1:「始」RenameFile「末」,
@@ -77,8 +100,62 @@ content3:「始」这是覆盖后的新内容。「末」
 <<<[END_TOOL_REQUEST]>>>
 通过这种方式可以构建多组指令。
 
-17.创建Canvas协同编辑器
+
+19.创建Canvas协同编辑器
 command:「始」CreateCanvas「末」,
 fileName:「始」new_canvas.js「末」,
 content:「始」console.log('Hello, Canvas!');「末」
-这是一个非常强大的指令，它将创建一个即时的IDE/文档编译窗口，允许你和用户共同编辑内部内容。该窗口拥有强大的渲染器和编译器，非常适合向用户展示代码或者大型文案，并且邀请用户一同编辑它。
+这是一个非常强大的指令，它将创建一个即时的IDE/文档编译窗口，允许你和用户共同编辑内部内容。该窗口拥有强大的渲染器和编译器，非常适合向用户展示代码或者大型文案，并且邀请用户一同编辑它。灵活使用之前的各类文件编辑工具来和用户一起编辑canvas内容吧。
+
+20.[重要]如何创建“内部内容有「始」，「末」”的文件！使用转义文件创造插件，它会自动将文本内的「始exp」，「末exp」，<<<[TOOL_REQUEST_EXP]>>>，<<<[END_TOOL_REQUEST_EXP]>>>进行替换，从而安全创造包含始末的文件。
+tool_name:「始」FileOperator「末」,
+command:「始」WriteEscapedFile「末」,
+filePath:「始」/path/to/new_plugin/plugin-manifest.json「末」,
+content:「始」{
+  "description": "...调用格式:\n<<<[TOOL_REQUEST_EXP]>>>\ntool_name:「始exp」MyNewPlugin「末exp」,\n...\n<<<[END_TOOL_REQUEST_EXP]>>>"
+}「末」
+
+[重要提示：事实上，在你向用户演示指令，而非真正调用工具的时候，也应该遵守exp转义原则！]
+
+21.命令行工具（环境路由强协议）。
+PowerShellExecutor/ServerPowerShellExecutor 是 Windows PowerShell 工具，会启动 powershell.exe；Ubuntu 服务器后端不要使用 ServerPowerShellExecutor。
+直接查看/编辑文件时优先使用 FileOperator/ServerFileOperator，只有确实需要执行系统命令时才调用 Shell 工具。
+【环境路由强协议】：
+- 操控【Ubuntu服务器后端】(Linux Shell)，必须使用 tool_name:「始」LinuxShellExecutor「末」
+- 操控【Windows本地前端】(带GUI窗口)，才使用 tool_name:「始」PowerShellExecutor「末」
+- LinuxShellExecutor 必须显式传 hostId；操作当前 Ubuntu 服务器一律使用 hostId:「始」local「末」。除非用户明确指定远程资产并确认 SSH 可用，不要选择 DB1、DE-server 等发现列表里的 SSH 主机。
+- LinuxShellExecutor 不用于读取/搜索文件；如确需执行只读命令，避免使用重定向符号、2>&1、后台 &、分号 ;。
+- LinuxShellExecutor 只读检索命令应优先写成安全管道，例如 `grep -rn "关键词" /path/to/VCPToolBox/Plugin/ | head -n 100`、`find /path/to/VCPToolBox/Plugin -type f -mmin -120 -maxdepth 2 | head -n 100`。不要使用 `2>/dev/null` 或 `|| true`。
+tool_name:「始」LinuxShellExecutor 或 PowerShellExecutor「末」, // 严格按上述物理环境选择
+command:「始」ls -la /path/to/VCPToolBox「末」,
+hostId:「始」local「末」, // LinuxShellExecutor 必填；当前服务器固定 local
+timeout:「始」60000「末」,
+outputFormat:「始」formatted「末」
+
+22.代码检索器。
+调用此工具在 VCP 服务器后端源码中搜索指定的代码片段或关键词。支持使用正则表达式进行高级搜索。通过这个插件更快理解 VCP 服务器工作原理！搜索 `server.js`、`Plugin.js`、`modules/`、`routes/`、`Plugin/`、`TVStxt/` 等 VCP 项目文件时，优先使用本工具，不要改用 LinuxShellExecutor。
+参数:
+- query (字符串, 必需): 需要搜索的关键词、代码片段或正则表达式。
+- search_path (字符串, 可选): 指定要搜索的相对路径。如果未提供，则默认为整个项目的工作区。
+- case_sensitive (布尔值, 可选, 默认false): 是否区分大小写搜索。
+- whole_word (布尔值, 可选, 默认false): 是否进行全词匹配。
+- context_lines (整数, 可选, 默认2): 返回结果时，在匹配行前后额外显示的上下文行数。
+tool_name:「始」ServerCodeSearcher「末」,   // VCP 后端源码搜索固定使用 ServerCodeSearcher；不要写 CodeSearcher
+query:「始」关键词或正则表达式「末」,
+search_path:「始」(可选)相对路径「末」,
+case_sensitive:「始」(可选)true/false「末」,
+whole_word:「始」(可选)true/false「末」,
+context_lines:「始」(可选)数字「末」
+
+示例：
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ServerCodeSearcher「末」,
+query:「始」admin_api/server/restart「末」,
+search_path:「始」Plugin「末」,
+context_lines:「始」2「末」
+<<<[END_TOOL_REQUEST]>>>
+
+
+
+
+
