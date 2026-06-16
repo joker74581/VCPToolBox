@@ -140,6 +140,10 @@ dist
 
 # Custom VCPToolBox ignores
 
+# ===== 本地临时测试脚本 =====
+test_chrome.js
+test_open_url.js
+
 # ===== 私有本地资料 =====
 .private/
 Plugin/**/.private/
