@@ -468,31 +468,212 @@ function isCredentialErrorPage(result = {}) {
   return /密码错误|密码不正确|账号或密码|用户名或密码|账户名与密码|登录失败|账号不存在|用户不存在|invalid password|invalid credentials|incorrect password|wrong password/i.test(collectPageText(result));
 }
 
-async function login({ chromeBridgeClient, username, password, timeout = 20000 }) {
-  const openResult = await chromeBridgeClient.openUrl(LOGIN_URL, timeout);
-  let urlWaitResult = null;
-  if (typeof chromeBridgeClient.waitForUrl === 'function') {
-    try {
-      urlWaitResult = await chromeBridgeClient.waitForUrl('sellersprite.com', Math.min(timeout, 15000));
-    } catch (error) {
-      const currentUrl = String(openResult.page_state?.url || '');
-      if (!/sellersprite\.com/i.test(currentUrl)) {
+function buildSellerSpriteLoginScript(username, password, timeout = 20000) {
+  return `
+    const username = ${JSON.stringify(username)};
+    const password = ${JSON.stringify(password)};
+    const timeoutMs = Math.max(3000, Math.min(Number(${JSON.stringify(timeout)}) || 20000, 30000));
+
+    const isVisible = element => {
+      if (!element || !element.isConnected) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        style.opacity !== '0' &&
+        rect.width > 0 &&
+        rect.height > 0;
+    };
+
+    const firstVisible = selectors => {
+      for (const selector of selectors) {
+        const element = Array.from(document.querySelectorAll(selector)).find(isVisible);
+        if (element) return element;
+      }
+      return null;
+    };
+
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const pageText = () => [
+      document.title || '',
+      location.href || '',
+      document.body?.innerText || ''
+    ].join('\\n');
+    const hasLoggedInSignal = () => /VIP会员|晚上好|工作台|用户中心|退出登录|会员中心|套餐|XS[A-Z0-9]+/i.test(pageText());
+
+    const setNativeValue = (element, value) => {
+      const prototype = element.tagName === 'TEXTAREA'
+        ? window.HTMLTextAreaElement.prototype
+        : window.HTMLInputElement.prototype;
+      const valueSetter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+      const previousValue = element.value;
+      if (valueSetter) {
+        valueSetter.call(element, value);
+      } else {
+        element.value = value;
+      }
+      if (element._valueTracker) {
+        element._valueTracker.setValue(previousValue);
+      }
+    };
+
+    const dispatchInputEvents = element => {
+      element.dispatchEvent(new InputEvent('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        inputType: 'insertText',
+        data: element.value || '',
+        composed: true
+      }));
+      element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true, composed: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true, composed: true }));
+    };
+
+    const fillInput = (element, value) => {
+      if (!element) throw new Error('login input not found');
+      element.scrollIntoView({ block: 'center', inline: 'center' });
+      element.focus();
+      setNativeValue(element, value);
+      dispatchInputEvents(element);
+      if (element.value !== value) {
+        setNativeValue(element, value);
+        dispatchInputEvents(element);
+      }
+      if (element.value !== value) {
+        throw new Error('login input value verification failed');
+      }
+    };
+
+    const clickLikeUser = element => {
+      if (!element) throw new Error('login submit button not found');
+      element.scrollIntoView({ block: 'center', inline: 'center' });
+      const rect = element.getBoundingClientRect();
+      const init = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        button: 0,
+        buttons: 1,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + rect.height / 2
+      };
+      element.dispatchEvent(new MouseEvent('mousedown', init));
+      element.focus();
+      element.dispatchEvent(new MouseEvent('mouseup', { ...init, buttons: 0 }));
+      element.dispatchEvent(new MouseEvent('click', { ...init, buttons: 0 }));
+      if (typeof element.click === 'function') element.click();
+    };
+
+    const usernameSelectors = [
+      'input[name="email"]',
+      'input[name="username"]',
+      'input[name="account"]',
+      'input[name="phone"]',
+      'input[autocomplete="username"]',
+      'input[type="email"]',
+      'input[type="tel"]',
+      'input[placeholder*="邮箱"]',
+      'input[placeholder*="账号"]',
+      'input[placeholder*="账户"]',
+      'input[placeholder*="用户名"]',
+      'input[placeholder*="手机"]',
+      'input[type="text"]'
+    ];
+    const passwordSelectors = [
+      'input[name="password"]',
+      'input[type="password"]',
+      'input[placeholder*="密码"]'
+    ];
+
+    let usernameInput = null;
+    let passwordInput = null;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (hasLoggedInSignal()) {
         return {
-          ...openResult,
-          success: false,
-          login_url: LOGIN_URL,
-          page_mismatch: true,
-          error: `SellerSprite login page did not become active before form interaction: ${error.message}`
+          already_logged_in: true,
+          submitted: false,
+          url: location.href,
+          title: document.title
         };
+      }
+      usernameInput = firstVisible(usernameSelectors);
+      passwordInput = firstVisible(passwordSelectors);
+      if (usernameInput && passwordInput) break;
+      await sleep(100);
+    }
+
+    if (!usernameInput || !passwordInput) {
+      return {
+        inputs_not_found: true,
+        submitted: false,
+        url: location.href,
+        title: document.title,
+        text_sample: pageText().slice(0, 1200)
+      };
+    }
+
+    fillInput(usernameInput, username);
+    fillInput(passwordInput, password);
+
+    const buttons = Array.from(document.querySelectorAll([
+      'button[type="submit"]',
+      'button.login-btn',
+      '.login-btn',
+      '.btn-login',
+      '[role="button"]',
+      'button',
+      'input[type="submit"]'
+    ].join(','))).filter(isVisible);
+    const submitButton = buttons.find(button => /登录|log\\s*in|sign\\s*in/i.test(button.innerText || button.value || button.textContent || '')) || buttons[0];
+
+    if (submitButton) {
+      clickLikeUser(submitButton);
+    } else {
+      const form = passwordInput.closest('form') || usernameInput.closest('form');
+      if (!form) throw new Error('login form submit target not found');
+      form.requestSubmit ? form.requestSubmit() : form.submit();
+    }
+
+    await sleep(500);
+    return {
+      filled_username: Boolean(usernameInput && usernameInput.value),
+      filled_password: Boolean(passwordInput && passwordInput.value),
+      submitted: true,
+      url: location.href,
+      title: document.title
+    };
+  `;
+}
+
+async function login({ chromeBridgeClient, username, password, timeout = 20000 }) {
+  let openResult;
+  try {
+    openResult = await chromeBridgeClient.openUrl(LOGIN_URL, timeout);
+  } catch (error) {
+    openResult = {
+      success: false,
+      login_url: LOGIN_URL,
+      error: `Unable to open SellerSprite login page without ChromeBridge open_url: ${error.message}`
+    };
+  }
+
+  if (typeof chromeBridgeClient.switchTab === 'function') {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await chromeBridgeClient.switchTab('sellersprite.com', Math.min(timeout, 10000));
+        break;
+      } catch (error) {
+        if (attempt === 4) break;
+        await new Promise(resolve => setTimeout(resolve, 200));
       }
     }
   }
 
   const navigationResult = {
     ...openResult,
-    page_state: urlWaitResult?.page_state || openResult.page_state,
-    page_info: urlWaitResult?.page_info || openResult.page_info,
-    url_wait_result: urlWaitResult || undefined
+    page_state: openResult.page_state,
+    page_info: openResult.page_info
   };
 
   if (isLoggedInPage(navigationResult)) {
@@ -534,22 +715,31 @@ async function login({ chromeBridgeClient, username, password, timeout = 20000 }
     };
   }
 
-  const formResult = await chromeBridgeClient.call({
-    command1: 'type',
-    selector1: 'input[name="email"], input[name="username"], input[type="text"]',
-    text1: username,
-    mode1: 'replace',
-    timeout1: timeout,
-    command2: 'type',
-    selector2: 'input[name="password"], input[type="password"]',
-    text2: password,
-    mode2: 'replace',
-    timeout2: timeout,
-    command3: 'click',
-    selector3: 'button[type="submit"], button.login-btn, .login-btn',
-    timeout3: timeout,
-    on_error: 'return_page_info'
-  });
+  let formResult = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      formResult = await chromeBridgeClient.call({
+        command: 'execute_script',
+        text: buildSellerSpriteLoginScript(username, password, timeout),
+        timeout
+      });
+      break;
+    } catch (error) {
+      formResult = {
+        success: false,
+        error: error.message || 'SellerSprite login form interaction failed.'
+      };
+      if (attempt === 2) break;
+      if (typeof chromeBridgeClient.switchTab === 'function') {
+        try {
+          await chromeBridgeClient.switchTab('sellersprite.com', Math.min(timeout, 10000));
+        } catch (_) {
+          // The next attempt may still land on the active navigating tab.
+        }
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
 
   if (formResult.success === false) {
     const credentialError = isCredentialErrorPage(formResult);
@@ -564,11 +754,47 @@ async function login({ chromeBridgeClient, username, password, timeout = 20000 }
     };
   }
 
+  if (formResult.result?.already_logged_in) {
+    return {
+      ...formResult,
+      success: true,
+      already_logged_in: true,
+      login_url: LOGIN_URL,
+      message: 'SellerSprite is already logged in.'
+    };
+  }
+
   if (isCredentialErrorPage(formResult)) {
     return {
       ...formResult,
       success: false,
       login_url: LOGIN_URL,
+      credential_error: true,
+      error: 'SellerSprite credential error: username or password is incorrect.'
+    };
+  }
+
+  const immediatePageInfoResult = await chromeBridgeClient.getPageInfo(Math.min(timeout, 5000));
+  if (isLoggedInPage(immediatePageInfoResult)) {
+    return {
+      ...immediatePageInfoResult,
+      login_url: LOGIN_URL,
+      form_result: {
+        success: formResult.success !== false,
+        completed_steps: formResult.completed_steps,
+        step_results: formResult.step_results,
+        script_result: formResult.result
+      },
+      success: true,
+      already_logged_in: false,
+      message: 'SellerSprite login succeeded.'
+    };
+  }
+
+  if (isCredentialErrorPage(immediatePageInfoResult)) {
+    return {
+      ...immediatePageInfoResult,
+      success: false,
       credential_error: true,
       error: 'SellerSprite credential error: username or password is incorrect.'
     };

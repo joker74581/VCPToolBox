@@ -4,6 +4,23 @@
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$APP_DIR"
 
+
+
+# ---------------------------------------------------------
+# 尝试加载 Node.js 环境 (应对宝塔/Cron 等非交互式环境找不到 pm2 的问题)
+# ---------------------------------------------------------
+# 强制获取并导出当前执行用户的真实 HOME 目录（应对宝塔计划任务中 HOME 变量丢失的问题）
+USER_HOME=$(getent passwd $(whoami) | cut -d: -f6)
+export HOME="$USER_HOME"
+
+# 1. 补充常见的全局 Node 路径兜底（涵盖各种系统级安装），放到 PATH 最末尾，优先级最低
+export PATH="$PATH:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:/www/server/nodejs/v24.14.1/bin"
+
+# 2. 动态尝试加载当前用户的 NVM (Node Version Manager)
+# 放在后面执行，是因为 nvm 会把自己的路径强行插到 PATH 的最前面，确保 NVM 拥有最高优先级！
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
 # 激活 Python 虚拟环境（供 PM2 子进程继承）
 export VIRTUAL_ENV="$APP_DIR/venv"
 export PATH="$VIRTUAL_ENV/bin:$PATH"

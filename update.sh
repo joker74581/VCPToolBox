@@ -69,16 +69,27 @@ UPSTREAM_HEAD="$(git rev-parse "upstream/$BRANCH")"
 
 if [ "$LOCAL_HEAD" = "$UPSTREAM_HEAD" ]; then
     echo "[Git] 当前已经是作者最新版本。"
+elif git merge-base --is-ancestor "$LOCAL_HEAD" "$UPSTREAM_HEAD"; then
+    echo "[Git] 本地没有额外提交，快进到作者最新版本..."
+    git merge --ff-only "upstream/$BRANCH"
+elif git merge-base --is-ancestor "$UPSTREAM_HEAD" "$LOCAL_HEAD"; then
+    echo "[Git] 你的本地提交已经包含作者最新版，无需合并。"
 else
-    echo "[Git] 准备合并 upstream/$BRANCH。"
-    if git merge --ff-only "upstream/$BRANCH"; then
-        echo "[Git] 已快进到作者最新版本。"
+    echo "[Git] 检测到作者仓库有新提交，同时你本地也有自定义提交。"
+    echo "[Git] 正在尝试 rebase，把你的提交挪到作者新代码之后..."
+    if git rebase "upstream/$BRANCH"; then
+        echo "[Git] rebase 完成。"
     else
-        echo "[Git] 当前分支包含本地提交，不能快进合并。"
-        echo "可选处理方式："
-        echo "  git rebase upstream/$BRANCH   # 推荐：把你的提交挪到作者新代码之后"
-        echo "  git merge upstream/$BRANCH    # 备选：保留一个合并提交"
-        fail "需要人工选择 rebase 或 merge。"
+        echo ""
+        echo "[Git] rebase 遇到冲突，已停止在冲突现场。"
+        echo "请手工处理冲突后执行："
+        echo "  git status --short"
+        echo "  git add <已解决的文件>"
+        echo "  git rebase --continue"
+        echo ""
+        echo "如果想放弃这次 rebase，执行："
+        echo "  git rebase --abort"
+        fail "需要人工解决 rebase 冲突。"
     fi
 fi
 

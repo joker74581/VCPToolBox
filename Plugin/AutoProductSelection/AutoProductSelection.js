@@ -8,16 +8,10 @@ const AUTO_SELECTION_RUNS_DIR = path.join(__dirname, 'runs');
 const AUTO_SELECTION_STRATEGY_PROFILE_PATH = path.join(__dirname, 'AutoSelectionStrategyProfile.md');
 const AGENT_TASK_DIR = path.join(VCP_ROOT_DIR, 'file', 'document', 'AgentTask');
 const AUTO_SELECTION_STAGES = new Set(['brief', 'raw', 'scored', 'archived', 'failed', 'locks']);
-const AUTO_SELECTION_SCOUT_AGENT_NAME = process.env.AUTO_SELECTION_SCOUT_AGENT_NAME || 'ProductSelectionScout';
-const AUTO_SELECTION_REVIEWER_AGENT_NAME = process.env.AUTO_SELECTION_REVIEWER_AGENT_NAME || 'ProductSelectionReviewer';
-const AUTO_SELECTION_SCOUT_TASK_PREFIXES = (process.env.AUTO_SELECTION_SCOUT_TASK_PREFIXES || `APS_SCOUT_,${AUTO_SELECTION_SCOUT_AGENT_NAME}_`)
-  .split(',')
-  .map(value => value.trim())
-  .filter(Boolean);
-const AUTO_SELECTION_REVIEWER_TASK_PREFIXES = (process.env.AUTO_SELECTION_REVIEWER_TASK_PREFIXES || `APS_REVIEWER_,${AUTO_SELECTION_REVIEWER_AGENT_NAME}_`)
-  .split(',')
-  .map(value => value.trim())
-  .filter(Boolean);
+let AUTO_SELECTION_SCOUT_AGENT_NAME = process.env.AUTO_SELECTION_SCOUT_AGENT_NAME || 'ProductSelectionScout';
+let AUTO_SELECTION_REVIEWER_AGENT_NAME = process.env.AUTO_SELECTION_REVIEWER_AGENT_NAME || 'ProductSelectionReviewer';
+let AUTO_SELECTION_SCOUT_TASK_PREFIXES = parsePrefixList(process.env.AUTO_SELECTION_SCOUT_TASK_PREFIXES || `APS_SCOUT_,${AUTO_SELECTION_SCOUT_AGENT_NAME}_`);
+let AUTO_SELECTION_REVIEWER_TASK_PREFIXES = parsePrefixList(process.env.AUTO_SELECTION_REVIEWER_TASK_PREFIXES || `APS_REVIEWER_,${AUTO_SELECTION_REVIEWER_AGENT_NAME}_`);
 
 const AUTO_SELECTION_FILE_SUFFIX = {
   brief: 'brief.md',
@@ -34,6 +28,43 @@ function nowIso() {
 
 function debugLog(...args) {
   if (debugMode) console.log('[AutoProductSelection]', ...args);
+}
+
+function parsePrefixList(value) {
+  return String(value || '')
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
+function configureAutoSelectionRuntime(config = {}) {
+  AUTO_SELECTION_SCOUT_AGENT_NAME = String(
+    config.AUTO_SELECTION_SCOUT_AGENT_NAME ||
+    process.env.AUTO_SELECTION_SCOUT_AGENT_NAME ||
+    AUTO_SELECTION_SCOUT_AGENT_NAME ||
+    'ProductSelectionScout'
+  ).trim();
+  AUTO_SELECTION_REVIEWER_AGENT_NAME = String(
+    config.AUTO_SELECTION_REVIEWER_AGENT_NAME ||
+    process.env.AUTO_SELECTION_REVIEWER_AGENT_NAME ||
+    AUTO_SELECTION_REVIEWER_AGENT_NAME ||
+    'ProductSelectionReviewer'
+  ).trim();
+
+  const scoutPrefixes = parsePrefixList(
+    config.AUTO_SELECTION_SCOUT_TASK_PREFIXES ||
+    process.env.AUTO_SELECTION_SCOUT_TASK_PREFIXES ||
+    `APS_SCOUT_,${AUTO_SELECTION_SCOUT_AGENT_NAME}_`
+  );
+  const reviewerPrefixes = parsePrefixList(
+    config.AUTO_SELECTION_REVIEWER_TASK_PREFIXES ||
+    process.env.AUTO_SELECTION_REVIEWER_TASK_PREFIXES ||
+    `APS_REVIEWER_,${AUTO_SELECTION_REVIEWER_AGENT_NAME}_`
+  );
+  const scoutAgentPrefix = `${AUTO_SELECTION_SCOUT_AGENT_NAME}_`;
+  const reviewerAgentPrefix = `${AUTO_SELECTION_REVIEWER_AGENT_NAME}_`;
+  AUTO_SELECTION_SCOUT_TASK_PREFIXES = scoutPrefixes.includes(scoutAgentPrefix) ? scoutPrefixes : [...scoutPrefixes, scoutAgentPrefix];
+  AUTO_SELECTION_REVIEWER_TASK_PREFIXES = reviewerPrefixes.includes(reviewerAgentPrefix) ? reviewerPrefixes : [...reviewerPrefixes, reviewerAgentPrefix];
 }
 
 function referencesStrategyProfile(value) {
@@ -171,6 +202,31 @@ function classifyMissingWorkerOutput(completedTask = {}) {
   }
 
   if (
+    combined.includes('达到最大轮数限制') ||
+    combined.includes('任务尚未自动上报完成') ||
+    combined.includes('max round') ||
+    combined.includes('maximum round')
+  ) {
+    return {
+      classification: 'worker_max_rounds_no_handoff',
+      safe_to_retry_once: true,
+      reason: 'Worker exhausted AgentAssistant rounds without writing raw/scored/failed; retry once with the stricter bounded worker prompt.'
+    };
+  }
+
+  if (
+    combined.includes('未被工具循环处理的 tool_request') ||
+    combined.includes('工具请求格式无法被解析器识别') ||
+    combined.includes('unprocessed_tool_request')
+  ) {
+    return {
+      classification: 'worker_unprocessed_tool_request_no_handoff',
+      safe_to_retry_once: true,
+      reason: 'Worker emitted a TOOL_REQUEST that the VCP loop did not process; retry once with the bounded worker prompt.'
+    };
+  }
+
+  if (
     combined.includes('未找到名为') ||
     combined.includes('tool_name:「始\\"productselector\\"末」') ||
     combined.includes('tool_name:「始"productselector"末」') ||
@@ -224,12 +280,14 @@ async function findCompletedWorkerWithoutOutput(lockFile) {
     const lockTime = new Date(lockFile.modified_at).getTime();
     const matches = [];
     for (const entry of entries) {
-      if (!entry.isFile() || !workerPrefixes.some(prefix => entry.name.startsWith(prefix)) || !entry.name.endsWith('.md')) continue;
+      if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+      const hasExpectedPrefix = workerPrefixes.some(prefix => entry.name.startsWith(prefix));
       const fullPath = path.join(AGENT_TASK_DIR, entry.name);
       const stat = await fs.stat(fullPath);
       if (stat.mtime.getTime() + 5000 < lockTime) continue;
       const content = await fs.readFile(fullPath, 'utf8');
       if (!content.includes(lockFile.run_id)) continue;
+      if (!hasExpectedPrefix && !content.includes('## 原始委托要求')) continue;
       if (!content.includes('任务状态:** Succeed') && !content.includes('任务状态:** Failed')) continue;
       const delegationId = (entry.name.match(/(aa-delegation-[^.]+)\.md$/) || [])[1] || '';
       const asyncResultPath = delegationId ? path.join(VCP_ROOT_DIR, 'VCPAsyncResults', `AgentAssistant-${delegationId}.json`) : '';
@@ -475,6 +533,8 @@ async function autoSelectionReadRunFile(args = {}) {
 
 function buildAutoSelectionWorkerPrompt(worker, runId) {
   const safeRunId = normalizeAutoSelectionRunId(runId);
+  const completionMarkerInstruction = '完成时输出两个英文左方括号、TaskComplete、两个英文右方括号组成的完成标记。不要在写文件成功前输出该完成标记。';
+  const callRhythmInstruction = '调用节奏：每一轮回复最多只发送 1 个 TOOL_REQUEST；等待工具摘要返回后，再基于结果决定下一步，不要在同一轮连续发多个工具块。';
   if (worker === 'hawkeye') {
     return `请执行一次自动选品取证任务。
 
@@ -483,9 +543,13 @@ brief_stage: brief
 success_stage: raw
 failure_stage: failed
 
+${callRhythmInstruction}
+
 先用 AutoProductSelection 读取 brief，读不到 brief 就写 failed。接着尝试读取已有的 raw 数据包，如果存在，说明是回环补采，请保留旧数据仅针对 brief 要求的缺口进行增量抓取并合并覆盖写回 raw；如果不存在则正常从头开始。只用 ProductSelector 串行取证，一次只调用一个数据命令。至少取得一个可追溯 ASIN/产品候选，除非 brief 明确只要求市场预研。
 
-成功或部分成功时写 raw_data_pack 到 raw；工具阻断、数据不可追溯、只有自然语言观察、页面/账号错误或 brief 不可读时写 failed。raw 必须包含 route_decision、tool_decisions、evidence_matrix、asin_source_map、elimination_log、execution_summary.data_tools_called。只有写文件成功后才能 [[TaskComplete]]。不要调用评审 Agent，不发论坛，不写 DailyNote。`;
+硬性边界：ProductSelector 数据命令总数最多 3 次；同一个 command+核心参数最多重试 1 次；任何登录/页面/账号/工具协议错误连续出现 2 次，立刻写 failed。不要为了补齐理想字段反复搜索；拿到可追溯证据就落 raw，拿不到就落 failed。ProductSelector 返回 success=false、plugin_error、超时、空结果或不可追溯数据时，把原始错误摘要写入 failed 或 raw.execution_summary.fallback_log。
+
+成功或部分成功时写 raw_data_pack 到 raw；工具阻断、数据不可追溯、只有自然语言观察、页面/账号错误或 brief 不可读时写 failed。raw 必须包含 route_decision、tool_decisions、evidence_matrix、asin_source_map、elimination_log、execution_summary.data_tools_called、execution_summary.fallback_log。failed 必须包含 failure_type、tool_decisions、failed_commands、diagnosis、next_manual_action。${completionMarkerInstruction} 不要调用评审 Agent，不发论坛，不写 DailyNote。`;
   }
 
   if (worker === 'forge') {
@@ -496,9 +560,11 @@ raw_stage: raw
 success_stage: scored
 failure_stage: failed
 
+${callRhythmInstruction}
+
 先用 AutoProductSelection 读取 raw，读不到或 raw 缺结构化证据就写 failed。不要抓新数据，不发论坛，不写 DailyNote。
 
-审计取证 Agent 交付的证据，输出 scored_candidate_pack。若缺失 ProductSelector 仍能补到的核心数据，写 scored 但标记 PARTIAL，并让 post_forge_action.action=LOOPBACK_TO_HAWKEYE。只有证据足够或剩余缺口属于人工验证时，才允许 PUBLISH_FINAL。只有写文件成功后才能 [[TaskComplete]]。`;
+审计取证 Agent 交付的证据，输出 scored_candidate_pack。评审最多读取 raw 1 次、写结果 1 次；不要循环等待更完整证据。若缺失 ProductSelector 仍能补到的核心数据，写 scored 但标记 PARTIAL，并让 post_forge_action.action=LOOPBACK_TO_HAWKEYE，同时列出最多 3 个明确补采缺口。只有证据足够或剩余缺口属于人工验证时，才允许 PUBLISH_FINAL。${completionMarkerInstruction}`;
   }
 
   throw new Error(`Invalid auto-selection worker: ${worker}`);
@@ -777,6 +843,10 @@ function getStatus() {
     plugin: 'AutoProductSelection',
     version: '1.0.0',
     runs_dir: AUTO_SELECTION_RUNS_DIR,
+    scout_agent_name: AUTO_SELECTION_SCOUT_AGENT_NAME,
+    reviewer_agent_name: AUTO_SELECTION_REVIEWER_AGENT_NAME,
+    scout_task_prefixes: AUTO_SELECTION_SCOUT_TASK_PREFIXES,
+    reviewer_task_prefixes: AUTO_SELECTION_REVIEWER_TASK_PREFIXES,
     debugMode
   };
 }
@@ -835,6 +905,7 @@ async function processToolCall(args = {}) {
 
 async function initialize(config = {}) {
   debugMode = config.DebugMode === true;
+  configureAutoSelectionRuntime(config);
   await ensureAutoSelectionRunDirs();
   console.log('[AutoProductSelection] Plugin initialized.');
 }

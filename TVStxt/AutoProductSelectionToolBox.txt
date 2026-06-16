@@ -1,45 +1,49 @@
-# AutoProductSelection ToolBox
+# AutoProductSelection (自动选品) 工具箱
 
-`AutoProductSelection` manages the automated product-selection state machine. It does not scrape product data itself. Use `ProductSelector` or another data plugin for marketplace evidence.
+`AutoProductSelection` 专门管理自动选品的状态机流程。**它本身不进行任何商品数据抓取**。抓取选品数据、查市场证据等请继续使用 `ProductSelector` 或其他数据插件。
 
-## Runtime Directory
+## 运行数据目录 (Runtime Directory)
 
 ```text
 Plugin/AutoProductSelection/runs/
-  brief/
-  raw/
-  scored/
-  failed/
-  archived/
-  locks/
+  brief/     # 任务大纲
+  raw/       # 原始数据结果
+  scored/    # 评分结果
+  failed/    # 失败记录
+  archived/  # 归档数据
+  locks/     # 线程锁
 ```
 
-`runs/` is runtime data. Do not commit real run outputs to a public repository.
+`runs/` 存放的是运行时的临时状态数据，请不要将真实的运行结果提交到公共代码库中。
 
-## Roles
+## 调用节奏 (Call Rhythm)
 
-- Coordinator: creates briefs, dispatches workers, reads queue state, archives outcomes.
-- Scout worker (`worker=hawkeye`): reads brief and writes raw or failed.
-- Reviewer worker (`worker=forge`): reads raw and writes scored or failed.
+自动选品 Worker（鹰眼/熔炉）每一轮回复最多只发送 1 个 `TOOL_REQUEST`。等待工具摘要返回后，再基于结果决定下一步；不要在同一轮连续发多个工具块。
 
-AgentAssistant names are configured with:
+## 角色分工 (Roles)
+
+- **协调者 (Coordinator)**：创建 brief 简报、分发调度 Worker 任务、读取队列状态、归档最终结果。
+- **侦察者 Worker (`worker=hawkeye`)**：读取 brief 简报，去执行抓取，然后写回 raw（原始数据） 或 failed（失败记录）。
+- **审查者 Worker (`worker=forge`)**：读取 raw 原始数据，评估并写回 scored（打分） 或 failed（失败记录）。
+
+处理这些子任务的 AgentAssistant 名字配置在环境变量中：
 
 ```text
 AUTO_SELECTION_SCOUT_AGENT_NAME
 AUTO_SELECTION_REVIEWER_AGENT_NAME
 ```
 
-## Strategy File
+## 选品策略配置文件
 
-The strategy file is not a run file:
+策略文件不是运行时数据，它是固定的配置文件：
 
 ```text
 Plugin/AutoProductSelection/AutoSelectionStrategyProfile.md
 ```
 
-Read it with a normal file-read tool before creating a new SelectionBrief. Do not call `auto_selection_read_run_file` for the strategy file.
+在创建新的选品任务 (SelectionBrief) 前，请用普通的文件读取工具去阅读它。**绝对不要**使用 `auto_selection_read_run_file` 去读策略文件。
 
-## Queue Status
+## 队列状态 (Queue Status)
 
 ```text
 <<<[TOOL_REQUEST]>>>
@@ -48,7 +52,23 @@ command:「始」auto_selection_queue_status「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-## Write A Brief
+如果 `next_action_hint=retry_worker_once`，说明某个 Worker 已完成但没有写出 raw/scored/failed，且诊断认为只允许安全重试一次。此时请用该条 `worker_missing_outputs` 的 `run_id`、`lock_name` 和 `retry_count+1` 重新调用 `auto_selection_prepare_dispatch`：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_prepare_dispatch「末」,
+worker:「始」hawkeye「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」,
+overwrite_lock:「始」true「末」,
+retry_count:「始」1「末」,
+dispatch_reason:「始」missing_output_retry「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+如果 `next_action_hint=handle_worker_missing_output`，不要继续分发同一个 Worker；请调用 `auto_selection_mark_worker_missing_output` 写入 failed 并清理锁。
+
+## 编写任务简报 (Write A Brief)
 
 ```text
 <<<[TOOL_REQUEST]>>>
@@ -62,7 +82,7 @@ content:「始」# SelectionBrief
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-## Dispatch Scout
+## 分发侦察任务 (Dispatch Scout)
 
 ```text
 <<<[TOOL_REQUEST]>>>
@@ -73,9 +93,11 @@ run_id:「始」APS-YYYYMMDD-topic「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-Immediately call AgentAssistant with the returned `agent_assistant_request`.
+收到返回的 `agent_assistant_request` 负载后，请**立即原样调用** AgentAssistant 工具进行任务分发。
 
-## Dispatch Reviewer
+AgentAssistant 提交成功后，如果返回 `{{VCP_ASYNC_RESULT::...}}` 占位符，不要把该占位符复制进你的回复。自动选品的真实状态只看 `AutoProductSelection/runs` 文件；等待 worker 时输出心跳，下一次醒来重新调用 `auto_selection_queue_status`。
+
+## 分发审查任务 (Dispatch Reviewer)
 
 ```text
 <<<[TOOL_REQUEST]>>>
@@ -86,7 +108,7 @@ run_id:「始」APS-YYYYMMDD-topic「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-## Read Handoff File
+## 读取交接文件 (Read Handoff File)
 
 ```text
 <<<[TOOL_REQUEST]>>>
@@ -97,7 +119,7 @@ run_id:「始」APS-YYYYMMDD-topic「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-## Cleanup
+## 清理操作 (Cleanup)
 
 - `auto_selection_move_run_file`
 - `auto_selection_delete_run_file`
@@ -105,4 +127,8 @@ run_id:「始」APS-YYYYMMDD-topic「末」
 - `auto_selection_mark_worker_missing_output`
 - `auto_selection_clear_locks`
 
-Use `auto_selection_mark_worker_missing_output` when queue status reports a worker completed without writing the expected raw/scored/failed file.
+如果在查询队列状态时发现一个 Worker 已经运行完成，但没有按照约定输出 raw/scored/failed 文件，请调用 `auto_selection_mark_worker_missing_output` 来标记缺失状态，防止流水线卡死。
+
+## 委托收尾纪律 (AgentAssistant Finalization)
+
+当协调者完成最终推荐归档、失败归档或阻断归档后，必须在同一轮回复末尾单独输出 `[[TaskComplete]]`。如果需要调用 DailyNote 写入《选品公共日记本》，最终归档阶段不要使用 `archery:no_reply` 作为最后动作；请等待 DailyNote 工具摘要返回，再输出简短完成说明和 `[[TaskComplete]]`。不要以工具请求作为整轮回复的最后内容，否则 AgentAssistant 会继续追问并可能进入空回复轮询。

@@ -45,7 +45,7 @@
     "invocationCommands": [
       {
         "command": "auto_selection_queue_status",
-        "description": "Inspect the automated product-selection handoff queue. Returns files in failed/scored/raw/brief/locks/archived, derived active_briefs/stale_briefs/valid_locks/malformed_locks/worker_missing_outputs, worker_timeout_minutes, and next_action_hint. Optional include_content=true includes content for failed/scored/raw files. Optional worker_timeout_minutes defaults to 60."
+        "description": "Inspect the automated product-selection handoff queue. Returns files in failed/scored/raw/brief/locks/archived, derived active_briefs/stale_briefs/valid_locks/malformed_locks/worker_missing_outputs, worker_timeout_minutes, and next_action_hint. If next_action_hint=retry_worker_once, redispatch the reported worker once with overwrite_lock=true and retry_count+1. If next_action_hint=handle_worker_missing_output, call auto_selection_mark_worker_missing_output. Optional include_content=true includes content for failed/scored/raw files. Optional worker_timeout_minutes defaults to 60."
       },
       {
         "command": "auto_selection_write_run_file",
@@ -57,7 +57,7 @@
       },
       {
         "command": "auto_selection_prepare_dispatch",
-        "description": "Prepare a worker dispatch. Parameters: worker hawkeye|forge, run_id/runId. For hawkeye, optional brief_content/content writes the brief before dispatch; otherwise an existing brief is required. For forge, an existing raw file is required. Creates the correct worker lock and returns agent_assistant_request fields. Hawkeye is injected with AutoProductSelection and ProductSelector; Forge is injected with AutoProductSelection. Use the returned fields to call AgentAssistant."
+        "description": "Prepare a worker dispatch. Parameters: worker hawkeye|forge, run_id/runId. For hawkeye, optional brief_content/content writes the brief before dispatch; otherwise an existing brief is required. For forge, an existing raw file is required. Optional retry_count/retryCount, dispatch_reason/dispatchReason, overwrite_lock/overwriteLock support the single retry path reported by queue_status. Creates the correct worker lock and returns agent_assistant_request fields. Hawkeye is injected with AutoProductSelection and ProductSelector; Forge is injected with AutoProductSelection. Use the returned fields to call AgentAssistant."
       },
       {
         "command": "auto_selection_move_run_file",

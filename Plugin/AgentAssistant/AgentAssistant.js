@@ -18,6 +18,8 @@ let DELEGATION_MAX_ROUNDS;
 let DELEGATION_TIMEOUT;
 let DELEGATION_SYSTEM_PROMPT;
 let DELEGATION_HEARTBEAT_PROMPT;
+let DELEGATION_TRACE_DEBUG;
+let DELEGATION_TRACE_MAX_CHARS;
 
 const AGENTS = {};
 const agentContexts = new Map();
@@ -31,6 +33,30 @@ let pushVcpInfo = () => { }; // Default no-op function
 let cleanupInterval;
 
 // --- Core Module Functions ---
+
+function truncateForTrace(value, maxChars = DELEGATION_TRACE_MAX_CHARS || 12000) {
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    if (!text) return '';
+    return text.length > maxChars ? `${text.slice(0, maxChars)}\n...[truncated ${text.length - maxChars} chars]` : text;
+}
+
+function writeDelegationTrace(delegationId, event) {
+    if (!DELEGATION_TRACE_DEBUG || !delegationId) return;
+    try {
+        const traceDir = path.join(__dirname, '..', '..', 'file', 'document', 'AgentTaskTrace');
+        if (!fs.existsSync(traceDir)) {
+            fs.mkdirSync(traceDir, { recursive: true });
+        }
+        const tracePath = path.join(traceDir, `${delegationId}.jsonl`);
+        fs.appendFileSync(tracePath, `${JSON.stringify({
+            timestamp: new Date().toISOString(),
+            delegationId,
+            ...event
+        })}\n`, 'utf8');
+    } catch (e) {
+        if (DEBUG_MODE) console.error(`[AgentAssistant Delegation] Failed to write trace for ${delegationId}:`, e.message);
+    }
+}
 
 /**
  * Initializes the AgentAssistant service module.
@@ -170,6 +196,8 @@ function loadAgentsFromLocalConfig() {
     DELEGATION_TIMEOUT = parseInt(config.delegationTimeout || '300000', 10);
     DELEGATION_SYSTEM_PROMPT = config.delegationSystemPrompt || "[异步委托模式]\n你当前正在接受来自 {{SenderName}} 的一项异步委托任务。请专注于完成以下委托内容，按照任务要求认真执行。你可以自由使用你所拥有的的所有工具来完成任务。\n\n[长执行任务优化机制]\n如果当前步骤涉及需要长时间等待的任务（如：视频生成、大型文件处理等），你可以在输出中包含 `[[NextHeartbeat::秒数]]` 占位符。系统将推迟下一次心跳（心跳即：再次唤醒你）的到来，在这段时间内不会产生额外的轮次和Token消耗。例如：如果你预计渲染需要3分钟，可以输出 `[[NextHeartbeat::180]]`。\n\n委托任务内容:\n{{TaskPrompt}}\n\n当你确认任务已经彻底完成后，请输出委托完成报告，格式如下:\n[[TaskComplete]]\n（此处写上你的任务完成报告，详细描述你完成了什么、执行过程和最终结果）\n\n如果你认为任务由于缺少工具、信息或其他原因【完全无法完成】，请输出失败报告，格式如下:\n[[TaskFailed]]\n（此处写上失败原因）";
     DELEGATION_HEARTBEAT_PROMPT = config.delegationHeartbeatPrompt || "[系统提示:]当前委托任务仍在进行中。请继续执行你的委托任务。如果你在等待长执行任务，请根据需要输出 `[[NextHeartbeat::秒数]]` 进行推迟。如果任务已完成，请输出 [[TaskComplete]] 及完成报告。如果确认无法完成，请输出 [[TaskFailed]] 及失败原因。";
+    DELEGATION_TRACE_DEBUG = String(config.delegationTraceDebug || process.env.AGENT_ASSISTANT_DELEGATION_TRACE_DEBUG || 'false').toLowerCase() === 'true';
+    DELEGATION_TRACE_MAX_CHARS = Math.max(1000, parseInt(config.delegationTraceMaxChars || process.env.AGENT_ASSISTANT_DELEGATION_TRACE_MAX_CHARS || '12000', 10) || 12000);
 
     const AGENT_ALL_SYSTEM_PROMPT = config.globalSystemPrompt || "";
     Object.keys(AGENTS).forEach(key => delete AGENTS[key]); // Clear existing agents
@@ -935,6 +963,15 @@ async function processToolCall(args) {
 async function executeDelegation(delegationId, agentConfig, taskPrompt, senderName, temporaryToolsSystemPrompt = '') {
     const userSessionId = `agent_${agentConfig.baseName}_delegation_session`;
     const lockKey = `${agentConfig.baseName}::${userSessionId}`;
+    writeDelegationTrace(delegationId, {
+        event: 'delegation_started',
+        agentName: agentConfig.baseName,
+        senderName,
+        maxRounds: DELEGATION_MAX_ROUNDS,
+        timeoutMs: DELEGATION_TIMEOUT,
+        temporaryToolsInjected: Boolean(temporaryToolsSystemPrompt),
+        taskPromptPreview: truncateForTrace(taskPrompt, 3000)
+    });
 
     // 我们对于代理任务也是一个持久会话，因此需要占线锁保护
     while (activeSessionLocks.has(lockKey)) {
@@ -965,14 +1002,20 @@ async function executeDelegation(delegationId, agentConfig, taskPrompt, senderNa
             { role: 'system', content: injectedSystemPrompt },
             { role: 'user', content: taskPrompt }
         ];
-
         let state = activeDelegations.get(delegationId);
+        let consecutiveEmptyResponses = 0;
 
         while (state.currentRound < DELEGATION_MAX_ROUNDS) {
             state = assertDelegationNotCancelled(delegationId);
+            const roundNumber = state.currentRound + 1;
             if (Date.now() - state.startTime > DELEGATION_TIMEOUT) {
                 completionStatus = 'Failed';
                 finalReport = '委托任务执行超时。';
+                writeDelegationTrace(delegationId, {
+                    event: 'delegation_timeout',
+                    round: roundNumber,
+                    elapsedMs: Date.now() - state.startTime
+                });
                 break;
             }
 
@@ -980,7 +1023,7 @@ async function executeDelegation(delegationId, agentConfig, taskPrompt, senderNa
             state.updatedAt = Date.now();
             activeDelegations.set(delegationId, state);
 
-            if (DEBUG_MODE) console.error(`[AgentAssistant Delegation] Round ${state.currentRound + 1}/${DELEGATION_MAX_ROUNDS} for ${delegationId}`);
+            if (DEBUG_MODE) console.error(`[AgentAssistant Delegation] Round ${roundNumber}/${DELEGATION_MAX_ROUNDS} for ${delegationId}`);
 
             const payloadForVCP = {
                 model: agentConfig.id,
@@ -989,6 +1032,15 @@ async function executeDelegation(delegationId, agentConfig, taskPrompt, senderNa
                 temperature: agentConfig.temperature,
                 stream: false
             };
+
+            writeDelegationTrace(delegationId, {
+                event: 'round_request',
+                round: roundNumber,
+                messageCount: messagesForVCP.length,
+                model: agentConfig.id,
+                maxTokens: agentConfig.maxOutputTokens,
+                temperature: agentConfig.temperature
+            });
 
             const responseFromVCP = await axios.post(`${VCP_API_TARGET_URL}/chat/completions`, payloadForVCP, {
                 headers: { 'Authorization': `Bearer ${VCP_SERVER_ACCESS_KEY}`, 'Content-Type': 'application/json' },
@@ -1006,9 +1058,80 @@ async function executeDelegation(delegationId, agentConfig, taskPrompt, senderNa
             state.updatedAt = Date.now();
             activeDelegations.set(delegationId, state);
 
+            const responseHasToolRequest = cleanedAssistantResponse.includes('<<<[TOOL_REQUEST]>>>');
+            const responseHasToolSummary = cleanedAssistantResponse.includes('[本轮工具调用摘要');
+
             // 检查完成标记的容错正则
             const completionMatch = cleanedAssistantResponse.match(/\[\[TaskComplete(?:\s*\]\]|\s[\s\S]*?\]\])/i);
             const failureMatch = cleanedAssistantResponse.match(/\[\[TaskFailed(?:\s*\]\]|\s[\s\S]*?\]\])/i);
+            const heartbeatDelayMatch = cleanedAssistantResponse.match(/\[\[NextHeartbeat::(\d+)\]\]/i);
+            writeDelegationTrace(delegationId, {
+                event: 'round_response',
+                round: roundNumber,
+                rawLength: assistantResponseContent.length,
+                cleanedLength: cleanedAssistantResponse.length,
+                hasTaskComplete: Boolean(completionMatch),
+                hasTaskFailed: Boolean(failureMatch),
+                nextHeartbeatSeconds: heartbeatDelayMatch?.[1] ? Number(heartbeatDelayMatch[1]) : null,
+                containsToolRequest: responseHasToolRequest,
+                containsToolSummary: responseHasToolSummary,
+                responsePreview: truncateForTrace(cleanedAssistantResponse)
+            });
+
+            if (!cleanedAssistantResponse.trim()) {
+                consecutiveEmptyResponses += 1;
+                writeDelegationTrace(delegationId, {
+                    event: 'empty_response_detected',
+                    round: roundNumber,
+                    consecutiveEmptyResponses
+                });
+                if (consecutiveEmptyResponses >= 2) {
+                    completionStatus = 'Failed';
+                    finalReport = `委托任务连续 ${consecutiveEmptyResponses} 轮返回空内容，已提前熔断，避免继续空转消耗轮次。`;
+                    writeDelegationTrace(delegationId, {
+                        event: 'empty_response_circuit_break',
+                        round: roundNumber,
+                        reportPreview: finalReport
+                    });
+                    break;
+                }
+                messagesForVCP.push({
+                    role: 'user',
+                    content: [
+                        '[系统纠偏:]上一轮回复为空，不能继续空回复。',
+                        '请立即继续执行委托任务。',
+                        '如果你是自动选品枢纽/破壁_枢纽，当前第一步必须调用 AutoProductSelection 的 auto_selection_queue_status 检查 failed/scored/raw/locks，并按 next_action_hint 推进。',
+                        '如果任务已经完成，请输出 [[TaskComplete]] 和完成报告；如果确认无法完成，请输出 [[TaskFailed]] 和失败原因。'
+                    ].join('\n')
+                });
+                writeDelegationTrace(delegationId, {
+                    event: 'empty_response_reprompt',
+                    round: roundNumber,
+                    nextMessageCount: messagesForVCP.length
+                });
+                state.currentRound++;
+                activeDelegations.set(delegationId, state);
+                continue;
+            } else {
+                consecutiveEmptyResponses = 0;
+            }
+
+            if (responseHasToolRequest && !responseHasToolSummary && !completionMatch && !failureMatch && !heartbeatDelayMatch) {
+                completionStatus = 'Failed';
+                finalReport = [
+                    '检测到疑似未被工具循环处理的 TOOL_REQUEST：回复中包含工具请求标记，但没有任何工具调用摘要。',
+                    '这通常意味着工具请求格式无法被解析器识别，系统已提前熔断，避免 AgentAssistant 委托空转。',
+                    '',
+                    '异常回复预览：',
+                    truncateForTrace(cleanedAssistantResponse, 3000)
+                ].join('\n');
+                writeDelegationTrace(delegationId, {
+                    event: 'unprocessed_tool_request_circuit_break',
+                    round: roundNumber,
+                    reportPreview: truncateForTrace(finalReport, 3000)
+                });
+                break;
+            }
 
             if (completionMatch) {
                 // Task is completed
@@ -1027,6 +1150,11 @@ async function executeDelegation(delegationId, agentConfig, taskPrompt, senderNa
                 state.finalReportPreview = truncateText(finalReport);
                 state.updatedAt = Date.now();
                 activeDelegations.set(delegationId, state);
+                writeDelegationTrace(delegationId, {
+                    event: 'task_complete_detected',
+                    round: roundNumber,
+                    reportPreview: truncateForTrace(finalReport, 3000)
+                });
                 break; // Exit the loop
             } else if (failureMatch) {
                 // Task is explicitly failed by the agent
@@ -1045,13 +1173,18 @@ async function executeDelegation(delegationId, agentConfig, taskPrompt, senderNa
                 state.finalReportPreview = truncateText(finalReport);
                 state.updatedAt = Date.now();
                 activeDelegations.set(delegationId, state);
+                writeDelegationTrace(delegationId, {
+                    event: 'task_failed_detected',
+                    round: roundNumber,
+                    reportPreview: truncateForTrace(finalReport, 3000)
+                });
                 break; // Exit the loop
             } else {
                 // Task is not completed yet, push history and add heartbeat prompt
                 messagesForVCP.push({ role: 'assistant', content: cleanedAssistantResponse });
 
                 // 处理心跳延迟占位符: [[NextHeartbeat::秒数]]
-                const delayMatch = cleanedAssistantResponse.match(/\[\[NextHeartbeat::(\d+)\]\]/i);
+                const delayMatch = heartbeatDelayMatch;
                 if (delayMatch && delayMatch[1]) {
                     const delaySeconds = parseInt(delayMatch[1], 10);
                     if (!isNaN(delaySeconds) && delaySeconds > 0) {
@@ -1072,6 +1205,11 @@ async function executeDelegation(delegationId, agentConfig, taskPrompt, senderNa
                 }
 
                 messagesForVCP.push({ role: 'user', content: DELEGATION_HEARTBEAT_PROMPT });
+                writeDelegationTrace(delegationId, {
+                    event: 'round_continues',
+                    round: roundNumber,
+                    nextMessageCount: messagesForVCP.length
+                });
             }
 
             state.currentRound++;
@@ -1080,14 +1218,24 @@ async function executeDelegation(delegationId, agentConfig, taskPrompt, senderNa
 
         if (!finalReport && completionStatus === 'Failed') {
             finalReport = `达到最大轮数限制 (${DELEGATION_MAX_ROUNDS} 轮)，任务尚未自动上报完成。`;
+            writeDelegationTrace(delegationId, {
+                event: 'max_rounds_reached',
+                finalRound: DELEGATION_MAX_ROUNDS,
+                messageCount: messagesForVCP.length
+            });
         }
 
-    } catch (err) {
-        if (err && err.code === 'DELEGATION_CANCELLED') {
+    } catch (error) {
+        writeDelegationTrace(delegationId, {
+            event: 'delegation_exception',
+            errorMessage: error.message,
+            errorStack: truncateForTrace(error.stack || '', 4000)
+        });
+        if (error && error.code === 'DELEGATION_CANCELLED') {
             completionStatus = 'Cancelled';
-            finalReport = `委托任务已取消。原因: ${err.message}`;
+            finalReport = `委托任务已取消。原因: ${error.message}`;
         } else {
-            throw err;
+            throw error;
         }
     } finally {
         activeSessionLocks.delete(lockKey);
@@ -1101,6 +1249,11 @@ async function executeDelegation(delegationId, agentConfig, taskPrompt, senderNa
             finalState.endTime = Date.now();
             finalState.updatedAt = Date.now();
         }
+        writeDelegationTrace(delegationId, {
+            event: 'delegation_finalizing',
+            status: completionStatus,
+            reportPreview: truncateForTrace(secureReport, 3000)
+        });
 
         // 给成功完成任务的 Agent 发放积分奖励
         if (completionStatus === 'Succeed') {

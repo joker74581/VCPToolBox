@@ -1,7 +1,7 @@
 console.log('[VCP Background] 🚀 VCPChrome background.js loaded.');
 let ws = null;
 let isConnected = false;
-let isMonitoringEnabled = false; // 页面监控开关
+let isMonitoringEnabled = true; // 页面监控开关
 let heartbeatIntervalId = null;
 let latestPageInfo = null;
 let currentActiveTabId = null;
@@ -952,3 +952,6 @@ chrome.storage.local.get(['isMonitoringEnabled'], (result) => {
 
 // 初始化图标状态
 updateIcon();
+// 自动连接到远端
+connect();
+
