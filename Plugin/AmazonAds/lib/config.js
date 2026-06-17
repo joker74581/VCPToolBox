@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const DEFAULT_CONFIG_PATH = path.join(process.cwd(), 'Plugin', 'MCPO', 'custom-mcp-config', 'mcp-config.json');
+const DEFAULT_CONFIG_PATH = path.join(process.cwd(), 'Plugin', 'AmazonAds', 'mcp-config', 'mcp-config.json');
 const DEFAULT_SERVER_NAME = 'amazon_ads';
 const DEFAULT_TOKEN_URL = 'https://api.amazon.com/auth/o2/token';
 

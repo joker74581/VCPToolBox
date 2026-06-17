@@ -1,15 +1,15 @@
-# AmazonAds ToolBox
+# AmazonAds ToolBox (Amazon Ads 工具箱)
 
-`AmazonAds` reads Amazon Ads account structure and report data through an Amazon Ads MCP configuration. This toolbox is account-neutral. Use placeholders until the user has configured their own account.
+`AmazonAds` 通过 Amazon Ads MCP 配置读取 Amazon Ads 账户结构和报表数据。这个工具箱是中立的（不绑定具体账户）。在用户配置他们自己的账户之前，请使用占位符。
 
-## Safety
+## 安全要求 (Safety)
 
-- Do not reveal access tokens, refresh tokens, client secrets, MCP headers, or signed report URLs.
-- Do not assume a default seller account. Ask the user to configure or confirm `accountName`, `profileId`, and `marketplace`.
-- Do not create duplicate reports for the same account, date range, report kind, and field set.
-- Write operations must use `propose_*` first and require explicit user approval plus the plugin operation password before `apply_*`.
+- 不要泄露 access tokens、refresh tokens、client secrets、MCP headers 或签名的报表下载 URL。
+- 不要假设存在默认的卖家账户。请询问用户以配置或确认 `accountName`、`profileId` 和 `marketplace`。
+- 对于同一个账户、日期范围、报表类型和字段集，不要创建重复的报表。
+- 写操作必须首先使用 `propose_*` 生成建议，并在执行 `apply_*` 之前要求用户明确批准，同时需要插件操作密码。
 
-## Default Placeholders
+## 默认占位符 (Default Placeholders)
 
 ```text
 accountName: <YOUR_ACCOUNT_NAME>
@@ -19,7 +19,7 @@ entityId: <YOUR_ENTITY_ID>
 marketplace: US
 ```
 
-## Basic Checks
+## 基础检查 (Basic Checks)
 
 ```text
 <<<[TOOL_REQUEST]>>>
@@ -42,9 +42,9 @@ command:「始」list_accounts「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-## Direct Structure Queries
+## 直接查询结构 (Direct Structure Queries)
 
-Use these when the user asks what is currently configured:
+当用户询问当前配置了什么时，使用以下命令：
 
 - `list_campaigns`
 - `list_ad_groups`
@@ -54,7 +54,7 @@ Use these when the user asks what is currently configured:
 - `get_billing_status`
 - `list_account_users`
 
-Example:
+示例：
 
 ```text
 <<<[TOOL_REQUEST]>>>
@@ -66,13 +66,13 @@ maxResults:「始」50「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-Direct structure queries do not answer historical performance questions.
+直接查询结构的命令不能回答历史表现或数据问题。
 
-## Report Queries
+## 报表查询 (Report Queries)
 
-Use reports for impressions, clicks, cost, sales, orders, ACOS, ROAS, placements, targets, and search terms.
+使用报表来获取曝光量 (impressions)、点击量 (clicks)、花费 (cost)、销售额 (sales)、订单量 (orders)、ACOS、ROAS、广告位表现 (placements)、投放表现 (targets) 和搜索词 (search terms)。
 
-Preferred high-level command:
+推荐的高级命令：
 
 ```text
 <<<[TOOL_REQUEST]>>>
@@ -87,7 +87,7 @@ mode:「始」get_or_create「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-Common `reportKind` values:
+常见的 `reportKind` 值：
 
 - `campaign`
 - `placement`
@@ -95,16 +95,20 @@ Common `reportKind` values:
 - `search_term`
 - `keyword`
 
-Useful archive commands:
+有用的归档管理命令：
 
 - `list_report_jobs`
 - `read_report_artifact`
 - `export_report_artifact`
 - `aggregate_report_archives`
 
-## Field Probe Rule
+## 报表轮询规则 (Report Polling Rule)
 
-Only probe fields when the user asks, when Amazon rejects a field, or when schema uncertainty blocks the task. Keep probe batches small.
+当创建或查询报表时，如果返回的状态是 `PENDING` 或 `PROCESSING`，你**必须立刻停止工具调用并结束当前回复**，告诉用户报表正在生成中，然后**等待用户的下一次命令**。哪怕你觉得需要等待，也坚决不要自己陷入无限循环的轮询中，务必等待用户发起下一次交互后再去查询。
+
+## 字段探测规则 (Field Probe Rule)
+
+仅在用户要求、Amazon 拒绝了某个字段，或模式不确定性阻碍了任务时，才探测字段。保持探测批次尽量小。
 
 ```text
 <<<[TOOL_REQUEST]>>>
@@ -116,8 +120,8 @@ days:「始」1「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-## Token Refresh
+## Token 刷新 (Token Refresh)
 
-Call `refresh_token` only if plugin token refresh is enabled and the user requests it, or if a 401/token error occurs and `get_status` says refresh is available.
+仅在启用了插件 Token 刷新且用户要求时，或发生 401/Token 错误并且 `get_status` 显示刷新功能可用时，才调用 `refresh_token`。
 
-If `tokenRefresh.enabled=false`, tell the user to check the external token refresher or MCP config.
+如果 `tokenRefresh.enabled=false`，请告诉用户检查外部的 Token 刷新器或 MCP 配置。

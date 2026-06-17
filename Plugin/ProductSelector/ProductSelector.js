@@ -1499,7 +1499,7 @@ async function runSellerSpriteResearch(args = {}) {
     warnings,
     unknown_filters: normalized.unknown_filters,
     next_actions: parsed.no_results
-      ? ['放宽筛选条件、重新选择类目，或先重置条件后再查询。']
+      ? ['该条件下无产品数据。请勿死板循环等待数据：请放宽销量、价格、BSR等筛选条件，或者直接更换类目。如果多次尝试仍无数据，请在状态中明确标记FETCHED_EMPTY并汇报给枢纽。']
       : (parsed.candidates.length > 0
         ? ['基于候选 ASIN 做人工复核或后续 Amazon 评论采样。']
         : ['若页面确实有结果但未解析候选，请使用 get_page_info 证据扩展 pageInfoParser。'])
@@ -2062,7 +2062,7 @@ async function runSellerSpriteKeywordResearch(args = {}) {
     warnings,
     unknown_filters: normalized.unknown_filters,
     next_actions: parsed.no_results
-      ? ['放宽关键词筛选条件、重新选择类目，或先重置条件后再查询。']
+      ? ['该词/该条件下无数据。请勿死板循环等待数据：尝试将过窄的长尾词替换为核心宽泛大词，或放宽销量/价格等筛选条件；如果仍无数据，可改用 run_sellersprite_research(选产品功能)找出热销单品，再用 run_sellersprite_keyword_reverse 反查其真实流量词。并在状态中明确标记FETCHED_EMPTY。']
       : (parsed.candidates.length > 0
         ? ['基于候选关键词做人工复核，或继续扩展关键词详情解析字段。']
         : ['若页面确实有结果但未解析候选关键词，请使用 get_page_info 证据扩展 keyword pageInfoParser。'])
@@ -2267,22 +2267,19 @@ async function runSellerSpriteKeywordReverse(args = {}) {
       site: 'sellersprite',
       timestamp: nowIso(),
       success: false,
-      error: 'SellerSprite 当前页面是登录页'
-    };
-    return {
-      success: false,
-      site: 'sellersprite',
-      command: 'run_sellersprite_keyword_reverse',
-      url,
-      filters: normalized.filters,
-      warnings,
-      login_result: loginResult,
-      open_result: openResult,
-      wait_result: waitResult,
-      needs_login: true,
-      error: 'SellerSprite 当前页面仍是登录页，请确认登录状态或手动处理验证码后重试。'
-    };
-  }
+    success: false,
+    site: 'sellersprite',
+    command: 'run_sellersprite_keyword_reverse',
+    url,
+    filters: normalized.filters,
+    warnings,
+    login_result: loginResult,
+    open_result: openResult,
+    wait_result: waitResult,
+    needs_login: true,
+    error: 'SellerSprite 当前页面仍是登录页，请确认登录状态或手动处理验证码后重试。'
+  };
+}
 
   let tableResult = null;
   let parsed = null;

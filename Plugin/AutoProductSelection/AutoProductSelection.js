@@ -120,6 +120,39 @@ function normalizeAutoSelectionRunId(value) {
   return safe;
 }
 
+function pad2(value) {
+  return String(value).padStart(2, '0');
+}
+
+function buildTimestampRunPrefix(date = new Date()) {
+  return [
+    'APS',
+    `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}`,
+    `${pad2(date.getHours())}${pad2(date.getMinutes())}${pad2(date.getSeconds())}`
+  ].join('-');
+}
+
+function slugFromBriefContent(content) {
+  const text = String(content || '');
+  const firstUsefulLine = text
+    .split(/\r?\n/)
+    .map(line => line.replace(/^#+\s*/, '').trim())
+    .find(line => line && !/^selection\s+brief\s*:?$/i.test(line));
+  const source = firstUsefulLine || text.slice(0, 80) || 'reselect';
+  const slug = source
+    .toLowerCase()
+    .replace(/selection\s+brief\s*:?\s*/gi, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 36)
+    .replace(/-+$/g, '');
+  return slug || 'reselect';
+}
+
+function buildAutoSelectionRunIdFromBrief(content) {
+  return normalizeAutoSelectionRunId(`${buildTimestampRunPrefix()}-${slugFromBriefContent(content)}`);
+}
+
 function normalizeAutoSelectionStage(stage) {
   let value = String(stage || '').trim();
   value = value.replace(/['"「」始末]/g, '').trim();
@@ -185,6 +218,17 @@ function parseAutoSelectionLockContent(content = '') {
   };
 }
 
+function normalizeWorkerRole(value) {
+  const worker = String(value || '').trim().toLowerCase();
+  if (['hawkeye', 'scout', 'researcher', 'collector'].includes(worker)) return 'hawkeye';
+  if (['forge', 'reviewer', 'judge', 'evaluator'].includes(worker)) return 'forge';
+  return worker;
+}
+
+function publicWorkerRole(worker) {
+  return worker === 'forge' ? 'reviewer' : 'scout';
+}
+
 function classifyMissingWorkerOutput(completedTask = {}) {
   const combined = [
     completedTask?.report_excerpt,
@@ -211,6 +255,19 @@ function classifyMissingWorkerOutput(completedTask = {}) {
       classification: 'worker_max_rounds_no_handoff',
       safe_to_retry_once: true,
       reason: 'Worker exhausted AgentAssistant rounds without writing raw/scored/failed; retry once with the stricter bounded worker prompt.'
+    };
+  }
+
+  if (
+    combined.includes('连续 2 轮返回空内容') ||
+    combined.includes('连续 2 轮返回空回复') ||
+    combined.includes('empty_response_circuit_break') ||
+    combined.includes('empty response')
+  ) {
+    return {
+      classification: 'worker_empty_response_no_handoff',
+      safe_to_retry_once: true,
+      reason: 'Worker returned empty content twice without writing handoff; retry once after the model/provider recovers.'
     };
   }
 
@@ -457,8 +514,8 @@ function getAutoSelectionNextAction(stages, derived = {}) {
   if (derived.missingOutputs?.length) return 'handle_worker_missing_output';
   if (derived.malformedLocks?.length) return 'cleanup_malformed_locks';
   if (derived.validLocks?.length) return 'wait_for_worker';
-  if (derived.activeBriefs?.length) return 'send_existing_brief_to_hawkeye';
-  return 'create_brief_and_send_hawkeye';
+  if (derived.activeBriefs?.length) return 'send_existing_brief_to_scout';
+  return 'create_brief_and_send_scout';
 }
 
 async function autoSelectionWriteRunFile(args = {}) {
@@ -470,7 +527,9 @@ async function autoSelectionWriteRunFile(args = {}) {
   const runId = normalizeAutoSelectionRunId(args.run_id ?? args.runId);
   const content = String(args.content ?? '');
   if (!content && stage !== 'locks') throw new Error('content is required.');
-  const lockName = args.lock_name ?? args.lockName ?? '';
+  const lockName = stage === 'locks'
+    ? normalizeWorkerRole(args.lock_name ?? args.lockName ?? '')
+    : (args.lock_name ?? args.lockName ?? '');
   if (stage === 'locks' && !['hawkeye', 'forge'].includes(String(lockName || '').trim())) {
     return {
       success: false,
@@ -478,7 +537,7 @@ async function autoSelectionWriteRunFile(args = {}) {
       stage,
       run_id: runId,
       error: 'lock_name_required',
-      message: 'When stage=locks, lock_name must be hawkeye or forge.'
+      message: 'When stage=locks, lock_name must be scout/hawkeye or reviewer/forge.'
     };
   }
   const overwrite = parseBoolean(args.overwrite, false);
@@ -536,7 +595,7 @@ function buildAutoSelectionWorkerPrompt(worker, runId) {
   const completionMarkerInstruction = '完成时输出两个英文左方括号、TaskComplete、两个英文右方括号组成的完成标记。不要在写文件成功前输出该完成标记。';
   const callRhythmInstruction = '调用节奏：每一轮回复最多只发送 1 个 TOOL_REQUEST；等待工具摘要返回后，再基于结果决定下一步，不要在同一轮连续发多个工具块。';
   if (worker === 'hawkeye') {
-    return `请执行一次自动选品取证任务。
+    return `请执行一次自动选品取证任务 (Scout Worker)。
 
 run_id: ${safeRunId}
 brief_stage: brief
@@ -545,15 +604,14 @@ failure_stage: failed
 
 ${callRhythmInstruction}
 
-先用 AutoProductSelection 读取 brief，读不到 brief 就写 failed。接着尝试读取已有的 raw 数据包，如果存在，说明是回环补采，请保留旧数据仅针对 brief 要求的缺口进行增量抓取并合并覆盖写回 raw；如果不存在则正常从头开始。只用 ProductSelector 串行取证，一次只调用一个数据命令。至少取得一个可追溯 ASIN/产品候选，除非 brief 明确只要求市场预研。
-
-硬性边界：ProductSelector 数据命令总数最多 3 次；同一个 command+核心参数最多重试 1 次；任何登录/页面/账号/工具协议错误连续出现 2 次，立刻写 failed。不要为了补齐理想字段反复搜索；拿到可追溯证据就落 raw，拿不到就落 failed。ProductSelector 返回 success=false、plugin_error、超时、空结果或不可追溯数据时，把原始错误摘要写入 failed 或 raw.execution_summary.fallback_log。
-
-成功或部分成功时写 raw_data_pack 到 raw；工具阻断、数据不可追溯、只有自然语言观察、页面/账号错误或 brief 不可读时写 failed。raw 必须包含 route_decision、tool_decisions、evidence_matrix、asin_source_map、elimination_log、execution_summary.data_tools_called、execution_summary.fallback_log。failed 必须包含 failure_type、tool_decisions、failed_commands、diagnosis、next_manual_action。${completionMarkerInstruction} 不要调用评审 Agent，不发论坛，不写 DailyNote。`;
+读取 brief 并基于其指示抓取数据。如果是回环补采，请保留旧数据合并写回 raw。
+硬性边界：ProductSelector 数据命令最多 6 次。
+注意：不要死板遵循固定流程。如果某个工具无数据，请参考工具返回的 next_actions 提示，灵活切换其他工具或放宽条件。如果确实抓不到数据，必须在工具状态中明确记录 FETCHED_EMPTY 并落入 failed。
+成功或部分成功时写 raw_data_pack 到 raw；工具阻断或完全无数据写 failed。必须包含 route_decision、tool_decisions 等必要字段。${completionMarkerInstruction} 不要调用评审节点，不发论坛，不写 DailyNote。`;
   }
 
   if (worker === 'forge') {
-    return `请执行一次自动选品证据评审任务。
+    return `请执行一次自动选品证据评审任务 (Reviewer Worker)。
 
 run_id: ${safeRunId}
 raw_stage: raw
@@ -562,12 +620,77 @@ failure_stage: failed
 
 ${callRhythmInstruction}
 
-先用 AutoProductSelection 读取 raw，读不到或 raw 缺结构化证据就写 failed。不要抓新数据，不发论坛，不写 DailyNote。
-
-审计取证 Agent 交付的证据，输出 scored_candidate_pack。评审最多读取 raw 1 次、写结果 1 次；不要循环等待更完整证据。若缺失 ProductSelector 仍能补到的核心数据，写 scored 但标记 PARTIAL，并让 post_forge_action.action=LOOPBACK_TO_HAWKEYE，同时列出最多 3 个明确补采缺口。只有证据足够或剩余缺口属于人工验证时，才允许 PUBLISH_FINAL。${completionMarkerInstruction}`;
+读取 raw。审计取证节点 (Scout Worker) 交付的证据，输出 scored_candidate_pack。
+全局判决准则：进行“全局拼图判定”。如果现有数据足以判断该批候选没潜力（如利润低、易碎），或者发现 Scout 明确标记了 FETCHED_EMPTY（抓取后无有效数据），请直接在 post_forge_action.action 中返回 DROP_AND_RESELECT，并附理由，让 Coordinator 彻底重选方向。
+只有当产品有明显潜力，但确实缺失关键决策数据时，才使用 LOOPBACK_TO_SCOUT 打回补采。
+核心证据充足时允许 PUBLISH_FINAL。${completionMarkerInstruction}`;
   }
 
   throw new Error(`Invalid auto-selection worker: ${worker}`);
+}
+
+function extractForgeAction(content = '') {
+  const text = String(content || '');
+  const patterns = [
+    /post_forge_action[\s\S]{0,600}?\baction\s*:\s*['"]?([A-Z_]+)['"]?/i,
+    /post_forge_action[\s\S]{0,600}?\baction\s*=\s*['"]?([A-Z_]+)['"]?/i,
+    /\baction\s*:\s*['"]?(PUBLISH_FINAL|LOOPBACK_TO_HAWKEYE|LOOPBACK_TO_SCOUT|DROP_AND_RESELECT)['"]?/i,
+    /\b(PUBLISH_FINAL|LOOPBACK_TO_HAWKEYE|LOOPBACK_TO_SCOUT|DROP_AND_RESELECT)\b/i
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) return normalizeForgeAction(match[1]);
+  }
+  return '';
+}
+
+function normalizeForgeAction(value) {
+  const action = String(value || '').trim().toUpperCase();
+  if (action === 'LOOPBACK_TO_SCOUT') return 'LOOPBACK_TO_HAWKEYE';
+  return action;
+}
+
+function extractSectionExcerpt(content = '', sectionNames = []) {
+  const text = String(content || '');
+  const lines = text.split('\n');
+  const wanted = sectionNames.map(name => String(name).toLowerCase());
+  const picked = [];
+  let capturing = false;
+  for (const line of lines) {
+    const normalized = line.toLowerCase();
+    const startsWanted = wanted.some(name => normalized.includes(name));
+    if (startsWanted) capturing = true;
+    if (capturing) picked.push(line);
+    if (capturing && picked.length >= 40) break;
+  }
+  return picked.join('\n').trim().slice(0, 4000);
+}
+
+function buildLoopbackBrief(runId, scoredContent) {
+  const excerpt = extractSectionExcerpt(scoredContent, [
+    'evidence_gaps',
+    'next_research_suggestion',
+    'manual_verification',
+    'post_forge_action'
+  ]) || String(scoredContent || '').slice(0, 3000);
+  return [
+    '# SelectionBrief - Reviewer Loopback Evidence Patch',
+    '',
+    `run_id: ${runId}`,
+    'mode: LOOPBACK_TO_SCOUT',
+    '',
+    '## 任务目标',
+    '这是 reviewer 评审后的回环补采任务。读取并保留同 run_id 下已有 raw，只针对下方缺口做增量抓取，合并后 overwrite 写回 raw。',
+    '',
+    '## 补采缺口与熔炉建议',
+    '',
+    excerpt,
+    '',
+    '## 交付要求',
+    '- 不要重做已有证据。',
+    '- 只调用 ProductSelector 补齐最关键的 1-3 个缺口。',
+    '- 写回 raw 时保留旧 evidence_matrix、asin_source_map、elimination_log，并追加本轮补采记录。'
+  ].join('\n');
 }
 
 async function autoSelectionPrepareDispatch(args = {}) {
@@ -575,9 +698,9 @@ async function autoSelectionPrepareDispatch(args = {}) {
   if (referencesStrategyProfile(args.run_id ?? args.runId)) {
     return strategyProfileMisuseResponse('auto_selection_prepare_dispatch');
   }
-  const worker = String(args.worker || args.lock_name || args.lockName || '').trim().toLowerCase();
+  const worker = normalizeWorkerRole(args.worker || args.lock_name || args.lockName || '');
   if (!['hawkeye', 'forge'].includes(worker)) {
-    throw new Error('worker is required and must be hawkeye or forge.');
+    throw new Error('worker is required and must be scout/hawkeye or reviewer/forge.');
   }
   const runId = normalizeAutoSelectionRunId(args.run_id ?? args.runId);
   const overwriteBrief = parseBoolean(args.overwrite_brief ?? args.overwriteBrief, false);
@@ -624,6 +747,7 @@ async function autoSelectionPrepareDispatch(args = {}) {
     success: true,
     command: 'auto_selection_prepare_dispatch',
     worker,
+    public_worker: publicWorkerRole(worker),
     run_id: runId,
     lock_path: lockResult.path,
     agent_assistant_request: {
@@ -646,8 +770,8 @@ async function autoSelectionMoveRunFile(args = {}) {
   if (referencesStrategyProfile(args.run_id ?? args.runId)) {
     return strategyProfileMisuseResponse('auto_selection_move_run_file');
   }
-  const fromStage = normalizeAutoSelectionStage(args.from_stage ?? args.fromStage);
-  const toStage = normalizeAutoSelectionStage(args.to_stage ?? args.toStage);
+  const fromStage = normalizeAutoSelectionStage(args.from_stage ?? args.fromStage ?? args.stage);
+  const toStage = normalizeAutoSelectionStage(args.to_stage ?? args.toStage ?? (args.stage ? 'archived' : ''));
   const runId = normalizeAutoSelectionRunId(args.run_id ?? args.runId);
   const fromLockName = args.from_lock_name ?? args.fromLockName ?? '';
   const toLockName = args.to_lock_name ?? args.toLockName ?? '';
@@ -682,6 +806,186 @@ async function autoSelectionMoveRunFile(args = {}) {
     to_path: toPath,
     archived_already: toStage === 'archived' ? archivedAlready : undefined,
     cleanup
+  };
+}
+
+async function autoSelectionArchiveRun(args = {}) {
+  await ensureAutoSelectionRunDirs();
+  if (referencesStrategyProfile(args.run_id ?? args.runId)) {
+    return strategyProfileMisuseResponse('auto_selection_archive_run');
+  }
+  const runId = normalizeAutoSelectionRunId(args.run_id ?? args.runId);
+  const requestedStage = args.from_stage ?? args.fromStage ?? args.stage ?? '';
+  let fromStage = requestedStage ? normalizeAutoSelectionStage(requestedStage) : '';
+  const findFirstExistingStage = async (candidates) => {
+    for (const stage of candidates) {
+      try {
+        await fs.access(resolveAutoSelectionFile(stage, runId));
+        return stage;
+      } catch (_) {
+        // Try the next stage.
+      }
+    }
+    return '';
+  };
+  if (!fromStage) {
+    fromStage = await findFirstExistingStage(['failed', 'scored', 'raw', 'brief']);
+  } else if (!['archived', 'locks'].includes(fromStage)) {
+    try {
+      await fs.access(resolveAutoSelectionFile(fromStage, runId));
+    } catch (_) {
+      const fallbackStage = await findFirstExistingStage(['failed', 'scored', 'raw', 'brief'].filter(stage => stage !== fromStage));
+      if (fallbackStage) fromStage = fallbackStage;
+    }
+  }
+  if (!fromStage || fromStage === 'archived' || fromStage === 'locks') {
+    return {
+      success: false,
+      command: 'auto_selection_archive_run',
+      run_id: runId,
+      error: 'archive_source_not_found',
+      message: 'No archivable failed/scored/raw/brief file was found. Do not use cleanup_run as a substitute for final archive.'
+    };
+  }
+  return await autoSelectionMoveRunFile({
+    run_id: runId,
+    from_stage: fromStage,
+    to_stage: 'archived'
+  });
+}
+
+async function autoSelectionApplyForgeDecision(args = {}, commandName = 'auto_selection_apply_reviewer_decision') {
+  await ensureAutoSelectionRunDirs();
+  if (referencesStrategyProfile(args.run_id ?? args.runId)) {
+    return strategyProfileMisuseResponse(commandName);
+  }
+  const runId = normalizeAutoSelectionRunId(args.run_id ?? args.runId);
+  const scoredPath = resolveAutoSelectionFile('scored', runId);
+  const scoredContent = String(args.scored_content ?? args.scoredContent ?? await fs.readFile(scoredPath, 'utf8'));
+  const action = normalizeForgeAction(args.action || extractForgeAction(scoredContent) || '');
+
+  if (!['PUBLISH_FINAL', 'LOOPBACK_TO_HAWKEYE', 'DROP_AND_RESELECT'].includes(action)) {
+    return {
+      success: false,
+      command: commandName,
+      run_id: runId,
+      error: 'unknown_forge_action',
+      detected_action: action || null,
+      next_actions: ['Read scored and inspect post_forge_action.action before proceeding.']
+    };
+  }
+
+  if (action === 'DROP_AND_RESELECT' || action === 'PUBLISH_FINAL') {
+    try {
+      const rawPath = resolveAutoSelectionFile('raw', runId);
+      const rawContent = await fs.readFile(rawPath, 'utf8');
+      const hasStatusEmptyOrSuccess = /status:\s*['"]?(EMPTY|SUCCESS|PARTIAL_SUCCESS|FETCHED_EMPTY|FETCHED)['"]?/i.test(rawContent);
+      const hasToolsCalled = /data_tools_called:[\s\S]{1,50}-/.test(rawContent);
+      if (!hasStatusEmptyOrSuccess && !hasToolsCalled) {
+        return {
+          success: false,
+          command: commandName,
+          run_id: runId,
+          error: 'scout_lazy_validation_error',
+          detected_action: action,
+          message: 'Validation Error: Cannot drop or publish. Scout Worker has not actually attempted to fetch data (No FETCHED_EMPTY or SUCCESS records found in raw). Please LOOPBACK_TO_SCOUT to force fetching.',
+          next_actions: ['Re-evaluate using LOOPBACK_TO_SCOUT to force Scout Worker to fetch data.']
+        };
+      }
+    } catch (e) {}
+  }
+
+  if (action === 'LOOPBACK_TO_HAWKEYE') {
+    await fs.access(resolveAutoSelectionFile('raw', runId));
+    const removedScored = await autoSelectionDeleteRunFile({ stage: 'scored', run_id: runId });
+    const lockCleanup = await autoSelectionClearLocks({ run_id: runId });
+    const dispatch = await autoSelectionPrepareDispatch({
+      worker: 'hawkeye',
+      run_id: runId,
+      brief_content: String(args.brief_content ?? args.briefContent ?? buildLoopbackBrief(runId, scoredContent)),
+      overwrite_brief: true,
+      overwrite_lock: true,
+      dispatch_reason: 'forge_loopback'
+    });
+    return {
+      success: true,
+      command: commandName,
+      run_id: runId,
+      action,
+      state_transition: 'scored_deleted_raw_preserved_scout_redispatch_prepared',
+      removed_scored: removedScored.removed,
+      lock_cleanup: lockCleanup.removed || [],
+      agent_assistant_request: dispatch.agent_assistant_request,
+      next_actions: [
+        'Call AgentAssistant with agent_assistant_request.',
+        'Do not post forum or write DailyNote for a loopback.',
+        'After AgentAssistant succeeds, output [[NextHeartbeat::120]].'
+      ]
+    };
+  }
+
+  if (action === 'DROP_AND_RESELECT') {
+    const replacementBrief = args.brief_content ?? args.briefContent;
+    const requestedNewRunId = args.new_run_id ?? args.newRunId ?? args.next_run_id ?? args.nextRunId;
+    const nextRunId = replacementBrief != null && String(replacementBrief).trim()
+      ? normalizeAutoSelectionRunId(requestedNewRunId || buildAutoSelectionRunIdFromBrief(replacementBrief))
+      : runId;
+
+    const removed = [];
+    for (const stage of ['scored', 'raw', 'brief', 'failed']) {
+      const result = await autoSelectionDeleteRunFile({ stage, run_id: runId });
+      removed.push(result.removed);
+    }
+    const lockCleanup = await autoSelectionClearLocks({ run_id: runId });
+    if (replacementBrief != null && String(replacementBrief).trim()) {
+      const dispatch = await autoSelectionPrepareDispatch({
+        worker: 'hawkeye',
+        run_id: nextRunId,
+        brief_content: String(replacementBrief),
+        overwrite_brief: true,
+        overwrite_lock: true,
+        dispatch_reason: 'forge_drop_and_reselect'
+      });
+      return {
+        success: true,
+        command: commandName,
+        run_id: runId,
+        old_run_id: runId,
+        new_run_id: nextRunId,
+        action,
+        state_transition: 'raw_scored_deleted_new_scout_dispatch_prepared',
+        removed,
+        lock_cleanup: lockCleanup.removed || [],
+        brief_written: true,
+        cleanup_done: true,
+        agent_assistant_request: dispatch.agent_assistant_request,
+        message: 'DROP_AND_RESELECT complete. Old state cleaned. New brief written. Ready to dispatch new scout with the provided agent_assistant_request.'
+      };
+    }
+    return {
+      success: true,
+      command: commandName,
+      run_id: runId,
+      old_run_id: runId,
+      action,
+      state_transition: 'raw_scored_deleted_waiting_for_new_brief',
+      removed,
+      lock_cleanup: lockCleanup.removed || [],
+      next_actions: ['Create a new brief with a new_run_id, then dispatch scout. Do not archive or post yet.']
+    };
+  }
+
+  return {
+    success: true,
+    command: commandName,
+    run_id: runId,
+    action,
+    state_transition: 'ready_for_final_publication',
+    next_actions: [
+      'Publish forum and DailyNote first.',
+      'Then call auto_selection_archive_run with stage=scored.',
+      'After archive succeeds, output [[TaskComplete]].'
+    ]
   };
 }
 
@@ -725,6 +1029,25 @@ async function autoSelectionMarkWorkerMissingOutput(args = {}) {
     return strategyProfileMisuseResponse('auto_selection_mark_worker_missing_output');
   }
   const requestedRunId = args.run_id ?? args.runId ? normalizeAutoSelectionRunId(args.run_id ?? args.runId) : '';
+  if (requestedRunId) {
+    for (const stage of ['failed', 'scored', 'raw']) {
+      try {
+        const existingPath = resolveAutoSelectionFile(stage, requestedRunId);
+        await fs.access(existingPath);
+        return {
+          success: false,
+          command: 'auto_selection_mark_worker_missing_output',
+          error: 'expected_output_already_exists',
+          run_id: requestedRunId,
+          existing_stage: stage,
+          existing_path: existingPath,
+          message: 'A handoff file already exists. Do not mark worker missing output; follow queue_status next_action instead.'
+        };
+      } catch (_) {
+        // No handoff at this stage.
+      }
+    }
+  }
   const queue = await autoSelectionQueueStatus({
     include_content: false,
     worker_timeout_minutes: args.worker_timeout_minutes ?? args.workerTimeoutMinutes
@@ -863,6 +1186,11 @@ async function processToolCall(args = {}) {
         return await autoSelectionReadRunFile(args);
       case 'auto_selection_prepare_dispatch':
         return await autoSelectionPrepareDispatch(args);
+      case 'auto_selection_apply_forge_decision':
+      case 'auto_selection_apply_reviewer_decision':
+        return await autoSelectionApplyForgeDecision(args, command);
+      case 'auto_selection_archive_run':
+        return await autoSelectionArchiveRun(args);
       case 'auto_selection_move_run_file':
         return await autoSelectionMoveRunFile(args);
       case 'auto_selection_delete_run_file':
@@ -884,6 +1212,9 @@ async function processToolCall(args = {}) {
             'auto_selection_write_run_file',
             'auto_selection_read_run_file',
             'auto_selection_prepare_dispatch',
+            'auto_selection_apply_forge_decision',
+            'auto_selection_apply_reviewer_decision',
+            'auto_selection_archive_run',
             'auto_selection_move_run_file',
             'auto_selection_delete_run_file',
             'auto_selection_cleanup_run',

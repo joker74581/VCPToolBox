@@ -1,50 +1,50 @@
-# AmazonAds Data Capabilities
+# AmazonAds 数据能力说明
 
-This document describes the public, account-neutral data capabilities of `Plugin/AmazonAds`. It intentionally contains no real account name, profile ID, account ID, campaign name, ASIN, SKU, report output, or signed URL.
+本文档描述了 `Plugin/AmazonAds` 的公开、不绑定账户的数据能力。本文档有意不包含任何真实的账户名、Profile ID、账户 ID、Campaign 名称、ASIN、SKU、报表输出或签名 URL。
 
-## Direct Queries
+## 直接查询结构
 
-These commands query current account or advertising structure and do not create reports:
+这些命令用于查询当前的账户或广告结构，不创建报表：
 
-| Data | Command |
+| 数据 | 命令 |
 | --- | --- |
-| Plugin/MCP health | `get_status` |
-| Wrapped capabilities | `list_capabilities` |
-| Advertising accounts | `list_accounts`, `get_account` |
-| Campaigns | `list_campaigns` |
-| Ad groups | `list_ad_groups` |
-| Ads | `list_ads` |
-| Targets / keywords / product targets | `list_targets` |
-| Product eligibility | `check_product_eligibility` |
-| Billing status | `get_billing_status` |
-| Account users | `list_account_users` |
+| 插件/MCP 健康状态 | `get_status` |
+| 封装的能力列表 | `list_capabilities` |
+| 广告账户 | `list_accounts`, `get_account` |
+| 广告活动 (Campaigns) | `list_campaigns` |
+| 广告组 (Ad groups) | `list_ad_groups` |
+| 广告 (Ads) | `list_ads` |
+| 投放目标/关键词/商品投放 | `list_targets` |
+| 商品投放资格检查 | `check_product_eligibility` |
+| 账单状态 | `get_billing_status` |
+| 账户用户 | `list_account_users` |
 
-Use direct queries for questions like:
+在以下场景使用直接查询：
 
-- Which campaigns are currently configured?
-- Which targets exist under an ad group?
-- Is an ASIN eligible for advertising?
+- 当前配置了哪些广告活动？
+- 某个广告组下存在哪些投放目标？
+- 某个 ASIN 是否有资格投放广告？
 
-Do not use direct queries for historical performance questions.
+不要使用直接查询来获取历史表现数据。
 
-## Report-Based Queries
+## 报表查询
 
-Historical metrics such as impressions, clicks, cost, sales, orders, ACOS, ROAS, placements, targets, and search terms usually require asynchronous reports.
+曝光量 (impressions)、点击量 (clicks)、花费 (cost)、销售额 (sales)、订单量 (orders)、ACOS、ROAS、广告位 (placements)、投放目标 (targets) 和搜索词 (search terms) 等历史指标通常需要异步报表。
 
-High-level report commands:
+高级报表命令：
 
-| Purpose | Command |
+| 目的 | 命令 |
 | --- | --- |
-| Create or fetch a report | `get_report_data` |
-| Create a raw report job | `create_report` |
-| Poll a report | `retrieve_report` |
-| List local report jobs | `list_report_jobs` |
-| Read archived data | `read_report_artifact` |
-| Export CSV/XLSX | `export_report_artifact` |
-| Aggregate archives | `aggregate_report_archives` |
-| Probe candidate fields | `probe_report_fields` |
+| 创建或获取报表 | `get_report_data` |
+| 创建原始报表任务 | `create_report` |
+| 轮询报表 | `retrieve_report` |
+| 列出本地报表任务 | `list_report_jobs` |
+| 读取归档数据 | `read_report_artifact` |
+| 导出 CSV/XLSX | `export_report_artifact` |
+| 聚合归档报表 | `aggregate_report_archives` |
+| 探测候选字段 | `probe_report_fields` |
 
-Common report kinds:
+常见的报表类型 (report kinds)：
 
 - `campaign`
 - `placement`
@@ -52,38 +52,38 @@ Common report kinds:
 - `search_term`
 - `keyword`
 
-## Field Presets
+## 字段预设 (Field Presets)
 
-The plugin keeps field presets in `lib/fieldPresets.js`. Field availability can vary. A field listed in the plugin should be treated as a maintained default, not a universal Amazon guarantee.
+插件在 `lib/fieldPresets.js` 中维护了字段预设。字段的可用性可能会有所不同。插件中列出的字段应被视为维护的默认值，而不是 Amazon 的通用保证。
 
-If Amazon rejects a field combination:
+如果 Amazon 拒绝了某个字段组合：
 
-1. Reduce the date range.
-2. Probe a small batch of candidate fields.
-3. Re-run the business report with the confirmed fields.
+1. 缩短日期范围。
+2. 探测小批量的候选字段。
+3. 使用确认后的字段重新运行业务报表。
 
-## Local State
+## 本地状态
 
-The plugin writes local report indexes and downloads to:
+插件将本地报表索引和下载文件写入：
 
 ```text
 Plugin/AmazonAds/state/
 ```
 
-This directory is private runtime data. Do not commit it to Git. It may contain:
+该目录是私有的运行时数据。不要将其提交到 Git。它可能包含：
 
-- account names or IDs
-- campaign names
-- ASIN/SKU values
-- search terms
-- report IDs
-- signed URLs
-- raw metrics
-- CSV/XLSX exports
+- 账户名或 ID
+- Campaign 名称
+- ASIN/SKU 值
+- 搜索词
+- 报表 ID
+- 签名下载 URL
+- 原始指标数据
+- CSV/XLSX 导出文件
 
-## Public Example Account Placeholders
+## 公开示例账户占位符
 
-Use placeholders in documentation and sample prompts:
+在文档和示例提示词中使用以下占位符：
 
 ```text
 accountName: <YOUR_ACCOUNT_NAME>
@@ -93,4 +93,4 @@ entityId: <YOUR_ENTITY_ID>
 marketplace: US
 ```
 
-Each user should fill these values in `Plugin/AmazonAds/config.env` or the root `config.env`.
+每个用户都应该在 `Plugin/AmazonAds/config.env` 或根目录的 `config.env` 中填写这些值。

@@ -57,11 +57,23 @@
       },
       {
         "command": "auto_selection_prepare_dispatch",
-        "description": "Prepare a worker dispatch. Parameters: worker hawkeye|forge, run_id/runId. For hawkeye, optional brief_content/content writes the brief before dispatch; otherwise an existing brief is required. For forge, an existing raw file is required. Optional retry_count/retryCount, dispatch_reason/dispatchReason, overwrite_lock/overwriteLock support the single retry path reported by queue_status. Creates the correct worker lock and returns agent_assistant_request fields. Hawkeye is injected with AutoProductSelection and ProductSelector; Forge is injected with AutoProductSelection. Use the returned fields to call AgentAssistant."
+        "description": "Prepare a worker dispatch. Parameters: worker scout|reviewer, run_id/runId. Backward-compatible aliases hawkeye|forge are also accepted. For scout, optional brief_content/content writes the brief before dispatch; otherwise an existing brief is required. For reviewer, an existing raw file is required. Optional retry_count/retryCount, dispatch_reason/dispatchReason, overwrite_lock/overwriteLock support the single retry path reported by queue_status. Creates the correct worker lock and returns agent_assistant_request fields. Scout is injected with AutoProductSelection and ProductSelector; Reviewer is injected with AutoProductSelection. Use the returned fields to call AgentAssistant."
+      },
+      {
+        "command": "auto_selection_apply_forge_decision",
+        "description": "Backward-compatible alias for auto_selection_apply_reviewer_decision."
+      },
+      {
+        "command": "auto_selection_apply_reviewer_decision",
+        "description": "Apply the scored post_forge_action safely. Parameters: run_id/runId, optional action, optional scored_content/scoredContent, optional brief_content/briefContent, optional new_run_id/newRunId for DROP_AND_RESELECT. LOOPBACK_TO_SCOUT or LOOPBACK_TO_HAWKEYE preserves raw, deletes scored, clears old locks, writes a loopback brief, creates the scout lock, and returns agent_assistant_request. DROP_AND_RESELECT deletes old brief/raw/scored/failed, clears locks, then writes brief_content to new_run_id or an auto-generated replacement run and prepares scout dispatch. PUBLISH_FINAL returns ready_for_final_publication; publish forum/DailyNote first, then call auto_selection_archive_run."
+      },
+      {
+        "command": "auto_selection_archive_run",
+        "description": "Archive a completed run with low ambiguity. Parameters: run_id/runId and optional stage/from_stage/fromStage. If stage is omitted, archives the first existing failed/scored/raw/brief file. If the requested stage is missing but another handoff file exists, archives the existing fallback stage instead. Moves the file to archived and cleans same-run residue. Use this after final forum/DailyNote publication or failed blocking report; do not use cleanup_run as a substitute for archive."
       },
       {
         "command": "auto_selection_move_run_file",
-        "description": "Move a handoff file between runs stages. Parameters: from_stage/fromStage, to_stage/toStage, run_id/runId, optional lock names for lock files. Moving to archived also cleans same-run residue."
+        "description": "Move a handoff file between runs stages. Parameters: from_stage/fromStage or stage, to_stage/toStage, run_id/runId, optional lock names for lock files. If stage is provided without to_stage, it defaults to archived. Moving to archived also cleans same-run residue. Prefer auto_selection_archive_run for final archive."
       },
       {
         "command": "auto_selection_delete_run_file",

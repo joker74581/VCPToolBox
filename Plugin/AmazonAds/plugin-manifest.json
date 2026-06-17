@@ -17,8 +17,8 @@
   "configSchema": {
     "AMAZON_ADS_MCP_CONFIG_PATH": {
       "type": "string",
-      "description": "Amazon Ads MCP 配置文件路径。默认复用 MCPO custom-mcp-config/mcp-config.json。",
-      "default": "Plugin/MCPO/custom-mcp-config/mcp-config.json"
+      "description": "Amazon Ads MCP 配置文件路径。默认使用插件内部的 mcp-config/mcp-config.json。",
+      "default": "Plugin/AmazonAds/mcp-config/mcp-config.json"
     },
     "AMAZON_ADS_MCP_SERVER_NAME": {
       "type": "string",

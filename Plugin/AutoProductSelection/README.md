@@ -66,17 +66,19 @@ AUTO_SELECTION_REVIEWER_TASK_PREFIXES=APS_REVIEWER_,ProductSelectionReviewer_
 
 If you use custom AgentAssistant names, put these values in root `config.env` or a plugin-level config file according to your VCP deployment rules.
 
+See `config.env.example` for a copyable generic template.
+
 ## Core Workflow
 
 1. Coordinator reads queue state with `auto_selection_queue_status`.
 2. If no active run exists, Coordinator reads `AutoSelectionStrategyProfile.md` and creates a SelectionBrief.
-3. Coordinator calls `auto_selection_prepare_dispatch(worker=hawkeye)` to create a brief/lock and receive an AgentAssistant request for the scout agent.
+3. Coordinator calls `auto_selection_prepare_dispatch(worker=scout)` to create a brief/lock and receive an AgentAssistant request for the scout agent.
 4. Scout reads the brief, gathers evidence through `ProductSelector`, and writes `raw` or `failed`.
-5. Coordinator reviews the queue. If raw is ready, it calls `auto_selection_prepare_dispatch(worker=forge)` for the reviewer agent.
+5. Coordinator reviews the queue. If raw is ready, it calls `auto_selection_prepare_dispatch(worker=reviewer)` for the reviewer agent.
 6. Reviewer reads raw evidence and writes `scored` or `failed`.
 7. Coordinator decides whether to publish, loop back for more evidence, archive, or mark failed.
 
-The internal worker names are still `hawkeye` and `forge` for command compatibility, but the AgentAssistant display names are configurable.
+Backward-compatible worker aliases `hawkeye` and `forge` are still accepted. Public integrations should prefer `scout` and `reviewer`.
 
 ## Commands
 
@@ -86,6 +88,8 @@ All commands use `tool_name: AutoProductSelection`.
 - `auto_selection_write_run_file`
 - `auto_selection_read_run_file`
 - `auto_selection_prepare_dispatch`
+- `auto_selection_apply_reviewer_decision`
+- `auto_selection_archive_run`
 - `auto_selection_move_run_file`
 - `auto_selection_delete_run_file`
 - `auto_selection_cleanup_run`
@@ -94,6 +98,52 @@ All commands use `tool_name: AutoProductSelection`.
 - `get_status`
 
 `auto_selection_read_run_file` only reads files inside `runs/`. `AutoSelectionStrategyProfile.md` is a plugin-root strategy file and should be read with a normal file-reading tool, not as a run file.
+
+### Generic Dispatch Example
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_prepare_dispatch「末」,
+worker:「始」scout「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+Submit the returned `agent_assistant_request` fields to `AgentAssistant`.
+
+### Reviewer Decision Example
+
+When the reviewer writes `scored`, the coordinator can safely apply the decision without manually composing file operations:
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_apply_reviewer_decision「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+Supported actions are:
+
+- `PUBLISH_FINAL`: publish your final report, then call `auto_selection_archive_run`.
+- `LOOPBACK_TO_SCOUT`: preserve `raw`, delete old `scored`, create a loopback brief, and return a new scout dispatch request.
+- `DROP_AND_RESELECT`: clear the current raw/scored evidence and optionally prepare a new scout dispatch if `brief_content` is provided.
+
+`LOOPBACK_TO_HAWKEYE` is accepted as a backward-compatible alias for `LOOPBACK_TO_SCOUT`.
+
+### Archive Example
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_archive_run「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」,
+stage:「始」scored「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+Use `stage=failed` for failed runs. `auto_selection_cleanup_run` is only for residue cleanup and should not replace archive.
 
 ## Strategy File
 

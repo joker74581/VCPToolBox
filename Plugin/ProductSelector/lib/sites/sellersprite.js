@@ -102,12 +102,14 @@ const KEYWORD_DEPARTMENTS = [
   { slug: 'industrial', label: 'Industrial & Scientific', aliases: ['industrial', 'scientific', '工业', '工业类'] },
   { slug: 'mi', label: 'Musical Instruments', aliases: ['mi', 'musical instruments', '乐器'] },
   { slug: 'office-products', label: 'Office Products', aliases: ['office', 'office products', '办公', '办公产品'] },
+  { slug: 'lawngarden', label: 'Patio, Lawn & Garden', aliases: ['lawngarden', 'patio', 'lawn', 'garden', '庭院', '草坪', '园艺', 'garden & outdoor'] },
   { slug: 'pets', label: 'Pet Supplies', aliases: ['pets', 'pet supplies', '宠物', '宠物用品'] },
   { slug: 'sporting', label: 'Sports & Outdoors', aliases: ['sporting', 'sports', 'outdoors', '运动', '户外'] },
   { slug: 'tools', label: 'Tools & Home Improvement', aliases: ['tools', 'home improvement', '工具', '家装'] },
-  { slug: 'toys-and-games', label: 'Toys & Games', aliases: ['toys', 'games', 'toys and games', 'toys & games', '玩具', '游戏'] },
-  { slug: 'kitchen', label: 'Home & Kitchen', aliases: ['kitchen', 'home kitchen', 'home & kitchen', '家居用品', '厨具'] },
-  { slug: 'photo', label: 'Camera and Photo', aliases: ['photo', 'camera', 'camera and photo', '相机', '摄影'] }
+  { slug: 'toys-and-games', label: 'Toys & Games', aliases: ['toys', 'games', 'toys and games', 'toys & games', '玩具', '游戏', 'toys & kitchen'] },
+  { slug: 'kitchen', label: 'Home & Kitchen', aliases: ['kitchen', 'home kitchen', 'home & kitchen', '家居用品', '厨具', 'toys & kitchen'] },
+  { slug: 'photo', label: 'Camera and Photo', aliases: ['photo', 'camera', 'camera and photo', '相机', '摄影'] },
+  { slug: 'wireless', label: 'Wireless', aliases: ['wireless', '无线'] }
 ];
 
 const DEFAULT_KEYWORD_DEPARTMENTS = KEYWORD_DEPARTMENTS.map(item => item.slug);

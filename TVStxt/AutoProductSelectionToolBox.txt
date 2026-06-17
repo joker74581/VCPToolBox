@@ -2,6 +2,30 @@
 
 `AutoProductSelection` 专门管理自动选品的状态机流程。**它本身不进行任何商品数据抓取**。抓取选品数据、查市场证据等请继续使用 `ProductSelector` 或其他数据插件。
 
+## 默认执行协议 (优先读取)
+
+- **【身份纪律】调用任何工具时，必须在请求体中附带 `maid:「始」你的真实Agent名字「末」`（例如 破壁_枢纽、破壁_鹰眼）。绝对禁止使用“小冰”等虚构身份！**
+
+- 每次醒来第一步调用 `auto_selection_queue_status`。
+- 按 `next_action_hint` 推进；真实状态只看 `runs/` 文件，不看 AgentAssistant 口头完成。
+- 派发 worker：先调用 `auto_selection_prepare_dispatch`，再把返回的 `agent_assistant_request` 原样交给 AgentAssistant。
+- 等待 worker：只输出 `[[NextHeartbeat::120]]`，下一次醒来重新查队列。
+- `evaluate_scored`：优先调用 `auto_selection_apply_reviewer_decision`，不要手动拼 delete/clear/write/dispatch。
+- 最终发布或失败阻断：先发论坛/写日记，再调用 `auto_selection_archive_run`，成功后输出 `[[TaskComplete]]`。
+- `auto_selection_cleanup_run` 只清理残留，不能替代归档。
+- Coordinator 与 Worker 每轮最多只发 1 个 `TOOL_REQUEST`，等待工具摘要后再继续；不要在同一轮连续发多个工具块。
+
+常用命令速查：
+
+```text
+queue_status -> prepare_dispatch(worker=scout) -> AgentAssistant -> wait
+raw ready -> prepare_dispatch(worker=reviewer) -> AgentAssistant -> wait
+scored ready -> apply_reviewer_decision
+final/failed done -> archive_run -> [[TaskComplete]]
+```
+
+[===vcp_fold:0.35::desc:AutoProductSelection 自动选品 状态机 runs 队列 派发 scout reviewer 归档 回环 缺交付 AgentAssistant===]
+
 ## 运行数据目录 (Runtime Directory)
 
 ```text
@@ -18,13 +42,15 @@ Plugin/AutoProductSelection/runs/
 
 ## 调用节奏 (Call Rhythm)
 
-自动选品 Worker（鹰眼/熔炉）每一轮回复最多只发送 1 个 `TOOL_REQUEST`。等待工具摘要返回后，再基于结果决定下一步；不要在同一轮连续发多个工具块。
+自动选品 Worker 每一轮回复最多只发送 1 个 `TOOL_REQUEST`。等待工具摘要返回后，再基于结果决定下一步；不要在同一轮连续发多个工具块。
 
 ## 角色分工 (Roles)
 
 - **协调者 (Coordinator)**：创建 brief 简报、分发调度 Worker 任务、读取队列状态、归档最终结果。
-- **侦察者 Worker (`worker=hawkeye`)**：读取 brief 简报，去执行抓取，然后写回 raw（原始数据） 或 failed（失败记录）。
-- **审查者 Worker (`worker=forge`)**：读取 raw 原始数据，评估并写回 scored（打分） 或 failed（失败记录）。
+- **侦察者 Worker (`worker=scout`)**：读取 brief 简报，去执行抓取，然后写回 raw（原始数据） 或 failed（失败记录）。
+- **审查者 Worker (`worker=reviewer`)**：读取 raw 原始数据，评估并写回 scored（打分） 或 failed（失败记录）。
+
+兼容旧流程时也接受 `worker=hawkeye` 和 `worker=forge`，它们分别等价于 `scout` 和 `reviewer`。
 
 处理这些子任务的 AgentAssistant 名字配置在环境变量中：
 
@@ -47,6 +73,7 @@ Plugin/AutoProductSelection/AutoSelectionStrategyProfile.md
 
 ```text
 <<<[TOOL_REQUEST]>>>
+maid:「始」破壁_枢纽「末」,
 tool_name:「始」AutoProductSelection「末」,
 command:「始」auto_selection_queue_status「末」
 <<<[END_TOOL_REQUEST]>>>
@@ -58,7 +85,7 @@ command:「始」auto_selection_queue_status「末」
 <<<[TOOL_REQUEST]>>>
 tool_name:「始」AutoProductSelection「末」,
 command:「始」auto_selection_prepare_dispatch「末」,
-worker:「始」hawkeye「末」,
+worker:「始」scout「末」,
 run_id:「始」APS-YYYYMMDD-topic「末」,
 overwrite_lock:「始」true「末」,
 retry_count:「始」1「末」,
@@ -68,7 +95,11 @@ dispatch_reason:「始」missing_output_retry「末」
 
 如果 `next_action_hint=handle_worker_missing_output`，不要继续分发同一个 Worker；请调用 `auto_selection_mark_worker_missing_output` 写入 failed 并清理锁。
 
+[===vcp_fold:0.50::desc:AutoProductSelection 写brief 派发 AgentAssistant scout reviewer read raw scored VCP_ASYNC_RESULT 心跳===]
+
 ## 编写任务简报 (Write A Brief)
+
+编写 Brief 时，作为协调者，请不要仅仅简单传递几个宽泛的关键词。你必须进行“多维解构”（思考判断）：基于总体战略方向，主动在 Brief 中为侦察者 (Scout) 提供 3-5 个不同角度的细分场景、长尾词或目标受众作为备选抓取方向，以便侦察者在遇到某方向数据不足时有明确的 fallback 路径。
 
 ```text
 <<<[TOOL_REQUEST]>>>
@@ -88,7 +119,7 @@ content:「始」# SelectionBrief
 <<<[TOOL_REQUEST]>>>
 tool_name:「始」AutoProductSelection「末」,
 command:「始」auto_selection_prepare_dispatch「末」,
-worker:「始」hawkeye「末」,
+worker:「始」scout「末」,
 run_id:「始」APS-YYYYMMDD-topic「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
@@ -103,7 +134,7 @@ AgentAssistant 提交成功后，如果返回 `{{VCP_ASYNC_RESULT::...}}` 占位
 <<<[TOOL_REQUEST]>>>
 tool_name:「始」AutoProductSelection「末」,
 command:「始」auto_selection_prepare_dispatch「末」,
-worker:「始」forge「末」,
+worker:「始」reviewer「末」,
 run_id:「始」APS-YYYYMMDD-topic「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
@@ -119,7 +150,44 @@ run_id:「始」APS-YYYYMMDD-topic「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-## 清理操作 (Cleanup)
+## 熔炉决策应用 (Apply Forge Decision)
+
+当 `next_action_hint=evaluate_scored` 时，协调者先读取 `scored` 判断是否需要发帖；如果 `post_forge_action.action=LOOPBACK_TO_SCOUT`、`LOOPBACK_TO_HAWKEYE` 或 `DROP_AND_RESELECT`，不要手动拼接 delete/clear/write/dispatch，直接调用：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_apply_reviewer_decision「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」,
+new_run_id:「始」APS-YYYYMMDD-new-topic「末」,  # DROP_AND_RESELECT 可选；不填则插件自动生成
+brief_content:「始」# Selection Brief...「末」      # DROP_AND_RESELECT 或回环补采时传入
+<<<[END_TOOL_REQUEST]>>>
+```
+
+- `LOOPBACK_TO_SCOUT` / `LOOPBACK_TO_HAWKEYE`：插件会保留 raw、删除 scored、清理旧锁、覆盖补采 brief，并返回 `agent_assistant_request`。
+- `DROP_AND_RESELECT`：插件会清理旧 run 的 brief/raw/scored/failed 和旧锁；遇到此动作代表 Reviewer 完全否决了当前方向。作为 Coordinator，你必须汲取失败教训，彻底更换关键词或方向，编写全新的 `brief_content` 传入；可传 `new_run_id`，不传则插件自动生成新 run，并准备新一轮 Scout 派发。绝对不要死磕在类似的词上。
+- `PUBLISH_FINAL`：插件只返回 `ready_for_final_publication`，请先发论坛和写 DailyNote，再归档。
+
+收到 `agent_assistant_request` 后，按返回字段调用 AgentAssistant；成功提交后输出 `[[NextHeartbeat::120]]`。
+
+[===vcp_fold:0.55::desc:AutoProductSelection 归档 archive cleanup missing_output locks TaskComplete DailyNote no_reply===]
+
+## 归档与清理 (Archive / Cleanup)
+
+最终发布或失败阻断完成后，使用低歧义归档命令：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_archive_run「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」,
+stage:「始」scored「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+失败归档时优先 `stage=failed`。如果 failed 文件不存在但 raw/scored/brief 仍在，插件会自动归档现有阶段文件并清理 residue。`auto_selection_cleanup_run` 只用于清理残留，不能替代最终归档。
+
+## 低层文件操作 (Low-level Operations)
 
 - `auto_selection_move_run_file`
 - `auto_selection_delete_run_file`

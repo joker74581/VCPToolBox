@@ -62,17 +62,19 @@ AUTO_SELECTION_REVIEWER_TASK_PREFIXES=APS_REVIEWER_,ProductSelectionReviewer_
 
 如果你的 AgentAssistant 里有自己的 Agent 名称，把这些配置放进根目录 `config.env` 或插件级配置文件即可。
 
+可复制的通用配置模板见 `config.env.example`。
+
 ## 核心流程
 
 1. Coordinator 调用 `auto_selection_queue_status` 查看当前队列。
 2. 如果没有活跃任务，Coordinator 读取 `AutoSelectionStrategyProfile.md`，创建 SelectionBrief。
-3. Coordinator 调用 `auto_selection_prepare_dispatch(worker=hawkeye)`，插件写入 brief 和 lock，并返回发给调研 Agent 的 AgentAssistant 请求。
+3. Coordinator 调用 `auto_selection_prepare_dispatch(worker=scout)`，插件写入 brief 和 lock，并返回发给调研 Agent 的 AgentAssistant 请求。
 4. 调研 Agent 读取 brief，通过 `ProductSelector` 等工具收集证据，写入 `raw` 或 `failed`。
-5. Coordinator 再次检查队列。如果 raw 已完成，调用 `auto_selection_prepare_dispatch(worker=forge)`，把任务交给评审 Agent。
+5. Coordinator 再次检查队列。如果 raw 已完成，调用 `auto_selection_prepare_dispatch(worker=reviewer)`，把任务交给评审 Agent。
 6. 评审 Agent 读取 raw 证据，写入 `scored` 或 `failed`。
 7. Coordinator 根据 scored 结果决定发布、补充调研、归档或失败。
 
-为了兼容旧命令，内部 `worker` 参数仍然叫 `hawkeye` 和 `forge`，但真正派发给 AgentAssistant 的名称已经可以通过配置改成通用名称。
+为了兼容旧流程，`worker=hawkeye/forge` 仍然可用，分别等价于 `scout/reviewer`。公开集成建议使用 `scout/reviewer`。
 
 ## 命令列表
 
@@ -82,6 +84,8 @@ AUTO_SELECTION_REVIEWER_TASK_PREFIXES=APS_REVIEWER_,ProductSelectionReviewer_
 - `auto_selection_write_run_file`
 - `auto_selection_read_run_file`
 - `auto_selection_prepare_dispatch`
+- `auto_selection_apply_reviewer_decision`
+- `auto_selection_archive_run`
 - `auto_selection_move_run_file`
 - `auto_selection_delete_run_file`
 - `auto_selection_cleanup_run`
@@ -90,6 +94,52 @@ AUTO_SELECTION_REVIEWER_TASK_PREFIXES=APS_REVIEWER_,ProductSelectionReviewer_
 - `get_status`
 
 注意：`auto_selection_read_run_file` 只读取 `runs/` 内的交接文件。`AutoSelectionStrategyProfile.md` 是插件根目录下的策略文件，应该用普通文件读取工具读取，不要当作 run 文件读取。
+
+### 通用派发示例
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_prepare_dispatch「末」,
+worker:「始」scout「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+收到返回的 `agent_assistant_request` 后，把字段原样交给 `AgentAssistant`。
+
+### 评审决策应用示例
+
+评审 Agent 写入 `scored` 后，协调者不要手动拼接删除、清锁、重写 brief、再派发等多步命令，直接调用：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_apply_reviewer_decision「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+支持的动作：
+
+- `PUBLISH_FINAL`：先发布最终报告，再调用 `auto_selection_archive_run`。
+- `LOOPBACK_TO_SCOUT`：保留 `raw`、删除旧 `scored`、创建补采 brief，并返回新的 scout 派发请求。
+- `DROP_AND_RESELECT`：清理旧 run 的 brief/raw/scored/failed 和锁；如果传入 `brief_content`，会写入 `new_run_id`（未传则自动生成）并准备新的 scout 派发请求。
+
+兼容旧值：`LOOPBACK_TO_HAWKEYE` 等价于 `LOOPBACK_TO_SCOUT`。
+
+### 归档示例
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_archive_run「末」,
+run_id:「始」APS-YYYYMMDD-topic「末」,
+stage:「始」scored「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+失败阻断时使用 `stage=failed`。`auto_selection_cleanup_run` 只用于清理残留，不能替代最终归档。
 
 ## 策略文件
 

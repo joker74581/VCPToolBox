@@ -10,11 +10,17 @@ let networkLogs = new Map(); // requestId -> { request, response, body }
 const HEARTBEAT_INTERVAL = 30 * 1000;
 const defaultServerUrl = 'ws://localhost:8088';
 const defaultVcpKey = 'your_secret_key';
+let reconnectTimeoutId = null;
 
 function connect() {
     if (ws && ws.readyState === WebSocket.OPEN) {
         console.log('WebSocket is already connected.');
         return;
+    }
+
+    if (reconnectTimeoutId) {
+        clearTimeout(reconnectTimeoutId);
+        reconnectTimeoutId = null;
     }
 
     // 从storage获取URL和Key
@@ -156,6 +162,17 @@ function connect() {
                 clearInterval(heartbeatIntervalId);
                 heartbeatIntervalId = null;
             }
+
+            // 从storage检查是否需要自动重连
+            chrome.storage.local.get(['autoConnectEnabled'], (result) => {
+                const autoConnect = result.autoConnectEnabled !== false;
+                if (autoConnect) {
+                    console.log('[VCP Background] WebSocket closed. Auto-reconnect is enabled. Scheduling reconnect in 5s...');
+                    scheduleReconnect();
+                } else {
+                    console.log('[VCP Background] WebSocket closed. Auto-reconnect is disabled.');
+                }
+            });
         };
 
         ws.onerror = (error) => {
@@ -173,9 +190,23 @@ function connect() {
 }
 
 function disconnect() {
+    if (reconnectTimeoutId) {
+        clearTimeout(reconnectTimeoutId);
+        reconnectTimeoutId = null;
+    }
     if (ws) {
         ws.close();
     }
+}
+
+function scheduleReconnect() {
+    if (reconnectTimeoutId) {
+        clearTimeout(reconnectTimeoutId);
+    }
+    reconnectTimeoutId = setTimeout(() => {
+        console.log('[VCP Background] 🔄 Reconnecting now...');
+        connect();
+    }, 5000); // 5 seconds
 }
 
 function updateIcon() {
@@ -227,9 +258,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return true;
     } else if (request.type === 'TOGGLE_CONNECTION') {
         if (isConnected) {
-            disconnect();
+            // 用户手动断开：设置 autoConnectEnabled 为 false
+            chrome.storage.local.set({ autoConnectEnabled: false }, () => {
+                disconnect();
+            });
         } else {
-            connect();
+            // 用户手动连接：设置 autoConnectEnabled 为 true
+            chrome.storage.local.set({ autoConnectEnabled: true }, () => {
+                connect();
+            });
         }
         // 不再立即返回状态，而是等待广播
         // sendResponse({ isConnected: !isConnected });
@@ -952,6 +989,11 @@ chrome.storage.local.get(['isMonitoringEnabled'], (result) => {
 
 // 初始化图标状态
 updateIcon();
-// 自动连接到远端
-connect();
-
+// 从storage恢复连接状态并自动连接
+chrome.storage.local.get(['autoConnectEnabled'], (result) => {
+    const autoConnect = result.autoConnectEnabled !== false;
+    console.log('[VCP Background] 📡 恢复自动连接状态:', autoConnect ? '开启' : '关闭');
+    if (autoConnect) {
+        connect();
+    }
+});

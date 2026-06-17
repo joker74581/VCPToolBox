@@ -1,25 +1,28 @@
-# AutoProductSelection State Machine
+# AutoProductSelection 状态机说明
 
-This document describes the public, reusable workflow contract for the `AutoProductSelection` plugin.
+本文档描述 `AutoProductSelection` 插件的公开、通用、可复用工作流契约。插件本身不抓取商品数据，只负责 runs 文件状态机、Worker 锁、AgentAssistant 派发负载和阶段交接。
 
-## Roles
+## 角色
 
-The plugin uses three logical roles. You can map them to any AgentAssistant names.
+插件使用三个逻辑角色。你可以把它们映射到任意 AgentAssistant 角色名。
 
-| Logical role | Responsibility |
+| 逻辑角色 | 职责 |
 | --- | --- |
-| Coordinator | Owns strategy, creates SelectionBrief files, dispatches workers, checks queue state, archives outcomes. |
-| Scout | Reads `brief`, gathers product evidence through `ProductSelector`, writes `raw` or `failed`. |
-| Reviewer | Reads `raw`, evaluates the evidence, writes `scored` or `failed`. |
+| Coordinator | 制定策略、创建 SelectionBrief、派发 Worker、检查队列状态、发布与归档结果。 |
+| Scout | 读取 `brief`，通过 `ProductSelector` 或其他数据插件收集证据，写入 `raw` 或 `failed`。 |
+| Reviewer | 读取 `raw`，评审证据，写入 `scored` 或 `failed`。 |
 
-Internal worker names remain:
+新集成建议使用公开 worker 名称：
 
-- `hawkeye` for the Scout worker
-- `forge` for the Reviewer worker
+- `scout`：证据收集 Worker。
+- `reviewer`：证据评审 Worker。
 
-These names are command-level compatibility labels, not required public Agent names.
+兼容旧别名：
 
-## Runtime Folders
+- `hawkeye` 等价于 `scout`。
+- `forge` 等价于 `reviewer`。
+
+## 运行目录
 
 ```text
 Plugin/AutoProductSelection/runs/
@@ -31,29 +34,33 @@ Plugin/AutoProductSelection/runs/
   locks/
 ```
 
-The filesystem is the source of truth. A verbal AgentAssistant response is not a completed handoff until the expected file exists.
+文件系统是唯一状态源。AgentAssistant 的口头回复不算交付，只有预期阶段文件真实存在才算完成交接。
 
 ## SelectionBrief
 
-A brief should include:
+`brief` 建议包含：
 
 - `run_id`
-- research theme
-- marketplace
-- target price range
-- seed keywords
-- exclusion constraints
-- evidence requirements
-- maximum retry or loopback count
-- expected output format
+- 研究主题
+- 目标市场
+- 目标价格带
+- 种子关键词
+- 排除约束
+- 证据要求
+- 最大重试或回环次数
+- 期望输出格式
 
-The Coordinator should create one focused brief per run.
+Coordinator 每次应只创建一个聚焦的 brief。
 
 ## RawDataPack
 
-The Scout writes `runs/raw/{run_id}-raw.md` when it has useful evidence.
+Scout 拿到有效证据后写入：
 
-Recommended fields:
+```text
+runs/raw/{run_id}-raw.md
+```
+
+推荐字段：
 
 - `run_id`
 - `route_decision`
@@ -64,13 +71,21 @@ Recommended fields:
 - `elimination_log`
 - `execution_summary`
 
-If evidence is insufficient, the Scout writes `runs/failed/{run_id}-failed.md`.
+如果证据不足或工具阻断，Scout 写入：
+
+```text
+runs/failed/{run_id}-failed.md
+```
 
 ## ScoredCandidatePack
 
-The Reviewer writes `runs/scored/{run_id}-scored.md` after evaluating raw evidence.
+Reviewer 评审 raw 后写入：
 
-Recommended fields:
+```text
+runs/scored/{run_id}-scored.md
+```
+
+推荐字段：
 
 - `run_id`
 - `final_disposition`
@@ -80,56 +95,70 @@ Recommended fields:
 - `missing_data`
 - `post_forge_action`
 
-Common `final_disposition` values:
+常见 `final_disposition`：
 
 - `RECOMMEND`
 - `PARTIAL`
 - `DROP`
 - `NEEDS_MORE_EVIDENCE`
 
-Common `post_forge_action.action` values:
+常见 `post_forge_action.action`：
 
 - `PUBLISH_FINAL`
-- `LOOPBACK_TO_HAWKEYE`
+- `LOOPBACK_TO_SCOUT`
 - `DROP_AND_RESELECT`
 
-## Normal Flow
+## 标准流程
 
-1. Coordinator calls `auto_selection_queue_status`.
-2. If no active run exists, Coordinator reads `AutoSelectionStrategyProfile.md`.
-3. Coordinator writes a `brief`.
-4. Coordinator calls `auto_selection_prepare_dispatch(worker=hawkeye)`.
-5. Coordinator submits the returned `agent_assistant_request` to AgentAssistant.
-6. Scout writes `raw` or `failed`.
-7. Coordinator checks queue status again.
-8. If raw is ready, Coordinator calls `auto_selection_prepare_dispatch(worker=forge)`.
-9. Reviewer writes `scored` or `failed`.
-10. Coordinator archives, loops back, or records failure.
+1. Coordinator 调用 `auto_selection_queue_status`。
+2. 如果没有活跃 run，Coordinator 读取 `AutoSelectionStrategyProfile.md`。
+3. Coordinator 写入 `brief`。
+4. Coordinator 调用 `auto_selection_prepare_dispatch(worker=scout)`。
+5. Coordinator 将返回的 `agent_assistant_request` 交给 AgentAssistant。
+6. Scout 写入 `raw` 或 `failed`。
+7. Coordinator 再次检查队列。
+8. 如果 raw 已就绪，Coordinator 调用 `auto_selection_prepare_dispatch(worker=reviewer)`。
+9. Reviewer 写入 `scored` 或 `failed`。
+10. Coordinator 根据 scored/failed 执行发布、回环、重选或归档。
 
-## Loopback
+## 回环
 
-Use loopback when the Reviewer finds a fixable evidence gap.
+Reviewer 发现可由数据工具补齐的证据缺口时使用回环。
 
-Recommended procedure:
+推荐流程：
 
-1. Read `scored`.
-2. Create an updated brief with specific missing evidence.
-3. Delete or archive the old scored file according to your policy.
-4. Dispatch Scout again for the same run or a clearly related run.
+1. 如需检查或发布内容，先读取 `scored`。
+2. 调用 `auto_selection_apply_reviewer_decision`。
+3. 如果返回 `agent_assistant_request`，交给 AgentAssistant，并等待下一次心跳。
+4. 如果返回 `ready_for_final_publication`，先发布最终输出，再调用 `auto_selection_archive_run`。
 
-Avoid endless loops. A practical default is no more than 5 total rounds per run.
+避免无限回环。一个实用默认值是单个 run 总轮数不超过 5 轮。
 
-## Failure Handling
+## 失败处理
 
-Use `auto_selection_mark_worker_missing_output` if queue status reports that a worker completed but did not write `raw`, `scored`, or `failed`.
+如果 `auto_selection_queue_status` 报告 Worker 已完成但没有写入 `raw`、`scored` 或 `failed`，使用：
 
-Use `auto_selection_cleanup_run` to clear non-archived residue for a run.
+```text
+auto_selection_mark_worker_missing_output
+```
 
-Use `auto_selection_clear_locks` when a lock is stale or malformed.
+最终发布或失败阻断后，使用：
 
-## Public Repository Hygiene
+```text
+auto_selection_archive_run
+```
 
-Do not commit real runtime outputs:
+`auto_selection_cleanup_run` 只用于清理非归档残留，不能替代最终归档。
+
+锁过期或锁文件异常时，可使用：
+
+```text
+auto_selection_clear_locks
+```
+
+## 开源仓库卫生
+
+不要提交真实运行输出：
 
 - `runs/raw/*.md`
 - `runs/scored/*.md`
@@ -137,6 +166,6 @@ Do not commit real runtime outputs:
 - `runs/archived/*.md`
 - `runs/locks/*.lock`
 
-Commit only source files, docs, templates, and `.gitkeep` placeholders.
+可以提交源码、文档、模板和 `.gitkeep` 占位文件。
 
-Private strategy notes, supplier notes, brand details, marketplace account details, and internal agent names should stay in ignored local files.
+私有策略、供应商信息、品牌资料、市场账号信息和内部 Agent 名称应保留在本地忽略文件中。

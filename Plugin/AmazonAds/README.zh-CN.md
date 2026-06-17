@@ -2,7 +2,7 @@
 
 `AmazonAds` 是一个面向 VCPToolBox 的 Amazon Ads 只读分析插件。它通过 Amazon Ads MCP 服务调用广告账户、活动、广告组、投放目标、报表等接口，让 Agent 不需要直接拼接底层 MCP 请求。
 
-公开版本不包含任何真实店铺、品牌、广告账号、Profile ID、Entity ID、Token、报表下载链接或历史报表数据。你自己的真实配置应该只放在本地 `config.env`、MCPO 配置文件和 `state/` 目录中。
+公开版本不包含任何真实店铺、品牌、广告账号、Profile ID、Entity ID、Token、报表下载链接或历史报表数据。你自己的真实配置应该只放在本地 `config.env`、mcp-config 配置文件和 `state/` 目录中。
 
 ## 主要能力
 
@@ -12,7 +12,7 @@
 - 创建、轮询、下载、解析、归档、导出和聚合 Amazon Ads 报表。
 - 在 `Plugin/AmazonAds/state/` 下维护本地报表索引和归档。
 - 默认安全模式开启，写操作需要显式关闭安全限制并配置操作密码。
-- 可选自动刷新 Amazon OAuth Token，并写回 MCPO 配置文件。
+- 可选自动刷新 Amazon OAuth Token，并写回 mcp-config 配置文件。
 
 ## 安装与配置
 
@@ -59,7 +59,7 @@ AMAZON_CLIENT_SECRET=<YOUR_AMAZON_CLIENT_SECRET>
 AMAZON_REFRESH_TOKEN=<YOUR_AMAZON_REFRESH_TOKEN>
 ```
 
-如果你已经有外部程序负责刷新 MCPO 配置里的 Token，就保持 `AMAZON_ADS_ENABLE_TOKEN_REFRESH=false`。
+如果你已经有外部程序负责刷新 mcp-config 配置里的 Token，就保持 `AMAZON_ADS_ENABLE_TOKEN_REFRESH=false`。
 
 ## 常用调用
 
@@ -156,7 +156,7 @@ days:「始」1「末」
 不要提交：
 
 - `Plugin/AmazonAds/config.env`
-- MCPO 真实配置文件
+- mcp-config 真实配置文件
 - OAuth Token、Refresh Token、Client Secret
 - `Plugin/AmazonAds/state/`
 - 下载后的报表、预览结果、签名下载链接

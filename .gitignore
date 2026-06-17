@@ -199,6 +199,7 @@ Plugin/AgentDream/dream_logs/
 Plugin/AgentDream/dream_schedule_state.json
 Plugin/VCPTaskAssistant/task-center-data.json
 Plugin/AmazonAds/state/
+Plugin/AmazonAds/mcp-config/
 Plugin/AmazonSPAPI/state/
 Plugin/AmazonSPAPI/**/state/
 Plugin/MCPO/amazon_ads_credentials.env
@@ -231,6 +232,7 @@ ToolConfigs/dynamic_tool_catalog.json
 ToolConfigs/dynamic_tool_categories.json
 Plugin/VCPBridgeServer/bridge-config.json
 TVStxt/bak/
+TVStxt/*.code-workspace
 *.bak
 *.bak.*
 
