@@ -495,7 +495,7 @@ class ChromeBridgeClient {
 
       function findContainer(selector) {
         let container = null;
-        if (selector) {
+        if (selector && selector !== 'body') {
           container = document.querySelector(selector);
           if (container) return container;
         }
@@ -595,6 +595,8 @@ class ChromeBridgeClient {
         } else if (container.tagName === 'TABLE') {
           return Array.from(container.querySelectorAll('tbody tr, tr')).filter(isVisible);
         }
+        const descendantRows = Array.from(container.querySelectorAll('table tbody tr, table tr')).filter(isVisible);
+        if (descendantRows.length > 0) return descendantRows;
         return Array.from(container.children || []).filter(isVisible);
       }
 

@@ -44,6 +44,14 @@
   "capabilities": {
     "invocationCommands": [
       {
+        "command": "auto_selection_trigger_run",
+        "description": "Trigger or resume the automated product-selection workflow. If workflow is already running, returns error. If queue has active runs (after restart), resumes them; otherwise starts a new workflow from brief creation. The workflow runs in closed-loop mode: starts -> processes one complete cycle -> auto-terminates. Returns mode (resume|new) and active_runs count."
+      },
+      {
+        "command": "auto_selection_debug_status",
+        "description": "One-click comprehensive workflow diagnostics. Returns a Markdown report with: 1) Memory state (isWorkflowRunning, workflowState, consecutiveErrorCount, lastWorkflowError), 2) Physical lock files in runs/locks/, 3) Queue status (active_runs, next_action_hint, stage file counts), 4) Circuit breaker counters from active tasks, 5) Diagnostic recommendations. No parameters required. Use this to understand what the workflow is doing, where it's stuck, or why it stopped."
+      },
+      {
         "command": "auto_selection_queue_status",
         "description": "Inspect the automated product-selection handoff queue. Returns files in failed/scored/raw/brief/locks/archived, derived active_briefs/stale_briefs/valid_locks/malformed_locks/worker_missing_outputs, worker_timeout_minutes, and next_action_hint. If next_action_hint=retry_worker_once, redispatch the reported worker once with overwrite_lock=true and retry_count+1. If next_action_hint=handle_worker_missing_output, call auto_selection_mark_worker_missing_output. Optional include_content=true includes content for failed/scored/raw files. Optional worker_timeout_minutes defaults to 60."
       },
@@ -53,7 +61,7 @@
       },
       {
         "command": "auto_selection_read_run_file",
-        "description": "Read a scoped automated product-selection handoff file under runs/. Parameters: stage, run_id/runId, optional lock_name for locks. Do not use this for AutoSelectionStrategyProfile.md; read that plugin-root strategy file with ServerFileOperator.ReadFile."
+        "description": "Read a scoped automated product-selection handoff file under runs/. Parameters: stage, run_id/runId, optional lock_name for locks. Do not use this for AutoSelectionStrategyProfile.zh-CN.md or AutoSelectionStrategyProfile.md; these strategy files are automatically read and injected by the backend during brief creation."
       },
       {
         "command": "auto_selection_prepare_dispatch",
@@ -65,7 +73,7 @@
       },
       {
         "command": "auto_selection_apply_reviewer_decision",
-        "description": "Apply the scored post_forge_action safely. Parameters: run_id/runId, optional action, optional scored_content/scoredContent, optional brief_content/briefContent, optional new_run_id/newRunId for DROP_AND_RESELECT. LOOPBACK_TO_SCOUT or LOOPBACK_TO_HAWKEYE preserves raw, deletes scored, clears old locks, writes a loopback brief, creates the scout lock, and returns agent_assistant_request. DROP_AND_RESELECT deletes old brief/raw/scored/failed, clears locks, then writes brief_content to new_run_id or an auto-generated replacement run and prepares scout dispatch. PUBLISH_FINAL returns ready_for_final_publication; publish forum/DailyNote first, then call auto_selection_archive_run."
+        "description": "Apply the scored post_forge_action safely. Parameters: run_id/runId, optional action, optional scored_content/scoredContent, optional brief_content/briefContent, optional new_run_id/newRunId for DROP_AND_RESELECT. LOOPBACK_TO_SCOUT or LOOPBACK_TO_HAWKEYE preserves raw, deletes scored, clears old locks, writes a loopback brief, creates the scout lock, and returns agent_assistant_request when the request is specific and not repeated. Repeated, unfetchable, vague, or soft-limit loopbacks are converted to a force-decision reviewer dispatch. DROP_AND_RESELECT deletes old brief/raw/scored/failed, clears locks, then writes brief_content to new_run_id or an auto-generated replacement run and prepares scout dispatch. PUBLISH_FINAL returns ready_for_final_publication; publish forum/DailyNote first, then call auto_selection_archive_run."
       },
       {
         "command": "auto_selection_archive_run",

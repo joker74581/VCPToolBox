@@ -998,6 +998,27 @@ function hasProductCandidateMetrics(candidates) {
   return (candidates || []).some(item => metricKeys.some(key => item?.[key]));
 }
 
+function isTableStructureMismatch(tableRows, candidates, hasMetricsFn) {
+  if (!Array.isArray(tableRows) || tableRows.length === 0) {
+    return false;
+  }
+  if (candidates.length > 0) {
+    if (typeof hasMetricsFn === 'function' && !hasMetricsFn(candidates)) {
+      const hasRealContent = tableRows.some(row => {
+        const text = (row.text || '').trim();
+        return text.length > 0 && !/加载中|loading|please wait|数据加载|spinning/i.test(text);
+      });
+      return hasRealContent;
+    }
+    return false;
+  }
+  const hasRealContent = tableRows.some(row => {
+    const text = (row.text || '').trim();
+    return text.length > 0 && !/加载中|loading|please wait|数据加载|spinning/i.test(text);
+  });
+  return hasRealContent;
+}
+
 async function initialize(config = {}, dependencies = {}) {
   pluginConfig = config || {};
   debugMode = pluginConfig.DebugMode === true;
@@ -1408,34 +1429,57 @@ async function runSellerSpriteResearch(args = {}) {
   }
 
   let tableResult = null;
+  let productCandidates = [];
   if (!emptyResultParsed && parseBoolean(args.extract_table ?? args.extractTable, true) && typeof chromeBridgeClient.extractTable === 'function') {
-    try {
-      tableResult = await chromeBridgeClient.extractTable({
-        selector: String(args.table_selector || args.tableSelector || 'body'),
-        tableMode: String(args.table_mode || args.tableMode || 'sellersprite_product'),
-        maxRows: maxCandidates,
-        columns: args.table_columns || args.tableColumns || PRODUCT_TABLE_COLUMNS,
-        includeHtml: parseBoolean(args.include_table_html ?? args.includeTableHtml, false),
-        includeDetails: parseBoolean(args.include_table_details ?? args.includeTableDetails, true),
-        includeLinks: parseBoolean(args.include_table_links ?? args.includeTableLinks, false),
-        maxCellChars: Number(args.max_cell_chars || args.maxCellChars) || 220,
-        maxDetailChars: Number(args.max_detail_chars || args.maxDetailChars) || 260,
-        maxAsins: Number(args.max_asins || args.maxAsins) || 10,
-        timeout: Number(args.table_extract_timeout) || 30000
-      });
-    } catch (error) {
-      warnings.push(`结构化表格抽取失败，已回退 Markdown 页面解析: ${error.message}`);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        tableResult = await chromeBridgeClient.extractTable({
+          selector: String(args.table_selector || args.tableSelector || 'body'),
+          tableMode: String(args.table_mode || args.tableMode || 'sellersprite_product'),
+          maxRows: maxCandidates,
+          columns: args.table_columns || args.tableColumns || PRODUCT_TABLE_COLUMNS,
+          includeHtml: parseBoolean(args.include_table_html ?? args.includeTableHtml, false),
+          includeDetails: parseBoolean(args.include_table_details ?? args.includeTableDetails, true),
+          includeLinks: parseBoolean(args.include_table_links ?? args.includeTableLinks, false),
+          maxCellChars: Number(args.max_cell_chars || args.maxCellChars) || 220,
+          maxDetailChars: Number(args.max_detail_chars || args.maxDetailChars) || 260,
+          maxAsins: Number(args.max_asins || args.maxAsins) || 10,
+          timeout: Number(args.table_extract_timeout) || 30000
+        });
+
+        const tableData = tableResult?.table_data;
+        productCandidates = normalizeProductTableData(tableData, maxCandidates);
+        if (productCandidates.length > 0 && hasProductCandidateMetrics(productCandidates)) {
+          break;
+        }
+        if (isTableStructureMismatch(tableData?.rows, productCandidates, hasProductCandidateMetrics)) {
+          warnings.push('DOM 表格已呈现，但无法解析出有效产品数据或指标字段。结构不匹配，跳过重试并直接 fallback。');
+          break;
+        }
+      } catch (error) {
+        warnings.push(`结构化表格抽取尝试 ${attempt} 失败: ${error.message}`);
+      }
+
+      // Check if the page shows "no results" to stop retrying early
+      const tempPageInfo = await chromeBridgeClient.getPageInfo(10000).catch(() => ({}));
+      if (isSellerSpriteNoResultsText(tempPageInfo.page_info || '')) {
+        emptyResultParsed = buildSellerSpriteNoResultsParsed(tempPageInfo.page_info);
+        break;
+      }
+
+      if (attempt < 3) {
+        warnings.push(`抽取数据为空，可能页面正在呈现，等待 1.5 秒后重试 (尝试 ${attempt}/3)...`);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
     }
   }
 
-  const tableData = tableResult?.table_data;
-  const productCandidates = normalizeProductTableData(tableData, maxCandidates);
   let parsed = emptyResultParsed || {
-    result_count: tableData?.result_count || null,
+    result_count: tableResult?.table_data?.result_count || null,
     pagination: null,
     candidates: productCandidates,
     raw_page_info_excerpt: '',
-    table_data: tableData
+    table_data: tableResult?.table_data
   };
   let usedMarkdownFallback = false;
 
@@ -1451,10 +1495,10 @@ async function runSellerSpriteResearch(args = {}) {
     const keepDomCandidates = parsed.candidates.length > 0 && productMetricsAvailable;
     parsed = {
       ...markdownParsed,
-      result_count: markdownParsed.result_count ?? tableData?.result_count ?? parsed.result_count,
+      result_count: markdownParsed.result_count ?? tableResult?.table_data?.result_count ?? parsed.result_count,
       candidates: keepDomCandidates ? parsed.candidates : markdownParsed.candidates,
       raw_page_info_excerpt: resultMode === 'compact' ? '' : markdownParsed.raw_page_info_excerpt,
-      table_data: tableData
+      table_data: tableResult?.table_data
     };
     if (parsed.candidates.length === 0) {
       const tableCandidates = extractAsinCandidatesFromOrderedTable(parsed.table_data, maxCandidates);
@@ -1686,34 +1730,57 @@ async function runSellerSpriteCompetitorLookup(args = {}) {
   }
 
   let tableResult = null;
+  let productCandidates = [];
   if (!emptyResultParsed && parseBoolean(args.extract_table ?? args.extractTable, true) && typeof chromeBridgeClient.extractTable === 'function') {
-    try {
-      tableResult = await chromeBridgeClient.extractTable({
-        selector: String(args.table_selector || args.tableSelector || 'body'),
-        tableMode: String(args.table_mode || args.tableMode || 'sellersprite_product'),
-        maxRows: maxCandidates,
-        columns: args.table_columns || args.tableColumns || PRODUCT_TABLE_COLUMNS,
-        includeHtml: parseBoolean(args.include_table_html ?? args.includeTableHtml, false),
-        includeDetails: parseBoolean(args.include_table_details ?? args.includeTableDetails, true),
-        includeLinks: parseBoolean(args.include_table_links ?? args.includeTableLinks, false),
-        maxCellChars: Number(args.max_cell_chars || args.maxCellChars) || 220,
-        maxDetailChars: Number(args.max_detail_chars || args.maxDetailChars) || 260,
-        maxAsins: Number(args.max_asins || args.maxAsins) || 10,
-        timeout: Number(args.table_extract_timeout) || 30000
-      });
-    } catch (error) {
-      warnings.push(`查竞品结构化表格抽取失败，已回退 Markdown 页面解析: ${error.message}`);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        tableResult = await chromeBridgeClient.extractTable({
+          selector: String(args.table_selector || args.tableSelector || 'body'),
+          tableMode: String(args.table_mode || args.tableMode || 'sellersprite_product'),
+          maxRows: maxCandidates,
+          columns: args.table_columns || args.tableColumns || PRODUCT_TABLE_COLUMNS,
+          includeHtml: parseBoolean(args.include_table_html ?? args.includeTableHtml, false),
+          includeDetails: parseBoolean(args.include_table_details ?? args.includeTableDetails, true),
+          includeLinks: parseBoolean(args.include_table_links ?? args.includeTableLinks, false),
+          maxCellChars: Number(args.max_cell_chars || args.maxCellChars) || 220,
+          maxDetailChars: Number(args.max_detail_chars || args.maxDetailChars) || 260,
+          maxAsins: Number(args.max_asins || args.maxAsins) || 10,
+          timeout: Number(args.table_extract_timeout) || 30000
+        });
+
+        const tableData = tableResult?.table_data;
+        productCandidates = normalizeProductTableData(tableData, maxCandidates);
+        if (productCandidates.length > 0 && hasProductCandidateMetrics(productCandidates)) {
+          break;
+        }
+        if (isTableStructureMismatch(tableData?.rows, productCandidates, hasProductCandidateMetrics)) {
+          warnings.push('DOM 表格已呈现，但无法解析出有效产品数据或指标字段。结构不匹配，跳过重试并直接 fallback。');
+          break;
+        }
+      } catch (error) {
+        warnings.push(`结构化表格抽取尝试 ${attempt} 失败: ${error.message}`);
+      }
+
+      // Check if the page shows "no results" to stop retrying early
+      const tempPageInfo = await chromeBridgeClient.getPageInfo(10000).catch(() => ({}));
+      if (isSellerSpriteNoResultsText(tempPageInfo.page_info || '')) {
+        emptyResultParsed = buildSellerSpriteNoResultsParsed(tempPageInfo.page_info);
+        break;
+      }
+
+      if (attempt < 3) {
+        warnings.push(`抽取数据为空，可能页面正在呈现，等待 1.5 秒后重试 (尝试 ${attempt}/3)...`);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
     }
   }
 
-  const tableData = tableResult?.table_data;
-  const productCandidates = normalizeProductTableData(tableData, maxCandidates);
   let parsed = emptyResultParsed || {
-    result_count: tableData?.result_count || null,
+    result_count: tableResult?.table_data?.result_count || null,
     pagination: null,
     candidates: productCandidates,
     raw_page_info_excerpt: '',
-    table_data: tableData
+    table_data: tableResult?.table_data
   };
   let usedMarkdownFallback = false;
   const productMetricsAvailable = hasProductCandidateMetrics(parsed.candidates);
@@ -1729,10 +1796,10 @@ async function runSellerSpriteCompetitorLookup(args = {}) {
     const keepDomCandidates = parsed.candidates.length > 0 && productMetricsAvailable;
     parsed = {
       ...markdownParsed,
-      result_count: markdownParsed.result_count ?? tableData?.result_count ?? parsed.result_count,
+      result_count: markdownParsed.result_count ?? tableResult?.table_data?.result_count ?? parsed.result_count,
       candidates: keepDomCandidates ? parsed.candidates : markdownParsed.candidates,
       raw_page_info_excerpt: resultMode === 'compact' ? '' : markdownParsed.raw_page_info_excerpt,
-      table_data: tableData
+      table_data: tableResult?.table_data
     };
     if (parsed.candidates.length === 0) {
       const tableCandidates = extractAsinCandidatesFromOrderedTable(parsed.table_data, maxCandidates);
@@ -1978,41 +2045,73 @@ async function runSellerSpriteKeywordResearch(args = {}) {
 
   let tableResult = null;
   let parsed = null;
+  let candidates = [];
   if (!emptyResultParsed && parseBoolean(args.extract_table ?? args.extractTable, true) && typeof chromeBridgeClient.extractTable === 'function') {
-    try {
-      tableResult = await chromeBridgeClient.extractTable({
-        selector: String(args.table_selector || args.tableSelector || '#table-condition-search'),
-        tableMode: String(args.table_mode || args.tableMode || ''),
-        maxRows: maxCandidates,
-        includeHtml: parseBoolean(args.include_table_html ?? args.includeTableHtml, false),
-        includeDetails: parseBoolean(args.include_table_details ?? args.includeTableDetails, true),
-        includeLinks: parseBoolean(args.include_table_links ?? args.includeTableLinks, false),
-        maxCellChars: Number(args.max_cell_chars || args.maxCellChars) || 220,
-        maxDetailChars: Number(args.max_detail_chars || args.maxDetailChars) || 260,
-        maxAsins: Number(args.max_asins || args.maxAsins) || 10,
-        timeout: Number(args.table_extract_timeout) || 30000
-      });
-    } catch (error) {
-      warnings.push(`结构化表格抽取失败，已回退 Markdown 页面解析: ${error.message}`);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        tableResult = await chromeBridgeClient.extractTable({
+          selector: String(args.table_selector || args.tableSelector || '#table-condition-search'),
+          tableMode: String(args.table_mode || args.tableMode || ''),
+          maxRows: maxCandidates,
+          includeHtml: parseBoolean(args.include_table_html ?? args.includeTableHtml, false),
+          includeDetails: parseBoolean(args.include_table_details ?? args.includeTableDetails, true),
+          includeLinks: parseBoolean(args.include_table_links ?? args.includeTableLinks, false),
+          maxCellChars: Number(args.max_cell_chars || args.maxCellChars) || 220,
+          maxDetailChars: Number(args.max_detail_chars || args.maxDetailChars) || 260,
+          maxAsins: Number(args.max_asins || args.maxAsins) || 10,
+          timeout: Number(args.table_extract_timeout) || 30000
+        });
+
+        const tableRows = tableResult?.table_data?.rows;
+        if (Array.isArray(tableRows) && tableRows.length > 0) {
+          candidates = normalizeKeywordTableData(tableResult.table_data, { maxCandidates });
+          if (candidates.length > 0) {
+            parsed = {
+              result_count: tableResult.table_data.result_count || null,
+              pagination: null,
+              candidates,
+              raw_page_info_excerpt: '',
+              extraction_source: 'dom_table',
+              table_data: tableResult.table_data
+            };
+            break;
+          }
+          if (isTableStructureMismatch(tableRows, candidates)) {
+            warnings.push('DOM 表格已呈现，但无法解析出有效关键词数据。结构不匹配，跳过重试并直接 fallback。');
+            break;
+          }
+        }
+      } catch (error) {
+        warnings.push(`结构化表格抽取尝试 ${attempt} 失败: ${error.message}`);
+      }
+
+      // Check if the page shows "no results" to stop retrying early
+      const tempPageInfo = await chromeBridgeClient.getPageInfo(10000).catch(() => ({}));
+      if (isSellerSpriteNoResultsText(tempPageInfo.page_info || '')) {
+        emptyResultParsed = buildSellerSpriteNoResultsParsed(tempPageInfo.page_info);
+        parsed = {
+          ...emptyResultParsed,
+          extraction_source: 'empty_result'
+        };
+        break;
+      }
+
+      if (attempt < 3) {
+        warnings.push(`抽取数据为空，可能页面正在呈现，等待 1.5 秒后重试 (尝试 ${attempt}/3)...`);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
     }
   }
-  const tableRows = tableResult?.table_data?.rows;
+
   if (emptyResultParsed) {
     parsed = {
       ...emptyResultParsed,
       extraction_source: 'empty_result'
     };
-  } else if (Array.isArray(tableRows) && tableRows.length > 0) {
-    const candidates = normalizeKeywordTableData(tableResult.table_data, { maxCandidates });
-    parsed = {
-      result_count: null,
-      pagination: null,
-      candidates,
-      raw_page_info_excerpt: '',
-      extraction_source: 'dom_table',
-      table_data: tableResult.table_data
-    };
+  } else if (parsed) {
+    // Successfully extracted from table
   } else {
+    warnings.push('无法通过 DOM 表格抽取数据，已尝试通过页面文本解析。');
     const pageInfoResult = await chromeBridgeClient.getPageInfo(Number(args.page_info_timeout) || 30000);
     const pageInfo = pageInfoResult.page_info || waitResult.page_info || openResult.page_info || '';
     parsed = parseKeywordPageInfo(pageInfo, { maxCandidates });
@@ -2283,41 +2382,71 @@ async function runSellerSpriteKeywordReverse(args = {}) {
 
   let tableResult = null;
   let parsed = null;
+  let candidates = [];
   if (!emptyResultParsed && parseBoolean(args.extract_table ?? args.extractTable, true) && typeof chromeBridgeClient.extractTable === 'function') {
-    try {
-      tableResult = await chromeBridgeClient.extractTable({
-        selector: String(args.table_selector || args.tableSelector || 'body'),
-        tableMode: String(args.table_mode || args.tableMode || ''),
-        maxRows: maxCandidates,
-        includeHtml: parseBoolean(args.include_table_html ?? args.includeTableHtml, false),
-        includeDetails: parseBoolean(args.include_table_details ?? args.includeTableDetails, true),
-        includeLinks: parseBoolean(args.include_table_links ?? args.includeTableLinks, false),
-        maxCellChars: Number(args.max_cell_chars || args.maxCellChars) || 220,
-        maxDetailChars: Number(args.max_detail_chars || args.maxDetailChars) || 260,
-        maxAsins: Number(args.max_asins || args.maxAsins) || 10,
-        timeout: Number(args.table_extract_timeout) || 30000
-      });
-    } catch (error) {
-      warnings.push(`结构化表格抽取失败: ${error.message}`);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        tableResult = await chromeBridgeClient.extractTable({
+          selector: String(args.table_selector || args.tableSelector || 'body'),
+          tableMode: String(args.table_mode || args.tableMode || ''),
+          maxRows: maxCandidates,
+          includeHtml: parseBoolean(args.include_table_html ?? args.includeTableHtml, false),
+          includeDetails: parseBoolean(args.include_table_details ?? args.includeTableDetails, true),
+          includeLinks: parseBoolean(args.include_table_links ?? args.includeTableLinks, false),
+          maxCellChars: Number(args.max_cell_chars || args.maxCellChars) || 220,
+          maxDetailChars: Number(args.max_detail_chars || args.maxDetailChars) || 260,
+          maxAsins: Number(args.max_asins || args.maxAsins) || 10,
+          timeout: Number(args.table_extract_timeout) || 30000
+        });
+
+        const tableRows = tableResult?.table_data?.rows;
+        if (Array.isArray(tableRows) && tableRows.length > 0) {
+          candidates = normalizeKeywordReverseTableData(tableResult.table_data, { maxCandidates });
+          if (candidates.length > 0) {
+            parsed = {
+              result_count: tableResult.table_data.row_count || candidates.length,
+              pagination: null,
+              candidates,
+              raw_page_info_excerpt: '',
+              extraction_source: 'dom_table',
+              table_data: tableResult.table_data
+            };
+            break;
+          }
+          if (isTableStructureMismatch(tableRows, candidates)) {
+            warnings.push('DOM 表格已呈现，但无法解析出有效反查关键词数据。结构不匹配，跳过重试并直接 fallback。');
+            break;
+          }
+        }
+      } catch (error) {
+        warnings.push(`结构化表格抽取尝试 ${attempt} 失败: ${error.message}`);
+      }
+
+      // Check if the page shows "no results" to stop retrying early
+      const tempPageInfo = await chromeBridgeClient.getPageInfo(10000).catch(() => ({}));
+      if (isSellerSpriteNoResultsText(tempPageInfo.page_info || '')) {
+        emptyResultParsed = buildSellerSpriteNoResultsParsed(tempPageInfo.page_info);
+        parsed = {
+          ...emptyResultParsed,
+          extraction_source: 'empty_result'
+        };
+        break;
+      }
+
+      if (attempt < 3) {
+        warnings.push(`抽取数据为空，可能页面正在呈现，等待 1.5 秒后重试 (尝试 ${attempt}/3)...`);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
     }
   }
 
-  const tableRows = tableResult?.table_data?.rows;
   if (emptyResultParsed) {
     parsed = {
       ...emptyResultParsed,
       extraction_source: 'empty_result'
     };
-  } else if (Array.isArray(tableRows) && tableRows.length > 0) {
-    const candidates = normalizeKeywordReverseTableData(tableResult.table_data, { maxCandidates });
-    parsed = {
-      result_count: tableResult.table_data.row_count || candidates.length,
-      pagination: null,
-      candidates,
-      raw_page_info_excerpt: '',
-      extraction_source: 'dom_table',
-      table_data: tableResult.table_data
-    };
+  } else if (parsed) {
+    // Successfully extracted from table
   } else {
     warnings.push('无法通过 DOM 表格抽取数据，已尝试通过页面文本解析。');
     const pageInfoResult = await chromeBridgeClient.getPageInfo(Number(args.page_info_timeout) || 30000);
@@ -2329,22 +2458,22 @@ async function runSellerSpriteKeywordReverse(args = {}) {
         extraction_source: 'empty_result'
       };
     } else {
-      const candidates = [];
+      const fallbackCandidates = [];
       const linkRegex = /\[(链接|link):\s*([^\]]+?)\]\(vcp-id-\d+\)/gi;
       const seen = new Set();
       let match;
-      while ((match = linkRegex.exec(pageInfo)) !== null && !hasReachedOptionalLimit(candidates, maxCandidates)) {
+      while ((match = linkRegex.exec(pageInfo)) !== null && !hasReachedOptionalLimit(fallbackCandidates, maxCandidates)) {
         const keyword = cleanLine(match[2]);
         if (keyword && !seen.has(keyword.toLowerCase())) {
           seen.add(keyword.toLowerCase());
-          candidates.push({ keyword, translation: null });
+          fallbackCandidates.push({ keyword, translation: null });
         }
       }
 
       parsed = {
-        result_count: candidates.length,
+        result_count: fallbackCandidates.length,
         pagination: null,
-        candidates,
+        candidates: fallbackCandidates,
         raw_page_info_excerpt: pageInfo.slice(0, 1000),
         extraction_source: 'markdown'
       };
@@ -2602,45 +2731,71 @@ async function runSellerSpriteKeywordConversionRate(args = {}) {
 
   let tableResult = null;
   let parsed = null;
+  let candidates = [];
   if (!emptyResultParsed && parseBoolean(args.extract_table ?? args.extractTable, true) && typeof chromeBridgeClient.extractTable === 'function') {
-    try {
-      tableResult = await chromeBridgeClient.extractTable({
-        selector: String(args.table_selector || args.tableSelector || 'body'),
-        tableMode: String(args.table_mode || args.tableMode || ''),
-        maxRows: maxCandidates ? maxCandidates * 2 : undefined,
-        includeHtml: parseBoolean(args.include_table_html ?? args.includeTableHtml, false),
-        includeDetails: parseBoolean(args.include_table_details ?? args.includeTableDetails, true),
-        includeLinks: parseBoolean(args.include_table_links ?? args.includeTableLinks, false),
-        maxCellChars: Number(args.max_cell_chars || args.maxCellChars) || 1200,
-        maxDetailChars: Number(args.max_detail_chars || args.maxDetailChars) || 1200,
-        maxAsins: Number(args.max_asins || args.maxAsins) || 3,
-        timeout: Number(args.table_extract_timeout) || 30000
-      });
-    } catch (error) {
-      warnings.push(`结构化表格抽取失败: ${error.message}`);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        tableResult = await chromeBridgeClient.extractTable({
+          selector: String(args.table_selector || args.tableSelector || 'body'),
+          tableMode: String(args.table_mode || args.tableMode || ''),
+          maxRows: maxCandidates ? maxCandidates * 2 : undefined,
+          includeHtml: parseBoolean(args.include_table_html ?? args.includeTableHtml, false),
+          includeDetails: parseBoolean(args.include_table_details ?? args.includeTableDetails, true),
+          includeLinks: parseBoolean(args.include_table_links ?? args.includeTableLinks, false),
+          maxCellChars: Number(args.max_cell_chars || args.maxCellChars) || 1200,
+          maxDetailChars: Number(args.max_detail_chars || args.maxDetailChars) || 1200,
+          maxAsins: Number(args.max_asins || args.maxAsins) || 3,
+          timeout: Number(args.table_extract_timeout) || 30000
+        });
+
+        const tableRows = tableResult?.table_data?.rows;
+        if (Array.isArray(tableRows) && tableRows.length > 0) {
+          const rawCandidates = normalizeKeywordConversionRateTableData(tableResult.table_data, { maxCandidates: maxCandidates ? maxCandidates * 2 : undefined });
+          candidates = normalizeKeywordConversionRateCandidates(rawCandidates, { showTag, includeTranslation });
+          if (candidates.length > 0) {
+            parsed = {
+              result_count: candidates.length,
+              pagination: null,
+              candidates,
+              raw_page_info_excerpt: '',
+              extraction_source: 'dom_table',
+              table_data: tableResult.table_data
+            };
+            break;
+          }
+          if (isTableStructureMismatch(tableRows, candidates)) {
+            warnings.push('DOM 表格已呈现，但无法解析出有效关键词转化率数据。结构不匹配，跳过重试并直接 fallback。');
+            break;
+          }
+        }
+      } catch (error) {
+        warnings.push(`结构化表格抽取尝试 ${attempt} 失败: ${error.message}`);
+      }
+
+      // Check if the page shows "no results" to stop retrying early
+      const tempPageInfo = await chromeBridgeClient.getPageInfo(10000).catch(() => ({}));
+      if (isSellerSpriteNoResultsText(tempPageInfo.page_info || '')) {
+        emptyResultParsed = buildSellerSpriteNoResultsParsed(tempPageInfo.page_info);
+        parsed = {
+          ...emptyResultParsed,
+          extraction_source: 'empty_result'
+        };
+        break;
+      }
+
+      if (attempt < 3) {
+        warnings.push(`抽取数据为空，可能页面正在呈现，等待 1.5 秒后重试 (尝试 ${attempt}/3)...`);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
     }
   }
 
-  const tableRows = tableResult?.table_data?.rows;
   if (emptyResultParsed) {
     parsed = {
       ...emptyResultParsed,
       extraction_source: 'empty_result'
     };
-  } else if (Array.isArray(tableRows) && tableRows.length > 0) {
-    const candidates = normalizeKeywordConversionRateCandidates(
-      normalizeKeywordConversionRateTableData(tableResult.table_data, { maxCandidates: maxCandidates ? maxCandidates * 2 : undefined }),
-      { showTag, includeTranslation }
-    ).slice(0, maxCandidates);
-    parsed = {
-      result_count: candidates.length,
-      pagination: null,
-      candidates,
-      raw_page_info_excerpt: '',
-      extraction_source: 'dom_table',
-      table_data: tableResult.table_data
-    };
-  } else {
+  } else if (!parsed) {
     warnings.push('无法通过 DOM 表格抽取关键词转化率数据，已检查页面文本是否为空结果。');
     const pageInfoResult = await chromeBridgeClient.getPageInfo(Number(args.page_info_timeout) || 30000);
     const pageInfo = pageInfoResult.page_info || waitResult.page_info || openResult.page_info || '';

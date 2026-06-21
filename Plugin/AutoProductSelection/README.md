@@ -1,190 +1,199 @@
-# AutoProductSelection
+# AutoProductSelection 自动选品插件
 
-`AutoProductSelection` is a workflow-orchestration plugin for automated product research. It does not scrape marketplaces by itself. Instead, it manages a file-based state machine, worker locks, AgentAssistant delegation prompts, and result handoff files.
+AutoProductSelection 是自动选品工作流编排插件。它不直接抓取市场数据，而是管理 `runs/` 文件状态机、worker 锁、AgentAssistant 派发、回环守卫、评分安全阀和最终归档。
 
-The plugin is designed to be reusable by the community. The public version uses generic roles:
+数据抓取由 `ProductSelector` 完成；任务触发可由人工或 `VCPTaskAssistant` 调用 `auto_selection_trigger_run` 完成。
 
-- `Coordinator`: owns strategy, creates briefs, dispatches workers, and archives outcomes.
-- `ProductSelectionScout`: reads briefs and gathers evidence through `ProductSelector`.
-- `ProductSelectionReviewer`: reviews evidence and writes scored decisions.
+## 工作流
 
-You can rename the actual AgentAssistant agents through config.
-
-## Responsibilities
-
-AutoProductSelection manages:
-
-- `runs/brief`
-- `runs/raw`
-- `runs/scored`
-- `runs/failed`
-- `runs/archived`
-- `runs/locks`
-- worker locks and missing-output diagnostics
-- dispatch payloads for AgentAssistant
-- cleanup and archive flows
-
-`ProductSelector` or another external data plugin should provide marketplace/product data.
-
-## Directory Layout
+```mermaid
+graph TD
+    Trigger[定时任务 VCPTaskAssistant / 手动触发] -->|1. auto_selection_trigger_run| Driver[后端 WorkflowDriver]
+    Driver -->|2. delegate_to_coordinator| Hub[破壁_枢纽 Agent]
+    Hub -->|3. Get Injected Strategy & Memory| Brief[生成 SelectionBrief]
+    Brief -->|4. auto_selection_prepare_dispatch| Driver
+    Driver -->|5. call_agent_assistant| Scout[破壁_鹰眼 Agent]
+    Scout -->|6. ProductSelector| Raw[写入 raw.md]
+    Raw -->|7. Fast Path / Coordinator| Reviewer[破壁_熔炉 Agent]
+    Reviewer -->|8. Auditing & Hard Gates| Scored[写入 scored.md]
+    Scored -->|9. Math Safety Valve| Driver
+    Driver -->|10. Loopback / Decision| Hub
+```
 
 ```text
-Plugin/AutoProductSelection/
-  AutoProductSelection.js
-  plugin-manifest.json
-  README.md
-  SELECTION_LOGIC.md
-  AutoSelectionStrategyProfile.md
-  AutoSelectionStrategyProfile.md.example
-  runs/
-    README.md
-    brief/
-    raw/
-    scored/
-    failed/
-    archived/
-    locks/
+触发启动
+  -> 破壁_枢纽读取策略文件并创建 brief
+  -> 破壁_鹰眼读取 brief，调用 ProductSelector，写 raw
+  -> 破壁_熔炉读取 raw，审计评分，写 scored
+  -> 破壁_枢纽应用决策、发布、写日记、归档
+  -> 工作流自动休眠
 ```
 
-The `runs/` directory is runtime data. For public repositories, commit only `.gitkeep` placeholders or a short README, not real research outputs.
+## 角色
 
-## Agent Configuration
+- 破壁_枢纽：创建 brief、应用评审决策、发布最终报告、写入选品公共日记本。
+- 破壁_鹰眼：输出 Min Evidence Pack，记录工具调用、样本量、空数据缺口和证据来源。
+- 破壁_熔炉：执行 Hard Gates、四分制评分、广告压力测试、回环请求或终态裁决。
 
-Default worker agent names:
+## 评分逻辑
 
-```env
-AUTO_SELECTION_SCOUT_AGENT_NAME=ProductSelectionScout
-AUTO_SELECTION_REVIEWER_AGENT_NAME=ProductSelectionReviewer
+这套系统不是简单问“这个产品热不热”，而是分四步判断：
+
+1. **先看能不能碰**
+   如果产品涉及侵权、医疗/补剂、服装鞋帽、超大件、高认证、高售后、高退货、禁售风险，或者利润已经算出来是负的，系统会直接淘汰。这个叫 Hard Gates，一票否决。
+
+2. **再看有没有机会**
+   熔炉会看需求、增长、差异化、进入门槛，得到 `OpportunityScore`。它回答的是：“这个市场本身有没有机会？”
+
+3. **再看数据靠不靠谱**
+   ProductSelector 有时抓不到冷门长尾词数据，所以系统不会把空数据当成失败。熔炉会单独给 `DataReliabilityScore`，判断数据来源、样本量、字段完整度和多来源是否互相印证。它回答的是：“我们有多确定？”
+
+4. **最后看小卖家能不能做**
+   `ExecutionFitScore` 评估资金压力、供应链复杂度、Listing 难度、售后风险、迭代速度。它回答的是：“这个机会是不是适合小卖家？”
+
+最终的 `FinalScore` 不是孤立总分，而是：
+
+```text
+产品机会分
+× 数据置信度折扣
+× 小卖家执行适配折扣
 ```
 
-Optional task-file prefixes used to diagnose workers that completed without writing a handoff file:
+所以会出现几种合理结果：
 
-```env
-AUTO_SELECTION_SCOUT_TASK_PREFIXES=APS_SCOUT_,ProductSelectionScout_
-AUTO_SELECTION_REVIEWER_TASK_PREFIXES=APS_REVIEWER_,ProductSelectionReviewer_
+- 市场不错，但数据不够：`RESEARCH_GAP` 或 `WATCHLIST`，不能直接推荐。
+- 数据很可靠，但市场不好：`REJECT`。
+- 市场不错，但小卖家打不动：`WATCHLIST` 或 `REJECT`。
+- 机会、数据、执行都过关，且广告压力测试不倒挂：才可能 `RECOMMEND`。
+
+## 利润和广告压力怎么判断
+
+系统会保守计算单件贡献利润：
+
+```text
+售价 - 平台佣金 - 采购成本 - 头程 - FBA - 包装 - 退货预留 - 优惠券 - 仓储预留
 ```
 
-If you use custom AgentAssistant names, put these values in root `config.env` or a plugin-level config file according to your VCP deployment rules.
+SellerSprite 的关键词转化率只是行业平均，不会被直接当成新品真实转化率。系统会自动打折：
 
-See `config.env.example` for a copyable generic template.
+- 默认新品/小卖家：只按原始 CVR 的 50% 做基础测试，35% 做压力测试。
+- 只有证据充分、成熟低风险时，才使用稍宽松口径。
 
-## Core Workflow
+PPC 也会保守处理：不会用 low bid 做推荐依据；有 low/mid/high 时基础用 mid、压力用 high；只有单个竞价时自动放大到 1.15x / 1.35x。
 
-1. Coordinator reads queue state with `auto_selection_queue_status`.
-2. If no active run exists, Coordinator reads `AutoSelectionStrategyProfile.md` and creates a SelectionBrief.
-3. Coordinator calls `auto_selection_prepare_dispatch(worker=scout)` to create a brief/lock and receive an AgentAssistant request for the scout agent.
-4. Scout reads the brief, gathers evidence through `ProductSelector`, and writes `raw` or `failed`.
-5. Coordinator reviews the queue. If raw is ready, it calls `auto_selection_prepare_dispatch(worker=reviewer)` for the reviewer agent.
-6. Reviewer reads raw evidence and writes `scored` or `failed`.
-7. Coordinator decides whether to publish, loop back for more evidence, archive, or mark failed.
+如果广告获客成本吃掉了单件贡献利润，系统会阻止 `RECOMMEND`，即使市场需求看起来很漂亮。
 
-Backward-compatible worker aliases `hawkeye` and `forge` are still accepted. Public integrations should prefer `scout` and `reviewer`.
+## 策略文件
 
-## Commands
+后端工作流驱动程序在派发创建 Brief 任务时，会自动读取策略文件：
 
-All commands use `tool_name: AutoProductSelection`.
+```text
+Plugin/AutoProductSelection/AutoSelectionStrategyProfile.zh-CN.md (优先)
+或 Plugin/AutoProductSelection/AutoSelectionStrategyProfile.md (备用)
+```
 
+后端会将策略文件内容直接注入到任务提示词中。该文件默认为中文，并默认要求宽泛探索。除非文件明确写入品类、关键词、禁选方向或价格带，枢纽应从场景、人群、痛点、周边配件、收纳清洁、替换件和低成本改良角度发散。枢纽无需且不要调用 `ServerFileOperator.ReadFile` 去重复读取该文件。
+
+## 数据协议
+
+### RawDataPack
+
+鹰眼写入：
+
+```text
+runs/raw/{run_id}-raw.md
+```
+
+核心字段：
+
+- `route_decision.action`: `EARLY_REJECT | PIVOT | DEEPEN | READY_FOR_FORGE`
+- `data_audit_inputs.tools_called`
+- `sample_counts`
+- `unfetchable_gaps`
+- `keyword_market_summary`
+- `competitor_summary`
+- `profitability_raw_estimates`
+- `review_insight_summary`
+- `source_map`
+- `evidence_matrix`
+- `elimination_log`
+
+兼容旧字段：`conversion_rate_matrix`、`candidate_products`、`asin_source_map`、`execution_summary.data_tools_called`。
+
+### ScoredCandidatePack
+
+熔炉写入：
+
+```text
+runs/scored/{run_id}-scored.md
+```
+
+核心字段：
+
+- `hard_gates`
+- `scores.opportunity_score`
+- `scores.data_reliability_score`
+- `scores.execution_fit_score`
+- `scores.final_score`
+- `financial_factors`
+- `data_reliability_audit`
+- `loopback_request`
+- `kill_criteria`
+- `next_validation_steps`
+
+兼容旧字段：`demand_volume`、`differentiation_feasibility`、`competition_severity`、`compliance_risk`、`complexity_severity`、`data_confidence`。
+
+## 评分安全阀
+
+后端会在 scored 写入和应用评审决策时自动追加 `backend_math_validation_v2`：
+
+- 记录四分：机会分、数据置信度分、执行适配分、最终分。
+- 记录利润和广告压力测试：贡献利润、保守 CVR、PPC、CPA、ACOS、广告压力比例。
+- 记录缺失字段：不会乐观补齐，会写入 `missing_critical_fields` 并降低数据置信度。
+- 兜底阻止错误推荐：Hard Gate、负贡献利润、广告压力测试失败或低分 `RECOMMEND` 会被后端改成淘汰重选。
+
+## 空数据容错
+
+ProductSelector 不是 100% 有数据。冷门长尾词、过窄词或 SellerSprite 未收录时可能返回空。
+
+- 空结果不等于商业失败。
+- 鹰眼最多用同义词/父词补查 1 次。
+- 同类数据连续 2 次为空后写入 `unfetchable_gaps`。
+- 熔炉不得因已在 `unfetchable_gaps` 的字段继续回环，只能降低置信度并裁决。
+- 429/500、账号、验证码、页面阻断属于系统阻断，应直接 failed 或 partial raw，不循环重试。
+
+## 回环守卫
+
+正常回环只用于 Critical Gap，并且必须有明确的 `loopback_request`。后端会拒绝以下回环：
+
+- 缺少具体 `missing_field`、`requested_tool`、`target_keywords` 或 `target_asins`
+- 字段已在 `unfetchable_gaps`
+- 同一字段已有补采记录
+- 普通数据回环达到软上限：global=3、scout=2
+
+被拒绝的普通回环不会直接 failed；后端会删除旧 scored，保留 raw，重新派发 reviewer 进入 `force_decision_mode`，让熔炉基于现有证据输出终态裁决。
+
+## 常用命令
+
+- `auto_selection_trigger_run`
+- `auto_selection_debug_status`
 - `auto_selection_queue_status`
-- `auto_selection_write_run_file`
-- `auto_selection_read_run_file`
 - `auto_selection_prepare_dispatch`
 - `auto_selection_apply_reviewer_decision`
 - `auto_selection_archive_run`
-- `auto_selection_move_run_file`
-- `auto_selection_delete_run_file`
-- `auto_selection_cleanup_run`
-- `auto_selection_mark_worker_missing_output`
-- `auto_selection_clear_locks`
-- `get_status`
 
-`auto_selection_read_run_file` only reads files inside `runs/`. `AutoSelectionStrategyProfile.md` is a plugin-root strategy file and should be read with a normal file-reading tool, not as a run file.
+完整 API 见 `TVStxt/AutoProductSelectionToolBox.txt`。
 
-### Generic Dispatch Example
+## 运行数据
 
 ```text
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_prepare_dispatch「末」,
-worker:「始」scout「末」,
-run_id:「始」APS-YYYYMMDD-topic「末」
-<<<[END_TOOL_REQUEST]>>>
+Plugin/AutoProductSelection/runs/
+  brief/
+  raw/
+  scored/
+  failed/
+  archived/
+  locks/
 ```
 
-Submit the returned `agent_assistant_request` fields to `AgentAssistant`.
-
-### Reviewer Decision Example
-
-When the reviewer writes `scored`, the coordinator can safely apply the decision without manually composing file operations:
-
-```text
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_apply_reviewer_decision「末」,
-run_id:「始」APS-YYYYMMDD-topic「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-Supported actions are:
-
-- `PUBLISH_FINAL`: publish your final report, then call `auto_selection_archive_run`.
-- `LOOPBACK_TO_SCOUT`: preserve `raw`, delete old `scored`, create a loopback brief, and return a new scout dispatch request.
-- `DROP_AND_RESELECT`: clear the current raw/scored evidence and optionally prepare a new scout dispatch if `brief_content` is provided.
-
-`LOOPBACK_TO_HAWKEYE` is accepted as a backward-compatible alias for `LOOPBACK_TO_SCOUT`.
-
-### Archive Example
-
-```text
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_archive_run「末」,
-run_id:「始」APS-YYYYMMDD-topic「末」,
-stage:「始」scored「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-Use `stage=failed` for failed runs. `auto_selection_cleanup_run` is only for residue cleanup and should not replace archive.
-
-## Strategy File
-
-Use:
-
-```text
-Plugin/AutoProductSelection/AutoSelectionStrategyProfile.md
-```
-
-for your current product-research strategy. Keep it generic if you publish the repository. Store private brand, supplier, budget, or account-specific preferences in a local ignored copy.
-
-## Public Repository Hygiene
-
-Do not commit:
-
-- real `runs/archived` research outputs
-- private strategy files
-- marketplace account data
-- supplier data
-- brand names or internal agent names
-- generated evidence packs that contain ASIN/SKU/search-term datasets
-
-Commit:
-
-- plugin source
-- manifest
-- generic README and strategy template
-- `.gitkeep` placeholders for runtime folders
-
-## Quick Check
-
-```text
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AutoProductSelection「末」,
-command:「始」get_status「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-```text
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_queue_status「末」
-<<<[END_TOOL_REQUEST]>>>
-```
+真实运行输出和锁文件属于运行数据，不应作为稳定源码依赖。

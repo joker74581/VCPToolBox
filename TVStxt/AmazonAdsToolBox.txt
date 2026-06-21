@@ -1,25 +1,32 @@
 # AmazonAds ToolBox (Amazon Ads 工具箱)
 
-`AmazonAds` 通过 Amazon Ads MCP 配置读取 Amazon Ads 账户结构和报表数据。这个工具箱是中立的（不绑定具体账户）。在用户配置他们自己的账户之前，请使用占位符。
+`AmazonAds` 是 VCP 对接 Amazon Ads MCP 的业务封装插件。第一版只做只读分析，agent 不需要直接拼 MCPO/OpenAPI 参数。默认使用中立占位符，在用户提供具体账户信息前，请使用占位符。
 
-## 安全要求 (Safety)
+## 安全与核心规则 (Safety & Core Rules)
 
-- 不要泄露 access tokens、refresh tokens、client secrets、MCP headers 或签名的报表下载 URL。
-- 不要假设存在默认的卖家账户。请询问用户以配置或确认 `accountName`、`profileId` 和 `marketplace`。
-- 对于同一个账户、日期范围、报表类型和字段集，不要创建重复的报表。
-- 写操作必须首先使用 `propose_*` 生成建议，并在执行 `apply_*` 之前要求用户明确批准，同时需要插件操作密码。
+- **绝不**泄露 access tokens、refresh tokens、client secrets、MCP headers 或签名的报表下载 URL。
+- **不假设默认账户**：请询问用户以配置或确认 `accountName`、`profileId` 和 `marketplace`。
+- **字段规范**：支持常见友好别名传参（如 `spend`, `orders` 等），插件会自动转为规范字段。
+- **不要并发创建**：一次只发一个报表/探测命令，等返回后再决定下一步。
+- **不要陷入轮询死循环**：查询状态为 `PENDING/PROCESSING` 时，**必须立刻停止工具调用并结束当前回复**，告诉用户报表正在生成中，然后等待用户的下一次交互后再去查询。
+- **不要重复创建报表**：对于同一个账户、日期、报表类型和字段集，优先复用已存在的报表任务，新对话先 `list_report_jobs` 寻找旧任务。
+- **只读优先**：不要直接调用 MCPO 的底层工具，优先使用本插件的高层语义命令（如 `get_report_data`）。写操作必须通过 `propose_*` 和 `apply_*` 两段式进行。
 
 ## 默认占位符 (Default Placeholders)
 
 ```text
-accountName: <YOUR_ACCOUNT_NAME>
-adsAccountId: <YOUR_ADS_ACCOUNT_ID>
-profileId: <YOUR_PROFILE_ID>
-entityId: <YOUR_ENTITY_ID>
+accountName: Bellviora
+adsAccountId: amzn1.ads-account.g.b253bqb6po2remg7t5s9gm4cq
+profileId: 2528313277366250
+entityId: ENTITY2B44KUTM5A97D
 marketplace: US
 ```
 
-## 基础检查 (Basic Checks)
+[===vcp_fold:0.16::desc:亚马逊广告 总流程 get_status list_capabilities list_accounts 状态 健康检查 基础调用===]
+
+## 基础状态与标准开场
+
+首次接触 AmazonAds 插件，先确认状态：
 
 ```text
 <<<[TOOL_REQUEST]>>>
@@ -28,12 +35,16 @@ command:「始」get_status「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
+查看可用命令、白名单和报表 preset：
+
 ```text
 <<<[TOOL_REQUEST]>>>
 tool_name:「始」AmazonAds「末」,
 command:「始」list_capabilities「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
+
+确认账户：
 
 ```text
 <<<[TOOL_REQUEST]>>>
@@ -42,20 +53,16 @@ command:「始」list_accounts「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-## 直接查询结构 (Direct Structure Queries)
+如果用户要求“看广告账户并给策略”，推荐顺序：
+`get_status` -> `list_campaigns` -> `get_report_data reportKind=campaign dataNeed=traffic_basic`
 
-当用户询问当前配置了什么时，使用以下命令：
+[===vcp_fold:0.25::desc:广告结构 campaign ad group ad target keyword ASIN 直接查询 不创建报表===]
 
-- `list_campaigns`
-- `list_ad_groups`
-- `list_ads`
-- `list_targets`
-- `check_product_eligibility`
-- `get_billing_status`
-- `list_account_users`
+## 直接查询广告结构
 
-示例：
+不创建报表，适合查当前配置/投放结构。这些命令不能回答历史表现或数据问题。
 
+查 Campaign：
 ```text
 <<<[TOOL_REQUEST]>>>
 tool_name:「始」AmazonAds「末」,
@@ -66,62 +73,204 @@ maxResults:「始」50「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-直接查询结构的命令不能回答历史表现或数据问题。
+其他查询：
+- `list_ad_groups`
+- `list_ads`
+- `list_targets`
 
-## 报表查询 (Report Queries)
+[===vcp_fold:0.4::desc:高层取数 get_report_data 昨天 单日 关键词 计划 get_or_create READY PROCESSING NEEDS_FIELD_PROBE NO_DATA===]
 
-使用报表来获取曝光量 (impressions)、点击量 (clicks)、花费 (cost)、销售额 (sales)、订单量 (orders)、ACOS、ROAS、广告位表现 (placements)、投放表现 (targets) 和搜索词 (search terms)。
+## 高层取数入口 get_report_data
 
-推荐的高级命令：
+处理“拉取昨天的数据”、“查看某天关键词”、“分析某段计划”的最优入口。内部自动寻找归档、续查任务或新建报表。
 
+单日（必须用具体日期如 YYYY-MM-DD）：
 ```text
 <<<[TOOL_REQUEST]>>>
 tool_name:「始」AmazonAds「末」,
 command:「始」get_report_data「末」,
-reportKind:「始」campaign「末」,
-dateFrom:「始」2026-01-01「末」,
-dateTo:「始」2026-01-07「末」,
-accountName:「始」<YOUR_ACCOUNT_NAME>「末」,
+reportKind:「始」keyword「末」,
+date:「始」2026-05-24「末」,
+dataNeed:「始」traffic_basic「末」,
 marketplace:「始」US「末」,
 mode:「始」get_or_create「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-常见的 `reportKind` 值：
+多日（日期范围）：
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_report_data「末」,
+reportKind:「始」keyword「末」,
+dateFrom:「始」2026-05-10「末」,
+dateTo:「始」2026-05-20「末」,
+dataNeed:「始」traffic_basic「末」,
+marketplace:「始」US「末」,
+mode:「始」get_or_create「末」
+<<<[END_TOOL_REQUEST]>>>
+```
 
-- `campaign`
-- `placement`
-- `target`
-- `search_term`
-- `keyword`
+`dataNeed` 常见项：
+- `traffic_basic`：默认推荐，包含曝光和点击。
+- `sales_basic`：拉取销售额、花费、订单数。
+- `keyword_report_full`：包含转化、花费、ACOS、ROAS，通常配合 `reportKind=search_term`。计算字段会自动由插件在客户端计算并返回。
 
-有用的归档管理命令：
+返回状态：
+- `READY`：已有数据，可读取。
+- `CREATED` / `PROCESSING`：正在生成，**必须反馈状态后停止调用，等待后续交互**。
+- `NEEDS_FIELD_PROBE`：字段需要预探测。
+- `NO_DATA`：无业务行数据。
 
-- `list_report_jobs`
-- `read_report_artifact`
-- `export_report_artifact`
-- `aggregate_report_archives`
+[===vcp_fold:0.47::desc:报表归档 物理保存 跨对话续查 jobId list_report_jobs continue_report_job read_report_artifact 分页===]
 
-## 报表轮询规则 (Report Polling Rule)
+## 报表物理归档与跨对话续查
 
-当创建或查询报表时，如果返回的状态是 `PENDING` 或 `PROCESSING`，你**必须立刻停止工具调用并结束当前回复**，告诉用户报表正在生成中，然后**等待用户的下一次命令**。哪怕你觉得需要等待，也坚决不要自己陷入无限循环的轮询中，务必等待用户发起下一次交互后再去查询。
+所有表现报表物理归档于 `Plugin/AmazonAds/state/reports/`。
+新对话或等待后获取数据流程：
 
-## 字段探测规则 (Field Probe Rule)
+1. 查任务：
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_report_jobs「末」,
+accountName:「始」<YOUR_ACCOUNT_NAME>「末」,
+marketplace:「始」US「末」,
+limit:「始」10「末」
+<<<[END_TOOL_REQUEST]>>>
+```
 
-仅在用户要求、Amazon 拒绝了某个字段，或模式不确定性阻碍了任务时，才探测字段。保持探测批次尽量小。
+2. 对于 `PENDING/PROCESSING/DOWNLOAD_FAILED` 续查：
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」continue_report_job「末」,
+jobId:「始」这里填上一步选中的jobId「末」,
+download:「始」true「末」
+<<<[END_TOOL_REQUEST]>>>
+```
 
+3. 已完成任务先读摘要：
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」read_report_artifact「末」,
+jobId:「始」jobId「末」,
+artifact:「始」summary「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+需要表格时使用 `export_report_artifact format=xlsx`。
+
+[===vcp_fold:0.5::desc:报告分析 汇总 find_report_archives build_report_context aggregate_report_archives 干净数据===]
+
+## 归档报告分析与汇总
+
+用于“分析最近一个月的计划报告”或“汇总数据”，不要直接用文件插件读目录。
+
+第一步，找归档：
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」find_report_archives「末」,
+reportKind:「始」campaign「末」,
+dateFrom:「始」2026-05-01「末」,
+dateTo:「始」2026-05-20「末」,
+marketplace:「始」US「末」,
+status:「始」COMPLETED「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+第二步，构建分析包（优先用于文字分析）：
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」build_report_context「末」,
+reportKind:「始」campaign「末」,
+dateFrom:「始」2026-05-01「末」,
+dateTo:「始」2026-05-20「末」,
+marketplace:「始」US「末」,
+mode:「始」summary_only「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+如需汇总统计（聚合、排名）：
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」aggregate_report_archives「末」,
+reportKind:「始」campaign「末」,
+dateFrom:「始」2026-05-01「末」,
+dateTo:「始」2026-05-20「末」,
+groupBy:「始」campaign.id,campaign.name「末」,
+metrics:「始」metric.clicks,metric.impressions,metric.cost,metric.sales,metric.orders「末」,
+limit:「始」100「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+[===vcp_fold:0.62::desc:搜索词 target ASIN 表现 probe_report_fields 探测===]
+
+## 投放(Target)与搜索词(Search Term)表现
+
+- `reportKind=target` (或 `keyword`)：当前投放（关键词/ASIN）的表现，对应 `get_target_performance`。
+- `reportKind=search_term`：客户实际搜索词的表现（推荐用于客户成交分析，含更全转化），对应 `get_search_term_performance`。
+
+如果遇到字段缺失，或用户明确要求，才探测字段：
 ```text
 <<<[TOOL_REQUEST]>>>
 tool_name:「始」AmazonAds「末」,
 command:「始」probe_report_fields「末」,
-preset:「始」campaign_basic「末」,
-candidateFields:「始」budgetCurrency.value,metric.sales「末」,
+preset:「始」search_term_basic「末」,
+candidateFields:「始」searchTerm.value,searchTerm.text,customerSearchTerm.value,target.value「末」,
 days:「始」1「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
+注意：仅在必要时探测，成功后再正式发 `get_report_data`。
 
-## Token 刷新 (Token Refresh)
+[===vcp_fold:0.7::desc:限流 429 Too Many Requests Token刷新===]
 
-仅在启用了插件 Token 刷新且用户要求时，或发生 401/Token 错误并且 `get_status` 显示刷新功能可用时，才调用 `refresh_token`。
+## 限流与Token刷新
 
-如果 `tokenRefresh.enabled=false`，请告诉用户检查外部的 Token 刷新器或 MCP 配置。
+- **429 Too Many Requests**：立即停止创建新报表，避免并发和扩大字段列表。等待数分钟后，只用 `continue_report_job` 续查已有任务状态。
+- **Token 刷新**：若遇 401 且 `get_status` 显示启用了 Token 刷新功能：
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」refresh_token「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+如果未启用，告知用户检查外部刷新器或 MCP 配置。
+
+[===vcp_fold:0.76::desc:账单 资格 商品 eligibility 用户 users permissions===]
+
+## 资格、账单与用户
+
+直接查询，不建报表：
+- `check_product_eligibility` (查商品/ASIN是否能投)
+- `get_billing_status` (查账单/支付状态)
+- `list_account_users` (查用户与权限)
+
+[===vcp_fold:0.9::desc:写操作 propose apply 出价 bid 预算 budget 状态 state 安全===]
+
+## 写操作安全流程
+
+必须严格遵守两段式，默认只读：
+1. `propose_bid_changes` / `propose_state_changes` / `propose_budget_changes`，只生成建议不修改 Amazon。
+2. 用户明确确认并提供口令后：
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」apply_target_bid_changes「末」,
+dryRun:「始」false「末」,
+requireAdmin:「始」<这里填用户提供的密码>「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+[===vcp_fold:0.94::desc:错误排查 call_read_tool 兜底===]
+
+## 错误排查与兜底工具
+
+- `401`：token 或权限问题。
+- `422`：参数 schema 不匹配。
+- `field unknown` / `missing_dependent_field`：需按提示修正依赖字段或探测。
+- `call_read_tool`：仅当插件无对应高级命令，且属于**只读**操作时调用底层工具（需在 `list_capabilities` 白名单内）。不要编造底层写工具，不准调用 `sp-create_report` 等。

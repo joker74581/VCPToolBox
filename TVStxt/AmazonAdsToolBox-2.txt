@@ -1,0 +1,805 @@
+# AmazonAds 广告分析 ToolBox
+# BACKUP 2026-05-24
+
+`AmazonAds` 是 VCP 对接 Amazon Ads MCP 的业务封装插件。默认账户是 Bellviora / US，默认只读。
+
+最小调用格式：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_status「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+核心规则：
+- 优先使用本插件命令，不要直接调用 MCPO 的 96 个 Amazon Ads 原始工具。
+- 不要编造 `amazon_ads_sp-*`、`sp-create_report` 等工具名。
+- 字段支持常见友好别名直接传参（如 `spend`, `cost`, `orders`, `purchases`, `cpc`, `acos`, `roas`, `ctr`, `cvr`）。插件会自动将别名规整为规范字段，并在底层自动补全 `date.value` 与 `budgetCurrency.value` 等 API 必需维度的字段。
+- 不要快速并发创建报表。一次只发一个 AmazonAds 报表/探测命令，等返回后再决定下一步。
+- 账户、广告结构、资格、账单、用户类数据通常可直接查；历史表现指标通常需要报表。
+- 报表是异步任务。`PENDING/PROCESSING` 不是失败；拿到 `jobId` 后优先用 `continue_report_job` 续查同一个物理任务。
+- 创建报表后可以查看一次状态；如果仍是 `PENDING/PROCESSING`，必须停止继续查询并直接回复用户等待后续二次查询，不要在同一轮反复轮询。
+- 历史表现报表会物理归档。新对话先 `list_report_jobs`，不要为同一账户、日期、字段重复创建报表。
+- 用户要求“查看之前创建好的/刚才那份报表”时，先 `list_report_jobs limit=10`，根据 `display_name/report_type_label/period/status` 选 `jobId`，再 `read_report_artifact artifact=summary`。
+- 读取归档时先读 `summary`，需要明细再用 `rows limit/offset` 分页读取；不要一次读取全部历史报表。
+- 用户要求表格/Excel/方便人工查看时，用 `export_report_artifact format=xlsx`，不要读取 `downloads.json`。
+- `continue_report_job` 或同步等待完成后，如果报表有 rows，插件会自动写出 xlsx/csv；旧归档缺表格时再手动 `export_report_artifact format=all`。
+- 报表命令默认返回给 Agent 的是 compact payload：优先读 `summary_markdown`、`jobId/reportId/status`、`row_summary`、下载摘要和 Excel/CSV 路径；不要期待默认返回原始 MCP 响应、gzip preview、signed URL 或成批 rows。
+- 只有排查下载、字段映射或原始响应时，才传 `result_mode=debug/full/raw`、`format=debug/raw` 或 `include_debug=true`。
+- 用户要求分析一段时间的历史报告时，优先用 `find_report_archives`、`build_report_context`、`aggregate_report_archives`，不要直接读归档文件。
+- 用户要求“拉取昨天/某一天/某段时间的关键词或计划数据”时，默认优先用 `get_report_data`，不要自己串多个底层报表命令。
+- 遇到 `429 Too Many Requests` 限流时，插件底层会自动进行指数退避重试（3次）。若频控持久存在，再考虑停止创建新报表并复用已有 `jobId`。
+- 写操作必须先 `propose_*`，再由用户明确确认并提供 AmazonAds 插件操作口令后 `apply_*`。
+
+默认账户：
+
+```text
+accountName: Bellviora
+adsAccountId: amzn1.ads-account.g.b253bqb6po2remg7t5s9gm4cq
+profileId: 2528313277366250
+entityId: ENTITY2B44KUTM5A97D
+marketplace: US
+```
+
+[===vcp_fold:0.16::desc:亚马逊广告 总流程 默认账户 Bellviora get_status list_capabilities list_accounts 状态 健康检查 基础调用===]
+
+## 基础状态与标准开场
+
+首次接触 AmazonAds 插件，先确认状态：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_status「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+查看可用命令、白名单和报表 preset：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_capabilities「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+必要时确认账户：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_accounts「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+如果用户说“看广告账户并给策略”，推荐顺序：
+
+```text
+get_status
+list_campaigns
+get_report_data reportKind=campaign dataNeed=traffic_basic
+```
+
+如果返回 `jobId/reportId` 且状态是 `PENDING/PROCESSING`，停止创建新报表，等待后用 `continue_report_job` 查同一个 `jobId`。
+
+串行规则：同一轮不要同时发多个 `get_*_performance`、`probe_report_fields` 或 `create_report`。先拿一个返回，看 `reportId/status/warnings/field_validation` 后再继续。
+
+[===vcp_fold:0.4::desc:高层取数 get_report_data 昨天 单日 关键词 计划 get_or_create READY PROCESSING NEEDS_FIELD_PROBE NO_DATA===]
+
+## 高层取数入口 get_report_data
+
+当用户要求“拉取昨天的数据”“查看某一天关键词广告数据”“分析某段时间计划表现”，优先使用 `get_report_data`。这个命令会在插件内部完成：
+
+1. 查是否已有可用归档。
+2. 续查同一个 `jobId` 的处理中报表。
+3. 没有可用任务时创建新 Amazon Ads 报表。
+4. 字段必须来自 preset 白名单；白名单中的候选字段会直接正式请求，不做预探测。
+5. 404、FAILED、空报表会进入明确状态，不继续读空归档。
+
+用户说“昨天”时必须按调用当日换算成具体日期。比如当前日期是 2026-05-25 时，昨天是 2026-05-24。单日报表优先传 `date`，或传相同的 `dateFrom/dateTo`；不要用 `days` 代替单日日期。
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_report_data「末」,
+reportKind:「始」keyword「末」,
+date:「始」2026-05-24「末」,
+dataNeed:「始」traffic_basic「末」,
+marketplace:「始」US「末」,
+mode:「始」get_or_create「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+用户说“帮我拉取 5月10日到5月20日的关键词数据报表”，应理解为日期范围关键词表现报表：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_report_data「末」,
+reportKind:「始」keyword「末」,
+dateFrom:「始」2026-05-10「末」,
+dateTo:「始」2026-05-20「末」,
+dataNeed:「始」traffic_basic「末」,
+marketplace:「始」US「末」,
+mode:「始」get_or_create「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+如果用户没有要求销售额、花费、订单、ACOS，默认 `dataNeed=traffic_basic`；不要主动升级到 `sales_basic`。
+
+日期规则：
+- 单日：传 `date=YYYY-MM-DD`，或 `dateFrom=dateTo=YYYY-MM-DD`。
+- 多日：传明确的 `dateFrom/dateTo`。
+- 最近 N 天：只有用户明确说“最近 N 天”时才传 `days`。
+- 不要在用户指定某一天时改成 `days=7` 或默认 30 天。
+
+`reportKind`：
+- `keyword` 或 `target`：投放关键词 / Target / ASIN / 商品投放表现，默认对应 `get_target_performance`。
+- `search_term`：客户搜索词表现，对应 `get_search_term_performance`。
+- `keyword_report`：后台“关键词报表”模糊口径；归档查询时可兼容 target 和 search term。
+- `placement`：广告位 / Campaign Placement 表现，对应 `get_placement_performance`，核心字段 `placementClassification`。
+- `campaign` 或 `plan`：计划 / Campaign 表现。
+
+`dataNeed`：
+- `identity_basic`：只拿维度和点击。
+- `traffic_basic`：维度、曝光、点击。默认推荐，最稳。
+- `sales_basic`：拉取销售额、花费（对应底层的 `metric.totalCost`）、订单数（对应底层的 `metric.purchases`）以及币种字段。已通过 API v3 稳定跑通，可放心使用。
+- `keyword_report_full`：用户最常用的后台“关键词/搜索词成交报表”口径，属于客户搜索词表现，优先走 `search_term_basic`。目标字段包含日期、广告活动、投放、客户搜索词、匹配类型、曝光、点击、花费、销售额、订单、ACOS、ROAS。CTR、CPC、CVR、ACOS 和 ROAS 等计算字段会直接由插件在客户端计算并以纯净无前缀的友好根字段形式（如 `spend`, `cpc`, `acos`）自动填充在数据行中，无需 Agent 自行串联计算。
+- `diagnosis_full`：尝试更多诊断字段；只使用 preset 白名单字段。字段不在白名单时返回 `UNKNOWN_FIELDS`，不要猜字段。
+- `custom_verified`：可传 `fields`，但只能使用 verified fields。
+
+返回状态解释：
+- `READY`：已有归档可分析，但只能分析返回 `job.used_fields` 中真实存在的字段；如果用户要求成交/销售额而 `job.used_fields` 没有 `metric.sales`，必须报告插件异常，不能用旧流量报表代替。
+- `CREATED`：已创建新报表。最多查看一次状态；若仍为 `PENDING/PROCESSING`，反馈 `jobId/status` 后停止，等待后续二次查询再用同样参数调 `get_report_data` 或用 `continue_report_job jobId=...`。
+- `PROCESSING`：已有报表还在生成，不要创建重复报表。
+- `NEEDS_FIELD_PROBE`：只有用户显式要求预探测（如 `probeBeforeUse=true`）时才会返回；按返回的整批请求探测。
+- `NO_DATA`：报表完成但没有可分析 rows。
+- `DOWNLOAD_FAILED` 或 `COMPLETED_DOWNLOAD_FAILED`：Amazon 报表已完成，但下载文件失败；这不是“无数据”。必须重试同一个 `jobId` 的 `continue_report_job`，不要分析空 rows，也不要创建重复报表。
+- `FAILED_NOT_REUSABLE`：旧 reportId已失效或报表失败，不要复用。
+
+返回内容读取规则：
+- `summary_markdown` 是默认给 Agent 的首要分析入口，包含状态、日期、字段、总曝光/点击/花费/销售/订单/ACOS/ROAS 和 Excel/CSV 路径。
+- `report_result`、`continue_result` 等嵌套结果默认已被压缩，只保留状态、归档 job、下载摘要和下一步；不要把它当作原始 rows 来源。
+- 需要明细时，用 `read_report_artifact artifact=rows` 读取完整 compact 行；只有用户明确要求抽样/分页时才传 `offset`/`limit`，或用 `aggregate_report_archives` 做聚合。
+- 不要常规开启 debug/raw；那会返回调试负载，token 成本高，且可能包含 signed URL 或重复元信息。
+
+默认情况下，`get_report_data` 会直接使用 preset 白名单里的字段创建正式报表，不会为了“未探测”而先探测。如果用户主动要求预探测并返回 `NEEDS_FIELD_PROBE`，不要改用底层 `get_target_performance` 硬塞字段；只能按返回的 `recommended_probe_request` 整批探测，或降级为用户接受的更少字段。
+
+关键词成交数据常见探测方式：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」probe_report_fields「末」,
+preset:「始」target_basic「末」,
+candidateFields:「始」budgetCurrency.value,metric.sales「末」,
+days:「始」1「末`
+<<<[END_TOOL_REQUEST]>>>
+```
+
+探测成功后，再重试：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_report_data「末」,
+reportKind:「始」keyword「末」,
+date:「始」2026-05-24「末」,
+dataNeed:「始」sales_basic「末」,
+marketplace:「始」US「末」,
+mode:「始」get_or_create「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+注意：`probe_report_fields` 只验证字段是否能用于报表 schema，不等于正式 7 天数据已经完成。探测返回 `success_fields` 后，必须再调用一次原始日期范围的 `get_report_data`。只有 `get_report_data` 返回：
+- `CREATED` 或 `PROCESSING`：反馈 `jobId/status` 后停止，等待后续续查。
+- `READY`：确认返回的 `job.used_fields` 包含用户要求字段后，才读取/分析。
+- `NEEDS_FIELD_PROBE` 或 `FAILED_*`：原样报告问题，不要继续尝试。
+
+不要把 `probe_report_fields` 返回的 `reportId` 当成正式业务报表，也不要根据探测结果说“报告已经就绪”。
+
+如果探测失败，不要循环重试；把 `failed_fields` 原样反馈给用户。
+
+如果 `continue_report_job` 返回 `FAILED_REPORT_NOT_FOUND` 或 `FAILED_NOT_REUSABLE`，不要继续读取这个 job 的 summary/rows；用 `get_report_data mode=get_or_create` 创建新的同日期报表。
+
+`continue_report_job` 的 `jobId` 必须来自插件返回的本地物理归档 ID，形如 `20260523080914-894a4957f0`。不要臆造 `amzn1.ads-job...` 这类 ID；如果只有 Amazon `reportId`，使用 `retrieve_report`。
+
+不要让 Agent 自己先 `build_report_context`，发现 0 后又反复读空归档。拉新数据的第一入口是 `get_report_data`。
+
+用户说“完整关键词报告”“关键词成交报表”“关键词展示、点击、成交、花费、ACOS/ROAS”时，不要用普通 `sales_basic`，直接使用：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_report_data「末」,
+reportKind:「始」keyword「末」,
+date:「始」2026-05-24「末」,
+dataNeed:「始」keyword_report_full「末」,
+marketplace:「始」US「末」,
+mode:「始」get_or_create「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+如果返回 `NEEDS_FIELD_PROBE`，优先原样调用返回的 `recommended_probe_request`；否则按 `probe_plan_batches[0]` 组装成一个逗号分隔的 `candidateFields` 串行探测。不要把一个 batch 拆成逐字段多次调用。遇到 429 立即停止，不要继续后续 batch。
+
+用户说“广告位置/广告位/placement/Top of Search/Product Pages/Rest of Search 表现”时，使用广告位报表：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_report_data「末」,
+reportKind:「始」placement「末」,
+dateFrom:「始」2026-05-25「末」,
+dateTo:「始」2026-05-27「末」,
+dataNeed:「始」traffic_basic「末」,
+marketplace:「始」US「末」,
+mode:「始」get_or_create「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+[===vcp_fold:0.25::desc:广告结构 campaign ad group ad target keyword ASIN list_campaigns list_ad_groups list_ads list_targets 直接查询 不创建报表===]
+
+## 直接查询广告结构
+
+这些命令不创建报表，适合查“当前有哪些 Campaign / Ad Group / Ad / Target / 关键词 / 商品投放”。
+
+查 Campaign：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_campaigns「末」,
+accountName:「始」Bellviora「末」,
+marketplace:「始」US「末」,
+maxResults:「始」50「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+查 Ad Group：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_ad_groups「末」,
+accountName:「始」Bellviora「末」,
+marketplace:「始」US「末」,
+maxResults:「始」50「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+查 Ad：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_ads「末」,
+accountName:「始`Bellviora「末」,
+marketplace:「始」US「末」,
+maxResults:「始」50「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+查 Target / 关键词 / 商品投放结构：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_targets「末」,
+accountName:「始」Bellviora「末」,
+marketplace:「始」US「末」,
+maxResults:「始」50「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+可选过滤字段：`campaignId`、`adGroupId`、`targetId`、`state`、`keyword`。
+
+重要区别：
+- `list_targets` 查当前投放结构，不包含 7 天花费/销售/ACOS。
+- `get_target_performance` 查历史表现，需要创建报表。
+
+[===vcp_fold:0.42::desc:报表 performance campaign 表现 get_campaign_performance retrieve_report reportId PENDING PROCESSING 下载 花费 销售 点击 曝光 ACOS ROAS===]
+
+## Campaign 表现报表
+
+Campaign 表现属于历史指标，通常要创建报表。默认字段来自 `campaign_basic` 的 `verified_fields`。
+
+查看 preset：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_report_presets「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+正式报表字段规则：
+- 不传 `fields` 时，插件只使用对应 preset 的 `verified_fields`。
+- 传 `fields` 时，只能使用该 preset 的 `verified_fields` 或 `candidate_fields` 白名单字段。
+- 需要白名单以外的新字段时，先核对官方资料并更新 preset；不要凭经验直接塞进正式报表。
+
+拉最近 7/30 天 Campaign 表现：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_campaign_performance「末」,
+accountName:「始」Bellviora「末」,
+marketplace:「始」US「末」,
+days:「始」7「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+如果返回 `reportId` 且状态未完成：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」continue_report_job「末」,
+jobId:「始」这里填上一步返回的 jobId「末」,
+download:「始」true「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+不要在等待期间反复创建同类报表。只查同一个 `jobId/reportId`。
+
+[===vcp_fold:0.47::desc:报表归档 物理保存 跨对话续查 jobId list_report_jobs continue_report_job read_report_artifact summary rows 分页 历史对比===]
+
+## 报表物理归档与跨对话续查
+
+所有正式表现报表都会写入本地物理归档：
+
+```text
+Plugin/AmazonAds/state/report-jobs.json
+Plugin/AmazonAds/state/reports/YYYY/MM/<jobId>-.../
+```
+
+每个任务有稳定 `jobId`，目录里会保存 `metadata.json`、`request.json`、`report.json`、`downloads.json`、`rows.jsonl`、`summary.md`。其中 `downloads.json` 是原始/调试归档，体积大且包含重复元信息；业务分析不要读取它。
+
+新对话、自动任务、等待 10-20 分钟后继续拿数据时，标准流程是：
+
+1. 先查索引，不创建新报表。
+2. 用返回的 `display_name`、`report_type_label`、`period`、`status` 选择正确 `jobId`。
+3. 对 `PENDING/PROCESSING/DOWNLOAD_FAILED` 任务调用 `continue_report_job`。
+4. 完成后先读 `summary`。
+5. 需要明细再分页读 compact `rows`。
+
+查最近报表任务：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_report_jobs「末」,
+accountName:「始」Bellviora「末」,
+marketplace:「始」US「末」,
+reportCommand:「始」get_target_performance「末」,
+limit:「始」10「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+过滤报表类型时使用 `reportCommand`，不要把工具命令 `command` 改成报表类型。
+
+如果用户说“查看之前创建好的报表/刚才那份报表”，不要新建报表。先：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_report_jobs「末」,
+accountName:「始」Bellviora「末」,
+marketplace:「始」US「末」,
+limit:「始」10「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+选中对应 `display_name` 的 `jobId` 后，再读摘要：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」read_report_artifact「末」,
+jobId:「始」这里填选中的 jobId「末」,
+artifact:「始」summary「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+续查已有任务：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」continue_report_job「末」,
+jobId:「始」这里填 list_report_jobs 返回的 jobId「末」,
+download:「始」true「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+读取人类可读摘要：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」read_report_artifact「末」,
+jobId:「始」这里填已完成任务的 jobId「末」,
+artifact:「始」summary「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+分页读取明细行：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」read_report_artifact「末」,
+jobId:「始」这里填已完成任务的 jobId「末」,
+artifact:「始」rows「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+`artifact=rows` 默认返回紧凑业务字段，会去掉 `spend/cost/clicks/orders` 等重复别名。只有排查字段映射问题时才传 `format=raw` 或 `compact=false`。
+
+不要常规读取 `artifact=downloads`。该接口默认只返回下载摘要；只有调试下载解析或审计原始响应时才传 `format=raw`。
+
+如果用户需要人类阅读的表格文件，导出 Excel：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」export_report_artifact「末」,
+jobId:「始」这里填已完成任务的 jobId「末」,
+format:「始」xlsx「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+`export_report_artifact` 使用 compact 业务字段生成 `.xlsx` / `.csv`，不是把 `downloads.json` 原样塞进去。
+
+重要约束：
+- 只要 `list_report_jobs` 已有同一账户、同一日期、同一字段的 `PENDING/PROCESSING/COMPLETED` 任务，就不要重新创建。
+- 不要把 `report-jobs.json` 或所有历史 `rows.jsonl` 一次性读入上下文。
+- 先读 `summary.md` 判断是否足够；只有做明细分析时才读 rows。
+- 不要直接读 `downloads.json` 做分析；用 `summary`、`rows`、`build_report_context`、`aggregate_report_archives`。
+- 如果 `truncated=true`，说明下载受 `AMAZON_ADS_MAX_DOWNLOAD_BYTES` 限制，不能把归档当完整全量。
+
+[===vcp_fold:0.5::desc:报告分析 汇总 最近一个月 5月 关键词报告 计划报告 find_report_archives build_report_context aggregate_report_archives 干净数据 去重===]
+
+## 归档报告分析与汇总
+
+当用户说“查看最近 1 个月的关键词报告并分析”“分析 5月1日-5月20日的计划报告”“汇总一段时间的广告报告”，优先使用高层归档命令，不要直接用文件插件读目录。
+
+报告类型语义：
+- `reportKind: keyword`：关键词 / Target / ASIN / 商品投放归档，对应 `get_target_performance`。
+- `reportKind: search_term`：搜索词归档，对应 `get_search_term_performance`。
+- `reportKind: keyword_report`：后台“关键词报表”模糊口径，兼容 target 和 search term 归档。
+- `reportKind: placement`：广告位归档，对应 `get_placement_performance`。
+- `reportKind: campaign` 或 `plan`：计划 / Campaign 归档，对应 `get_campaign_performance`。
+- `reportKind: all`：全部表现归档。
+
+第一步：找归档，不读取大文件：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」find_report_archives「末」,
+reportKind:「始」keyword「末」,
+dateFrom:「始」2026-05-01「末」,
+dateTo:「始」2026-05-20「末」,
+marketplace:「始」US「末」,
+status:「始」COMPLETED「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+第二步：构建干净分析包。默认只读摘要，过滤 `request.json`、`report.json`、`downloads.json` 这类重复元信息：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」build_report_context「末」,
+reportKind:「始」keyword「末」,
+dateFrom:「始」2026-05-01「末」,
+dateTo:「始」2026-05-20「末」,
+marketplace:「始」US「末」,
+mode:「始」summary_only「末`
+<<<[END_TOOL_REQUEST]>>>
+```
+
+需要少量明细样本时再带 rows：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」build_report_context「末」,
+reportKind:「始」keyword「末」,
+dateFrom:「始」2026-05-01「末」,
+dateTo:「始」2026-05-20「末」,
+marketplace:「始」US「末」,
+mode:「始」summary_with_rows「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+如果用户要“汇总、排名、对比、按计划/关键词/ASIN 聚合”，使用聚合命令：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」aggregate_report_archives「末」,
+reportKind:「始」campaign「末」,
+dateFrom:「始」2026-05-01「末」,
+dateTo:「始」2026-05-20「末」,
+groupBy:「始」campaign.id,campaign.name「末」,
+metrics:「始」metric.clicks,metric.impressions,metric.cost,metric.sales,metric.orders「末」,
+limit:「始」100「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+归档分析规则：
+- `find_report_archives` 会按 `jobKey` 排除重复任务，返回候选 `jobId`。
+- `build_report_context` 是给 Agent 的“干净阅读包”，优先用于文字分析。
+- `aggregate_report_archives` 是给数值汇总的“干净表格”，优先用于排名、对比、合计。
+- 归档分析层支持字段别名模糊匹配：例如 `metric.clicks` 可匹配 `clicks`，`campaign.id` 可匹配 `campaignId`，`target.value` 可匹配 `keywordText`。
+- 模糊匹配只用于读取已归档数据；创建正式报表时仍必须使用 `list_report_presets` 里的严格字段名。
+- 如果返回 `field_mapping`，分析时以它为准判断实际读取了哪些原始字段。
+- 如果没有匹配的 `COMPLETED` 归档，先 `list_report_jobs` 看是否有 `PENDING/PROCESSING`，再 `continue_report_job`。
+- 不要直接读取 `metadata/request/report/downloads` 做业务分析；这些是审计材料，不是干净数据。
+
+[===vcp_fold:0.58::desc:关键词 target ASIN 商品投放 get_target_performance target.value target.matchType adGroup keyword targetingExpression 目标 asin 表现===]
+
+## Target / 关键词 / 商品投放表现
+
+如果用户要“最近 7 天关键词数据、目标 ASIN 数据、商品投放表现”，不能只调用：
+
+```text
+get_target_performance days=7
+```
+
+默认字段可能只有：
+
+```text
+date.value
+campaign.id
+metric.clicks
+```
+
+这不能当关键词或 ASIN 数据。必须先确认 target 维度字段，再显式传 `fields`。
+
+字段探测不是正式取数，而是验证字段名和字段组合是否被当前 Amazon Ads MCP 接受。默认不预探测；只有用户明确要求、Amazon 返回字段错误、或官方 schema 有变化时才探测。一次探测一个 batch，默认最多 4 个候选字段；插件默认用 1 天窗口减轻限流。
+
+如用户明确要求预探测，才探测 target 维度字段：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」probe_report_fields「末」,
+preset:「始」target_basic「末」,
+candidateFields:「始」target.value,target.matchType,adGroup.id,adGroup.name「末」,
+days:「始」1「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+正式取数时直接使用 preset 白名单字段；如果刚做过探测，则用探测成功的字段显式拉表现：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_target_performance「末」,
+accountName:「始」Bellviora「末」,
+marketplace:「始」US「末」,
+fields:「始」date.value,campaign.id,target.value,target.matchType,metric.clicks「末」,
+days:「始」7「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+如果返回里有 `field_guidance` 或 `analysis_scope` 不是 `requested_fields`，说明字段不够；不要声称已经拿到关键词/ASIN 表现。
+
+如果只需要“当前有哪些关键词/ASIN 被投放”，使用 `list_targets`，不要创建报表。
+
+[===vcp_fold:0.62::desc:搜索词 search term searchTerm customerSearchTerm query get_search_term_performance 关键词 搜索词 转化 表现===]
+
+## Search Term 搜索词表现
+
+Search Term 是用户搜索词历史表现，不等同于当前投放 target。它通常需要报表。
+
+用户后台下载的常用“关键词报告”通常更接近 Search Term 口径，而不是 Target 口径，因为它包含“客户搜索词”。因此：
+- 用户说“关键词完整报告/关键词成交报告/客户搜索词/搜索词”时，优先用 `get_report_data reportKind=search_term dataNeed=keyword_report_full`。兼容旧调用：`reportKind=keyword + dataNeed=keyword_report_full` 会被插件明确路由到 search term，并在返回的 `report_route.reason` 中说明原因。
+- 用户明确说“当前投放 Target / ASIN 投放 / 商品投放目标”时，才用 `get_target_performance` 或 `reportKind=target`。
+- `target.value` 是“投放”，`searchTerm.value` 或探测成功的同义字段才是“客户搜索词”。
+
+如用户明确要求预探测，才探测搜索词维度字段：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」probe_report_fields「末」,
+preset:「始」search_term_basic「末」,
+candidateFields:「始」searchTerm.value,searchTerm.text,customerSearchTerm.value,target.value「末」,
+days:「始」1「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+正式取数时优先用 `get_report_data reportKind=search_term dataNeed=keyword_report_full`。如果刚做过探测，则用探测成功的搜索词字段显式拉表现。示例字段需根据探测结果调整：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_search_term_performance「末」,
+accountName:「始」Bellviora「末」,
+marketplace:「始」US「末」,
+fields:「始」date.value,campaign.id,searchTerm.value,metric.clicks「末」,
+days:「始」7「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+如果 `searchTerm.value` 探测失败，不要继续假装已拿到搜索词；换用探测成功的字段，或向用户说明当前 MCP 字段未确认。
+
+[===vcp_fold:0.64::desc:字段探测 probe_report_fields verified_fields candidateFields unknown_field missing_dependent_field target.value adGroup.id budgetCurrency 429 限流===]
+
+## 字段探测与字段依赖
+
+为什么要探测：
+- Amazon Ads MCP 报表字段名很严格，传统 Ads API 字段名不一定可用。
+- 有些字段存在但必须搭配依赖字段，例如 `target.matchType` 需要 `target.value`，`adGroup.name` 需要 `adGroup.id`。
+- 新字段必须先来自官方资料并加入 preset；如果官方资料不明确，才通过探测确认。
+
+什么时候需要探测：
+- 用户明确要求先探测。
+- 出现 `unknown_field`、`missing_dependent_field`。
+- 官方文档或 MCP 工具 schema 疑似发生变化，需要定位可用字段。
+
+什么时候可以跳过探测：
+- 字段已经在 `list_report_presets` 返回的 `verified_fields` 或 `candidate_fields` 中。
+- 你复用的是同一账户、同一 preset、同一字段组合，并且近期已成功生成报表。
+
+探测规则：
+- 支持批量探测候选字段（默认每批 4 个，由 `AMAZON_ADS_PROBE_MAX_CANDIDATE_FIELDS` 调控）。
+- 如果上一步返回了 `recommended_probe_request`，原样调用它；不要把 `candidateFields` 拆成单字段循环。
+- 若批量探测中包含个别无效/未知字段导致官方报错，插件会自动解析错误（支持 `field X is unknown` 或 `invalid fields: Y, Z` 格式），自动修剪剔除坏字段并继续对好字段进行重试探测，直至整个批次探测成功或完全被修剪。
+- 不要把 base fields 已包含的字段放进 candidate。
+- 只能探测 `list_report_presets` 里该 preset 的 `candidate_fields`，不要凭经验编字段。
+- 不要用探测替代正式取数；探测只做 schema 验证。
+- 如果返回 `stopped_by_rate_limit=true`，立即停止创建报表，等待后只重试 `skipped_fields`。
+
+字段结果解释：
+- `success_fields`：可用于下一步正式报表。
+- `failed_fields`：不可用于正式报表。
+- `skipped_fields`：因限流未探测，不算成功也不算字段错误。
+- `reportId: null`：不是成功。
+
+[===vcp_fold:0.7::desc:限流 429 Too Many Requests rate limit PENDING reportId retrieve_report 等待 重试 冷却===]
+
+## 限流与异步报表处理
+
+遇到 `429 Too Many Requests`：
+- 立即停止创建新报表。
+- 不要并行重试，不要扩大字段列表。
+- 等待数分钟后，只查询已有 `reportId`。
+- 如果 `probe_report_fields` 返回 `skipped_fields`，稍后只重试这些字段，并减少 candidate 数量。
+
+优先按物理任务续查已有报表：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」continue_report_job「末」,
+jobId:「始」已有 jobId「末」,
+download:「始」true「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+如果只有 Amazon `reportId`、没有 `jobId`，才直接查 reportId：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」retrieve_report「末」,
+reportId:「始」已有 reportId「末」,
+download:「始」true「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+`PENDING` 和 `PROCESSING` 不是失败。不要因为 PENDING 重新创建同样报表。
+
+安全节奏：报表任务天然慢，宁可少字段、串行、等待，也不要“为了快”同时发多个报表创建请求。
+
+[===vcp_fold:0.76::desc:账单 资格 商品 eligibility billing invoice 用户 users permissions 账户健康 直接查询===]
+
+## 账单、资格、用户与账户健康
+
+这些能力通常是直接查询，不创建报表。
+
+检查商品是否可投放：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」check_product_eligibility「末」,
+accountName:「始」Bellviora「末」,
+marketplace:「始」US「末」,
+asins:「始`["B0XXXXXXXX"]「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+查账单/支付通知：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」get_billing_status「末」,
+accountName:「始」Bellviora「末」,
+marketplace:「始」US「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+查账户用户：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」list_account_users「末」,
+accountName:「始」Bellviora「末」,
+marketplace:「始」US「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+[===vcp_fold:0.82::desc:原始工具 call_read_tool 白名单 payload 底层工具 read whitelist billing invoices account link users 不要 sp-create_report===]
+
+## 只读原始工具兜底
+
+只有插件没有封装某个只读能力时，才用 `call_read_tool`。插件会拦截非白名单工具。
+
+示例：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」call_read_tool「末」,
+toolName:「始」amazon_ads_billing-list_invoices「末」,
+payload:「始」{}「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+规则：
+- 优先用插件业务命令。
+- `toolName` 必须来自 `list_capabilities` 返回的白名单。
+- 不要用 `call_read_tool` 调 create/update/delete/archive/bid/budget/user/permission 等工具。
+- 不要编造 `amazon_ads_sp-list_campaigns`、`sp-create_report`。
+- 不要为了绕过字段问题开放底层写/创建工具；应修 preset 或显式 fields。
+
+[===vcp_fold:0.9::desc:写操作 propose apply 出价 bid 预算 budget 状态 state 暂停 启用 操作口令 dryRun doubleConfirm 安全===]
+
+## 写操作安全流程
+
+默认只读。真实修改必须两段式：
+
+1. `propose_*` 只生成建议，不修改 Amazon。
+2. 用户明确确认后，`apply_*` 才允许执行。
+
+生成出价建议：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」AmazonAds「末」,
+command:「始」propose_bid_changes「末」,
+maxAcos:「始」0.35「末」,
+minClicks:「始」10「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+真实执行必须满足：
+- 用户明确要求执行。
+- `dryRun=false`
+- `requireAdmin` 等于 AmazonAds 插件操作口令。
+- 状态和预算修改还必须 `doubleConfirm=true`。
+
+无用户明确授权时，只能做 `propose_*`，不能做 `apply_*`。
+
+[===vcp_fold:0.94::desc:错误排查 401 422 500 field unknown missing_dependent_field signed URL reportId field_guidance analysis_scope===]
+
+## 常见错误判断
+
+- `401`：token、client id、refresh token 或权限问题。
+- `422`：参数 schema 不匹配，不能猜 body。
+- `field unknown` / `unknown_field`：字段名不被当前 MCP 接受。
+- `missing_dependent_field`：字段需要依赖字段，按错误提示补字段。
+- `PENDING/PROCESSING`：报表仍在生成，稍后查同一个 `reportId`。
+- `429 Too Many Requests`：限流，停止创建新报表。
+- `signed S3 URL`：下载地址有时效，不要放进普通报告正文。
+- `field_guidance`：字段不够，不能把当前结果解释为关键词、ASIN 或搜索词表现。
+- `analysis_scope` 不是 `requested_fields`：说明返回数据粒度不足，必须补字段或重新探测。

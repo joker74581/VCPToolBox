@@ -6,12 +6,13 @@ const KEYWORD_REVERSE_URL = 'https://www.sellersprite.com/v3/keyword-reverse';
 const KEYWORD_CONVERSION_RATE_URL = 'https://www.sellersprite.com/v3/keyword-conversion-rate';
 
 const DEFAULT_NODE_ID_PATHS = [
+  '2619525011',
   '2617941011',
   '15684181',
   '165796011',
   '3760911',
-  '283155',
   '2335752011',
+  '7141123011',
   '172282',
   '16310101',
   '3760901',
@@ -660,6 +661,9 @@ async function login({ chromeBridgeClient, username, password, timeout = 20000 }
     };
   }
 
+  // 等待页面导航完成后再切换标签
+  await new Promise(resolve => setTimeout(resolve, 1000));
+
   if (typeof chromeBridgeClient.switchTab === 'function') {
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
@@ -667,10 +671,13 @@ async function login({ chromeBridgeClient, username, password, timeout = 20000 }
         break;
       } catch (error) {
         if (attempt === 4) break;
-        await new Promise(resolve => setTimeout(resolve, 200));
+        await new Promise(resolve => setTimeout(resolve, 300));
       }
     }
   }
+
+  // 再次等待确保标签切换完成
+  await new Promise(resolve => setTimeout(resolve, 500));
 
   const navigationResult = {
     ...openResult,
@@ -725,6 +732,36 @@ async function login({ chromeBridgeClient, username, password, timeout = 20000 }
         text: buildSellerSpriteLoginScript(username, password, timeout),
         timeout
       });
+
+      // 检查是否找到输入框
+      if (formResult.success !== false && formResult.result?.inputs_not_found) {
+        formResult = {
+          success: false,
+          error: 'Login form inputs not found on the page.',
+          inputs_not_found: true,
+          result: formResult.result
+        };
+      }
+
+      // 如果成功或已登录，跳出重试循环
+      if (formResult.success !== false || formResult.result?.already_logged_in) {
+        break;
+      }
+
+      // 如果是输入框未找到，需要重试
+      if (formResult.inputs_not_found && attempt < 2) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        if (typeof chromeBridgeClient.switchTab === 'function') {
+          try {
+            await chromeBridgeClient.switchTab('sellersprite.com', Math.min(timeout, 10000));
+            await new Promise(resolve => setTimeout(resolve, 500));
+          } catch (_) {
+            // 继续下一次尝试
+          }
+        }
+        continue;
+      }
+
       break;
     } catch (error) {
       formResult = {
@@ -732,15 +769,29 @@ async function login({ chromeBridgeClient, username, password, timeout = 20000 }
         error: error.message || 'SellerSprite login form interaction failed.'
       };
       if (attempt === 2) break;
+
+      // 重试前等待更长时间并重新切换标签
+      await new Promise(resolve => setTimeout(resolve, 1000));
       if (typeof chromeBridgeClient.switchTab === 'function') {
         try {
           await chromeBridgeClient.switchTab('sellersprite.com', Math.min(timeout, 10000));
+          await new Promise(resolve => setTimeout(resolve, 500));
         } catch (_) {
-          // The next attempt may still land on the active navigating tab.
+          // 继续下一次尝试
         }
       }
-      await new Promise(resolve => setTimeout(resolve, 500));
     }
+  }
+
+  // 处理找不到输入框的情况
+  if (formResult.inputs_not_found) {
+    return {
+      ...formResult,
+      success: false,
+      login_url: LOGIN_URL,
+      needs_manual_action: true,
+      error: 'SellerSprite login form inputs not found after multiple attempts. The page structure may have changed or requires manual verification.'
+    };
   }
 
   if (formResult.success === false) {
@@ -775,6 +826,9 @@ async function login({ chromeBridgeClient, username, password, timeout = 20000 }
       error: 'SellerSprite credential error: username or password is incorrect.'
     };
   }
+
+  // 提交表单后等待页面响应
+  await new Promise(resolve => setTimeout(resolve, 1500));
 
   const immediatePageInfoResult = await chromeBridgeClient.getPageInfo(Math.min(timeout, 5000));
   if (isLoggedInPage(immediatePageInfoResult)) {

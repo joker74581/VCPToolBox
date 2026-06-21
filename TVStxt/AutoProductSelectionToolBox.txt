@@ -1,77 +1,231 @@
-# AutoProductSelection (自动选品) 工具箱
+# AutoProductSelection 自动选品工具箱 API 字典
 
-`AutoProductSelection` 专门管理自动选品的状态机流程。**它本身不进行任何商品数据抓取**。抓取选品数据、查市场证据等请继续使用 `ProductSelector` 或其他数据插件。
+当你被委托执行自动选品相关任务时，你可以使用以下工具来读写任务数据。请严格按照参数格式调用。
 
-## 默认执行协议 (优先读取)
+## 核心纪律
 
-- **【身份纪律】调用任何工具时，必须在请求体中附带 `maid:「始」你的真实Agent名字「末」`（例如 破壁_枢纽、破壁_鹰眼）。绝对禁止使用“小冰”等虚构身份！**
+- **【身份纪律】** 调用任何工具时，必须在请求体中附带 `maid:「始」你的真实Agent名字「末」`（例如 破壁_枢纽、破壁_鹰眼、破壁_熔炉）。
+- **【落墨留痕】** 读取策略文件、brief、raw、scored、failed 等关键文件时，必须加入 `ink:「始」mark_history「末」` 参数。
+- **【调用节奏】** 每一轮回复最多只发送 1 个 TOOL_REQUEST，等待工具摘要返回后再决定下一步。
 
-- 每次醒来第一步调用 `auto_selection_queue_status`。
-- 按 `next_action_hint` 推进；真实状态只看 `runs/` 文件，不看 AgentAssistant 口头完成。
-- 派发 worker：先调用 `auto_selection_prepare_dispatch`，再把返回的 `agent_assistant_request` 原样交给 AgentAssistant。
-- 等待 worker：只输出 `[[NextHeartbeat::120]]`，下一次醒来重新查队列。
-- `evaluate_scored`：优先调用 `auto_selection_apply_reviewer_decision`，不要手动拼 delete/clear/write/dispatch。
-- 最终发布或失败阻断：先发论坛/写日记，再调用 `auto_selection_archive_run`，成功后输出 `[[TaskComplete]]`。
-- `auto_selection_cleanup_run` 只清理残留，不能替代归档。
-- Coordinator 与 Worker 每轮最多只发 1 个 `TOOL_REQUEST`，等待工具摘要后再继续；不要在同一轮连续发多个工具块。
+[===vcp_fold:0.35::desc:AutoProductSelection 自动选品 新版协议 Min Evidence Pack 空数据容错 CVR保守修正 回环守卫 raw scored 数据结构===]
 
-常用命令速查：
+## 新版选品协议总则
 
-```text
-queue_status -> prepare_dispatch(worker=scout) -> AgentAssistant -> wait
-raw ready -> prepare_dispatch(worker=reviewer) -> AgentAssistant -> wait
-scored ready -> apply_reviewer_decision
-final/failed done -> archive_run -> [[TaskComplete]]
+- `ProductSelector` 不保证所有关键词都有数据。冷门长尾词、过窄词或卖家精灵未收录时可能返回空；空结果不是商业失败结论。
+- 鹰眼必须有限重试：同义词/父词最多补 1 次；同类数据连续 2 次为空后写入 `unfetchable_gaps`。
+- 熔炉不得因已写入 `unfetchable_gaps` 的字段继续回环，只能降低 `DataReliabilityScore` 并裁决。
+- 后端会对 scored 自动执行数学安全阀：CVR 保守修正、广告压力测试、Hard Gate、重复回环守卫。
+- 普通数据缺口达到软上限后，后端不会强行 failed，而会改派 reviewer 进入 `force_decision_mode` 输出终态裁决。
+
+## raw_data_pack 最小证据包要求
+
+鹰眼写入 raw 时应输出聚合证据，不要塞入大量原始评论、完整商品页或超长关键词表。必须包含：
+
+- `route_decision.action`: `EARLY_REJECT | PIVOT | DEEPEN | READY_FOR_FORGE`
+- `data_audit_inputs.tools_called`: 每次工具调用的 tool/query/status/timestamp/summary
+- `sample_counts`: 关键词、ASIN、商品页、评论样本量
+- `unfetchable_gaps`: 字段、原因、尝试过的查询
+- `keyword_market_summary`: 需求、购买、CVR、PPC、ABA 集中度摘要
+- `competitor_summary`: Top ASIN、价格、销量、评论、FBA、优势/弱点
+- `profitability_raw_estimates`: 价格、FBA、PPC、CPA、ACOS 范围
+- `review_insight_summary`: 样本量、差评痛点、差异化线索
+- `source_map`、`evidence_matrix`、`elimination_log`
+- 兼容旧字段：`conversion_rate_matrix`、`candidate_products`、`asin_source_map`
+
+## scored_candidate_pack 评审要求
+
+熔炉写入 scored 时必须先 Hard Gates，再评分，并保留旧字段兼容：
+
+- `hard_gates.passed` 与 `triggered_gates`
+- `scores.opportunity_score`
+- `scores.data_reliability_score`
+- `scores.execution_fit_score`
+- `scores.final_score`
+- `financial_factors`: UnitContribution、base/stress CVR、used/stress PPC、base/stress CPA、BreakEvenACOS、base/stress ad ratio
+- `data_reliability_audit`: 缺失字段、冲突信号、accepted_unfetchable_gaps、CVR 保守修正说明
+- `loopback_request`: 如需回环，必须指定 `missing_field`、`requested_tool`、`target_keywords` 或 `target_asins`，禁止笼统“继续调研”
+- 兼容旧字段：`demand_volume`、`differentiation_feasibility`、`competition_severity`、`compliance_risk`、`complexity_severity`、`data_confidence`
+
+[===vcp_fold:0.50::desc:AutoProductSelection 基础命令 trigger debug status read write archive queue run_file 运行文件===]
+
+## 0. 触发工作流 (auto_selection_trigger_run)
+
+**用途**: 启动或恢复自动选品工作流。工作流采用单轮闭环模式：触发启动 → 处理一个完整任务周期 → 自动销毁休眠。
+
+**参数**: 无
+
+**返回**:
+- `mode: "new"` - 创建新任务
+- `mode: "resume"` - 恢复未完成任务（系统重启后）
+- `active_runs` - 活动任务数
+
+**示例**：
+```
+<<<[TOOL_REQUEST]>>>
+maid:「始」破壁_枢纽「末」,
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_trigger_run「末」
+<<<[END_TOOL_REQUEST]>>>
 ```
 
-[===vcp_fold:0.35::desc:AutoProductSelection 自动选品 状态机 runs 队列 派发 scout reviewer 归档 回环 缺交付 AgentAssistant===]
+**注意**: 如果工作流已在运行，会返回错误。只有在工作流停止后才能重新触发。
 
-## 运行数据目录 (Runtime Directory)
+[===vcp_fold:0.55::desc:AutoProductSelection 诊断状态 debug queue workflow lock loopback counters 队列 锁 熔断===]
 
-```text
-Plugin/AutoProductSelection/runs/
-  brief/     # 任务大纲
-  raw/       # 原始数据结果
-  scored/    # 评分结果
-  failed/    # 失败记录
-  archived/  # 归档数据
-  locks/     # 线程锁
+## 0.1 诊断工作流状态 (auto_selection_debug_status)
+
+**用途**: 一键获取工作流的完整诊断报告，了解当前运行状态、卡在哪里、是否有错误。
+
+**参数**: 无
+
+**返回**: Markdown 格式的诊断报告，包含：
+1. **内存状态**: isWorkflowRunning, workflowState (IDLE/INIT/ACTIVE), consecutiveErrorCount, 定时器状态, 最近错误
+2. **物理锁状态**: runs/locks/ 目录下的锁文件列表及创建时间
+3. **队列状态**: 活动任务数, next_action_hint, 各阶段文件统计, Worker 缺失输出警告
+4. **熔断计数器**: 活动任务的 global/scout/reviewer loopback 计数器
+5. **诊断建议**: 智能分析当前状态并给出操作建议
+
+**示例**：
+```
+<<<[TOOL_REQUEST]>>>
+maid:「始」破壁_枢纽「末」,
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_debug_status「末」
+<<<[END_TOOL_REQUEST]>>>
 ```
 
-`runs/` 存放的是运行时的临时状态数据，请不要将真实的运行结果提交到公共代码库中。
+**使用场景**:
+- 工作流长时间无进展，想知道卡在哪里
+- 工作流意外停止，想知道原因
+- 怀疑死循环，想查看熔断计数器
+- 协调器锁卡死，想确认锁状态
 
-## 调用节奏 (Call Rhythm)
+**重要**: 这个命令可以在工作流运行中随时调用，也可以在工作流停止后作为 debug 工具使用。**不会影响工作流的正常运行**。
 
-自动选品 Worker 每一轮回复最多只发送 1 个 `TOOL_REQUEST`。等待工具摘要返回后，再基于结果决定下一步；不要在同一轮连续发多个工具块。
+[===vcp_fold:0.50::desc:AutoProductSelection 运行文件 write read archive raw scored failed brief 读写归档===]
 
-## 角色分工 (Roles)
+## 1. 写入运行文件 (auto_selection_write_run_file)
 
-- **协调者 (Coordinator)**：创建 brief 简报、分发调度 Worker 任务、读取队列状态、归档最终结果。
-- **侦察者 Worker (`worker=scout`)**：读取 brief 简报，去执行抓取，然后写回 raw（原始数据） 或 failed（失败记录）。
-- **审查者 Worker (`worker=reviewer`)**：读取 raw 原始数据，评估并写回 scored（打分） 或 failed（失败记录）。
+用于写入当前阶段的产出数据。
 
-兼容旧流程时也接受 `worker=hawkeye` 和 `worker=forge`，它们分别等价于 `scout` 和 `reviewer`。
+**参数**：
+- `run_id`: 「始」当前任务的运行ID「末」
+- `stage`: 「始」写入的阶段，可选值: 'brief' | 'raw' | 'scored' | 'failed'「末」
+- `content`: 「始」写入的具体内容（Markdown格式，必须包含要求的结构化YAML或JSON元数据）「末」
+- `overwrite`: 「始」是否覆盖已有文件，可选，默认 false「末」
 
-处理这些子任务的 AgentAssistant 名字配置在环境变量中：
-
-```text
-AUTO_SELECTION_SCOUT_AGENT_NAME
-AUTO_SELECTION_REVIEWER_AGENT_NAME
+**示例**：
+```
+<<<[TOOL_REQUEST]>>>
+maid:「始」破壁_鹰眼「末」,
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_write_run_file「末」,
+stage:「始」raw「末」,
+run_id:「始」APS-20260617-112233-desk-organizer「末」,
+content:「始」# Raw Data Pack
+...
+「末」
+<<<[END_TOOL_REQUEST]>>>
 ```
 
-## 选品策略配置文件
+## 2. 读取运行文件 (auto_selection_read_run_file)
 
-策略文件不是运行时数据，它是固定的配置文件：
+用于读取指定阶段的数据文件。
 
-```text
-Plugin/AutoProductSelection/AutoSelectionStrategyProfile.md
+**参数**：
+- `run_id`: 「始」当前任务的运行ID「末」
+- `stage`: 「始」读取的阶段，可选值: 'brief' | 'raw' | 'scored' | 'failed'「末」
+- `ink`: 「始」mark_history「末」（必须，用于追踪关键决策节点）
+
+**示例**：
+```
+<<<[TOOL_REQUEST]>>>
+maid:「始」破壁_熔炉「末」,
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_read_run_file「末」,
+stage:「始」raw「末」,
+run_id:「始」APS-20260617-112233-desk-organizer「末」,
+ink:「始」mark_history「末」
+<<<[END_TOOL_REQUEST]>>>
 ```
 
-在创建新的选品任务 (SelectionBrief) 前，请用普通的文件读取工具去阅读它。**绝对不要**使用 `auto_selection_read_run_file` 去读策略文件。
+## 3. 归档运行任务 (auto_selection_archive_run)
 
-## 队列状态 (Queue Status)
+当任务成功完成或彻底失败时，用于将任务移入归档。
 
-```text
+**参数**：
+- `run_id`: 「始」当前运行ID「末」
+- `stage`: 「始」归档来源阶段，可选值: 'scored' | 'failed' | 'raw' | 'brief'「末」（可选，不传则自动检测）
+
+**示例**：
+```
+<<<[TOOL_REQUEST]>>>
+maid:「始」破壁_枢纽「末」,
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_archive_run「末」,
+run_id:「始」APS-20260617-112233-desk-organizer「末」,
+stage:「始」scored「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+[===vcp_fold:0.65::desc:AutoProductSelection 派发 worker scout reviewer AgentAssistant apply_reviewer_decision loopback force_decision===]
+
+## 4. 应用评审决策 (auto_selection_apply_reviewer_decision)
+
+当需要将评审决定（如退回重试、放弃重选）应用到状态机时使用。
+
+**参数**：
+- `run_id`: 「始」当前运行ID「末」
+- `action`: 「始」可选，PUBLISH_FINAL | LOOPBACK_TO_SCOUT | DROP_AND_RESELECT「末」（可选，自动从 scored 文件提取）
+- `brief_content`: 「始」新 brief 内容「末」（LOOPBACK 或 DROP 时需要）
+- `new_run_id`: 「始」新运行ID「末」（DROP_AND_RESELECT 时可选）
+
+**示例**：
+```
+<<<[TOOL_REQUEST]>>>
+maid:「始」破壁_枢纽「末」,
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_apply_reviewer_decision「末」,
+run_id:「始」APS-20260617-112233-desk-organizer「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## 5. 准备派发 Worker (auto_selection_prepare_dispatch)
+
+准备派发鹰眼（scout）或熔炉（reviewer）执行任务。
+
+**参数**：
+- `worker`: 「始」scout | reviewer「末」（或旧名称 hawkeye | forge）
+- `run_id`: 「始」当前运行ID「末」
+- `brief_content`: 「始」brief 内容「末」（scout 新建时需要）
+- `overwrite_lock`: 「始」true | false「末」（可选，系统重启后建议 true）
+
+**示例**：
+```
+<<<[TOOL_REQUEST]>>>
+maid:「始」破壁_枢纽「末」,
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_prepare_dispatch「末」,
+worker:「始」scout「末」,
+run_id:「始」APS-20260617-112233-desk-organizer「末」,
+brief_content:「始」# SelectionBrief
+...
+「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+返回 `agent_assistant_request` 对象后，必须原样传递给 AgentAssistant。
+
+## 6. 队列状态查询 (auto_selection_queue_status)
+
+查询当前队列状态和下一步行动提示。
+
+**参数**：
+- `include_content`: 「始」true | false「末」（可选，是否包含文件内容，默认 false）
+
+**示例**：
+```
 <<<[TOOL_REQUEST]>>>
 maid:「始」破壁_枢纽「末」,
 tool_name:「始」AutoProductSelection「末」,
@@ -79,124 +233,71 @@ command:「始」auto_selection_queue_status「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-如果 `next_action_hint=retry_worker_once`，说明某个 Worker 已完成但没有写出 raw/scored/failed，且诊断认为只允许安全重试一次。此时请用该条 `worker_missing_outputs` 的 `run_id`、`lock_name` 和 `retry_count+1` 重新调用 `auto_selection_prepare_dispatch`：
+返回 `next_action_hint` 指示下一步操作。
 
-```text
+**注意**: 这个命令主要用于后端工作流驱动器，Agent 通常不需要直接调用。
+
+[===vcp_fold:0.80::desc:AutoProductSelection 最终发布 策略文件 VCPForum DailyNote TaskComplete 发帖 写日记 归档===]
+
+## 重要提醒
+
+1. **策略文件自动注入**：选品策略（`AutoSelectionStrategyProfile.zh-CN.md` 或 `AutoSelectionStrategyProfile.md`）由后端工作流自动读取并作为提示词一部分注入给破壁_枢纽，**枢纽无需且禁止**使用 `ServerFileOperator.ReadFile` 工具重复读取策略文件。
+
+
+2. **完成标记**：所有任务完成后必须输出 `[[TaskComplete]]`，不要以工具请求作为最后内容。
+
+3. **心跳标记**：不要输出 `[[NextHeartbeat::120]]`，后端驱动器会自动处理。所有任务完成后必须输出 `[[TaskComplete]]` 以清理 coordinator 锁。
+
+4. **不要复制占位符**：AgentAssistant 返回的 `{{VCP_ASYNC_RESULT::...}}` 占位符不要复制到回复中。
+
+5. **工作流控制**：不要试图通过调用工具来控制工作流流程，后端驱动器会自动推进。你只需专注执行被委托的单一任务。
+
+6. **最终发布顺序**：`ready_for_final_publication` 后必须先发论坛帖，再写 `选品公共日记本`，再调用 `auto_selection_archive_run`。论坛板块定义：成功选品发布至 `自动选品推荐板块`，失败/阻断归档发布至 `自动选品板块`。
+
+成功发帖示例：
+
+```
 <<<[TOOL_REQUEST]>>>
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_prepare_dispatch「末」,
-worker:「始」scout「末」,
-run_id:「始」APS-YYYYMMDD-topic「末」,
-overwrite_lock:「始」true「末」,
-retry_count:「始」1「末」,
-dispatch_reason:「始」missing_output_retry「末」
+maid:「始」破壁_枢纽「末」,
+tool_name:「始」VCPForum「末」,
+command:「始」CreatePost「末」,
+board:「始」自动选品推荐板块「末」,
+title:「始」[RECOMMEND] 选品研报标题「末」,
+content:「始」研报正文内容「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-如果 `next_action_hint=handle_worker_missing_output`，不要继续分发同一个 Worker；请调用 `auto_selection_mark_worker_missing_output` 写入 failed 并清理锁。
+失败/阻断发帖示例：
 
-[===vcp_fold:0.50::desc:AutoProductSelection 写brief 派发 AgentAssistant scout reviewer read raw scored VCP_ASYNC_RESULT 心跳===]
-
-## 编写任务简报 (Write A Brief)
-
-编写 Brief 时，作为协调者，请不要仅仅简单传递几个宽泛的关键词。你必须进行“多维解构”（思考判断）：基于总体战略方向，主动在 Brief 中为侦察者 (Scout) 提供 3-5 个不同角度的细分场景、长尾词或目标受众作为备选抓取方向，以便侦察者在遇到某方向数据不足时有明确的 fallback 路径。
-
-```text
+```
 <<<[TOOL_REQUEST]>>>
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_write_run_file「末」,
-stage:「始」brief「末」,
-run_id:「始」APS-YYYYMMDD-topic「末」,
-content:「始」# SelectionBrief
-...
-「末」
+maid:「始」破壁_枢纽「末」,
+tool_name:「始」VCPForum「末」,
+command:「始」CreatePost「末」,
+board:「始」自动选品板块「末」,
+title:「始」[REJECT] 自动选品阻断标题「末」,
+content:「始」阻断原因、关键证据、数据缺口与下一步处理「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-## 分发侦察任务 (Dispatch Scout)
+选品公共日记示例（一轮只写一条合并日记；注意：`Tag:` 行必须是 Content 的最后一行，否则 DailyNote 报 "Tag is missing"）：
 
-```text
+```
 <<<[TOOL_REQUEST]>>>
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_prepare_dispatch「末」,
-worker:「始」scout「末」,
-run_id:「始」APS-YYYYMMDD-topic「末」
+maid:「始」破壁_枢纽「末」,
+tool_name:「始」DailyNote「末」,
+command:「始」create「末」,
+folder:「始」选品公共日记本「末」,
+Date:「始」YYYY-MM-DD「末」,
+Content:「始ESCAPE」[HH:MM] [入选/观察/淘汰/数据不足] 产品方向 - 核心原因
+outcome:
+product_direction:
+primary_reason:
+secondary_reason:
+category:
+price_band:
+risk_tags:
+opportunity_tags:
+Tag: #入选或#排除 #主要原因 #品类 #风险「末ESCAPE」
 <<<[END_TOOL_REQUEST]>>>
 ```
-
-收到返回的 `agent_assistant_request` 负载后，请**立即原样调用** AgentAssistant 工具进行任务分发。
-
-AgentAssistant 提交成功后，如果返回 `{{VCP_ASYNC_RESULT::...}}` 占位符，不要把该占位符复制进你的回复。自动选品的真实状态只看 `AutoProductSelection/runs` 文件；等待 worker 时输出心跳，下一次醒来重新调用 `auto_selection_queue_status`。
-
-## 分发审查任务 (Dispatch Reviewer)
-
-```text
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_prepare_dispatch「末」,
-worker:「始」reviewer「末」,
-run_id:「始」APS-YYYYMMDD-topic「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-## 读取交接文件 (Read Handoff File)
-
-```text
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_read_run_file「末」,
-stage:「始」raw「末」,
-run_id:「始」APS-YYYYMMDD-topic「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-## 熔炉决策应用 (Apply Forge Decision)
-
-当 `next_action_hint=evaluate_scored` 时，协调者先读取 `scored` 判断是否需要发帖；如果 `post_forge_action.action=LOOPBACK_TO_SCOUT`、`LOOPBACK_TO_HAWKEYE` 或 `DROP_AND_RESELECT`，不要手动拼接 delete/clear/write/dispatch，直接调用：
-
-```text
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_apply_reviewer_decision「末」,
-run_id:「始」APS-YYYYMMDD-topic「末」,
-new_run_id:「始」APS-YYYYMMDD-new-topic「末」,  # DROP_AND_RESELECT 可选；不填则插件自动生成
-brief_content:「始」# Selection Brief...「末」      # DROP_AND_RESELECT 或回环补采时传入
-<<<[END_TOOL_REQUEST]>>>
-```
-
-- `LOOPBACK_TO_SCOUT` / `LOOPBACK_TO_HAWKEYE`：插件会保留 raw、删除 scored、清理旧锁、覆盖补采 brief，并返回 `agent_assistant_request`。
-- `DROP_AND_RESELECT`：插件会清理旧 run 的 brief/raw/scored/failed 和旧锁；遇到此动作代表 Reviewer 完全否决了当前方向。作为 Coordinator，你必须汲取失败教训，彻底更换关键词或方向，编写全新的 `brief_content` 传入；可传 `new_run_id`，不传则插件自动生成新 run，并准备新一轮 Scout 派发。绝对不要死磕在类似的词上。
-- `PUBLISH_FINAL`：插件只返回 `ready_for_final_publication`，请先发论坛和写 DailyNote，再归档。
-
-收到 `agent_assistant_request` 后，按返回字段调用 AgentAssistant；成功提交后输出 `[[NextHeartbeat::120]]`。
-
-[===vcp_fold:0.55::desc:AutoProductSelection 归档 archive cleanup missing_output locks TaskComplete DailyNote no_reply===]
-
-## 归档与清理 (Archive / Cleanup)
-
-最终发布或失败阻断完成后，使用低歧义归档命令：
-
-```text
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_archive_run「末」,
-run_id:「始」APS-YYYYMMDD-topic「末」,
-stage:「始」scored「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-失败归档时优先 `stage=failed`。如果 failed 文件不存在但 raw/scored/brief 仍在，插件会自动归档现有阶段文件并清理 residue。`auto_selection_cleanup_run` 只用于清理残留，不能替代最终归档。
-
-## 低层文件操作 (Low-level Operations)
-
-- `auto_selection_move_run_file`
-- `auto_selection_delete_run_file`
-- `auto_selection_cleanup_run`
-- `auto_selection_mark_worker_missing_output`
-- `auto_selection_clear_locks`
-
-如果在查询队列状态时发现一个 Worker 已经运行完成，但没有按照约定输出 raw/scored/failed 文件，请调用 `auto_selection_mark_worker_missing_output` 来标记缺失状态，防止流水线卡死。
-
-## 委托收尾纪律 (AgentAssistant Finalization)
-
-当协调者完成最终推荐归档、失败归档或阻断归档后，必须在同一轮回复末尾单独输出 `[[TaskComplete]]`。如果需要调用 DailyNote 写入《选品公共日记本》，最终归档阶段不要使用 `archery:no_reply` 作为最后动作；请等待 DailyNote 工具摘要返回，再输出简短完成说明和 `[[TaskComplete]]`。不要以工具请求作为整轮回复的最后内容，否则 AgentAssistant 会继续追问并可能进入空回复轮询。

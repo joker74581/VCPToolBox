@@ -1,62 +1,65 @@
-# Auto Product Selection Strategy Profile
+# 自动选品策略档案
 
-This public strategy profile is intentionally generic. Customize a private local copy for your own brand, budget, supplier constraints, marketplace account, or internal operating rules.
+这是一份给破壁_枢纽创建 SelectionBrief 时读取的策略档案。它不是运行文件，不属于 `runs/` 交接状态；创建 brief 前必须用普通文件读取工具读取本文件。
 
-## Purpose
+## 默认原则：宽泛探索
 
-- Give the Coordinator a concise source of strategy when creating a new SelectionBrief.
-- Keep strategy separate from runtime handoff files under `runs/`.
-- Make the plugin usable without private seller or brand context.
+- 除非本文件明确写入某个品类、关键词、价格带、目标人群或禁选方向，否则枢纽应默认进行开放式选品探索。
+- 宽泛探索不是随机乱选，而是从场景、人群、痛点、配件、周边、收纳、清洁、替换件、低成本改良和轻量差异化角度发散。
+- 不要因为历史淘汰过某个具体产品，就砍掉整个大类；应避开已失败的具体子方向，寻找相邻但不同的痛点入口。
+- Brief 应给鹰眼 3-5 个不同角度的英文种子词或微场景，避免只给一组近义词。
 
-## Default Marketplace And Budget
+## 默认市场与资金风格
 
 - `marketplace`: Amazon US
 - `price_band`: 25-150 USD
-- `capital_style`: small team, light inventory, limited upfront risk
-- `target_candidate_window`: 1-3 candidates per run
+- `capital_style`: 小团队、轻库存、低前期风险
+- `target_candidate_window`: 每次 1-3 个候选方向
 
-## Exploration Theme
+## 探索主题
 
-- `scan_theme`: open-ended product opportunity discovery within normal compliance and safety boundaries.
-- `strategic_angle`: prefer products with clear use cases, observable pain points, and room for lightweight differentiation.
-- `why_now`: identify ideas that can be quickly validated or rejected with accessible marketplace evidence.
+- `scan_theme`: 在合规和安全边界内做开放式产品机会发现
+- `strategic_angle`: 优先选择使用场景明确、评论痛点可观察、且有轻量差异化空间的产品
+- `why_now`: 优先寻找能用卖家精灵、Amazon 页面和评论快速验证或快速否定的机会
 
-## Preferred Opportunity Signals
+## 偏好的机会信号
 
-- Clear customer pain point.
-- Review complaints point to specific improvement opportunities.
-- Reasonable logistics profile.
-- Not dominated entirely by protected brands or heavy moats.
-- Price supports margin after marketplace fees, shipping, returns, and ads.
-- Evidence can be traced to concrete product examples, keywords, or market data.
+- 客户痛点清晰，且能从评论、关键词或竞品结构中追溯证据
+- 差评能指向具体改进点，例如尺寸、安装、收纳、清洁、耐用性、兼容性、包装或使用步骤
+- 物流特征合理，不重、不超大、不易碎，FBA 费用占售价比例可控
+- 不完全被强势品牌、专利、认证、头部 ASIN 或评论壁垒垄断
+- 售价能覆盖平台费、FBA、头程、包装、退货、优惠券和广告压力
+- 可以用低成本方式做差异化，不依赖复杂开模、大 MOQ 或长开发周期
 
-## Negative Signals
+## 负面信号
 
-- Very low price with little room for margin.
-- Heavy, fragile, regulated, or high-liability product class.
-- Strong brand monopoly with weak differentiation room.
-- Requires complex certification, support, or supply-chain depth.
-- Evidence is anecdotal and cannot be reproduced.
+- 价格过低，利润空间太薄，尤其是低于 20 USD 且 PPC 偏高的方向
+- FDA/医疗/补剂、服装鞋帽、儿童安全高风险、强认证、强监管或平台禁售风险
+- 超大件、重货、易碎、液体、强气味、高退货、高售后或安装失败风险
+- 明显强品牌绑定、侵权风险、专利壁垒或头部垄断
+- 需要复杂供应链、复杂质检、长交期或小卖家难以承受的首单资金
+- 证据无法复现，且关键字段多次抓取为空
 
-## Seed Keyword Guidance
+## 种子词建议
 
-- Provide at least three English seed keywords per new brief.
-- Use varied angles: scenario, pain point, product form, target user, material, or use environment.
-- Avoid three near-identical keywords.
+- 每个新 brief 至少提供 3 个英文种子词，推荐 3-5 个。
+- 种子词角度要分散：使用场景、痛点、产品形态、目标用户、材料、使用环境或周边配件。
+- 避免三个几乎重复的关键词。
+- 如果本文件没有指定强策略，优先从常青场景切入，例如家庭整理、厨房小工具、居家办公、旅行便利、宠物居家、园艺/爱好配件、车载/露营收纳等。或以3个月开发周期为期限，提前寻找季节性的产品，策略上要明确在brief中明确查看往年数据。
 
-## Output Preferences
+## 输出偏好
 
-- Start with a one-sentence conclusion.
-- Explain why the opportunity is worth reviewing.
-- For each candidate, include strengths, risks, evidence quality, and next validation steps.
-- Keep an elimination log, but eliminate specific products, keywords, or sub-directions rather than entire broad categories.
+- Brief 先用一句话说明本轮探索假设。
+- 明确目标场景、目标客户、预期价格带、排除红线和 3-5 个备选切入点。
+- 要求鹰眼做最小可判断证据包，而不是一次性写完整市场论文。
+- 最终报告要展示证据链、风险、缺口、Kill Criteria 和下一步最低成本验证动作。
 
-## Commonly Tuned Fields
+## 常调字段
 
 - `scan_theme`
 - `strategic_angle`
 - `why_now`
-- preferred scenarios
-- seed keyword style
+- 偏好的使用场景
+- 种子词风格
 - `price_band`
-- positive and negative signals
+- 正向和负向信号
