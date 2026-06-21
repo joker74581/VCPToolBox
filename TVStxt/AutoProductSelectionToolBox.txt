@@ -23,13 +23,14 @@
 鹰眼写入 raw 时应输出聚合证据，不要塞入大量原始评论、完整商品页或超长关键词表。必须包含：
 
 - `route_decision.action`: `EARLY_REJECT | PIVOT | DEEPEN | READY_FOR_FORGE`
+- `prescreen_log`: 每个并列候选方向的关键指标、强/中/弱评级、胜出或落选理由（多方向廉价预筛产物）
 - `data_audit_inputs.tools_called`: 每次工具调用的 tool/query/status/timestamp/summary
 - `sample_counts`: 关键词、ASIN、商品页、评论样本量
 - `unfetchable_gaps`: 字段、原因、尝试过的查询
 - `keyword_market_summary`: 需求、购买、CVR、PPC、ABA 集中度摘要
 - `competitor_summary`: Top ASIN、价格、销量、评论、FBA、优势/弱点
 - `profitability_raw_estimates`: 价格、FBA、PPC、CPA、ACOS 范围
-- `review_insight_summary`: 样本量、差评痛点、差异化线索
+- `review_insight_summary`: 样本量、差评痛点、差异化线索、`scene_vs_function_signal`（评论偏"好看/送礼/氛围"还是"能用/结实/功能"，供熔炉判定 listing_leverage）
 - `source_map`、`evidence_matrix`、`elimination_log`
 - 兼容旧字段：`conversion_rate_matrix`、`candidate_products`、`asin_source_map`
 
@@ -38,6 +39,7 @@
 熔炉写入 scored 时必须先 Hard Gates，再评分，并保留旧字段兼容：
 
 - `hard_gates.passed` 与 `triggered_gates`
+- `listing_leverage_score`: 0-1 场景代入弹性（摆件/玩具/礼品偏 1；锤子/扳手/替换件偏 0）。后端 v3 引擎用它放大差异化机会分，体现卖家 Listing 优势。
 - `scores.opportunity_score`
 - `scores.data_reliability_score`
 - `scores.execution_fit_score`
@@ -46,6 +48,8 @@
 - `data_reliability_audit`: 缺失字段、冲突信号、accepted_unfetchable_gaps、CVR 保守修正说明
 - `loopback_request`: 如需回环，必须指定 `missing_field`、`requested_tool`、`target_keywords` 或 `target_asins`，禁止笼统“继续调研”
 - 兼容旧字段：`demand_volume`、`differentiation_feasibility`、`competition_severity`、`compliance_risk`、`complexity_severity`、`data_confidence`
+
+后端写回 scored 时会自动追加 v3 数学块：`backend_math_validation_v2.v3_interval_decision`（point/optimistic/pessimistic/uncertainty_band/overall_trust/listing_leverage）与 `v3_pillars`（五支柱归一化值与权重）。熔炉无需手填这些，后端按区间决策复核动作。
 
 [===vcp_fold:0.50::desc:AutoProductSelection 基础命令 trigger debug status read write archive queue run_file 运行文件===]
 
@@ -102,6 +106,53 @@ command:「始」auto_selection_debug_status「末」
 - 协调器锁卡死，想确认锁状态
 
 **重要**: 这个命令可以在工作流运行中随时调用，也可以在工作流停止后作为 debug 工具使用。**不会影响工作流的正常运行**。
+
+## 0.2 切换调试模式 (auto_selection_toggle_debug)
+
+**用途**: 动态打开或关闭 AutoProductSelection 的详细调试日志输出，该配置会自动持久化保存在 config.env 中。
+
+**参数**:
+- `enable`: 「始」true | false「末」（可选，不传则自动反转当前状态）
+
+**示例**：
+```
+<<<[TOOL_REQUEST]>>>
+maid:「始」破壁_枢纽「末」,
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_toggle_debug「末」,
+enable:「始」true「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## 0.3 暂停工作流 (auto_selection_pause_workflow)
+
+**用途**: 手动暂停整个选品流程（注销定时器和清锁），但保留所有正在运行的任务状态机文件（Brief, Raw, Scored）。可通过再次调用 `auto_selection_trigger_run` 继续当前的选品流程。
+
+**参数**: 无
+
+**示例**：
+```
+<<<[TOOL_REQUEST]>>>
+maid:「始」破壁_枢纽「末」,
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_pause_workflow「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+## 0.4 中止并重置工作流 (auto_selection_abort_workflow)
+
+**用途**: 彻底中止当前这轮选品，销毁定时器，清除所有正在运行的临时状态机文件和文件锁（包括 Brief, Raw, Scored 以及 hawkeye/forge 锁）。下一次唤醒时将全新重新开始。
+
+**参数**: 无
+
+**示例**：
+```
+<<<[TOOL_REQUEST]>>>
+maid:「始」破壁_枢纽「末」,
+tool_name:「始」AutoProductSelection「末」,
+command:「始」auto_selection_abort_workflow「末」
+<<<[END_TOOL_REQUEST]>>>
+```
 
 [===vcp_fold:0.50::desc:AutoProductSelection 运行文件 write read archive raw scored failed brief 读写归档===]
 

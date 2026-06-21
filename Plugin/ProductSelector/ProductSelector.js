@@ -5,6 +5,7 @@ const { normalizeArgs, parseBoolean, SUPPORTED_TOP_LEVEL_CATEGORIES } = require(
 const { normalizeKeywordArgs, normalizeKeywordReverseArgs, normalizeKeywordConversionRateArgs } = require('./lib/keywordFilterNormalizer');
 const { parsePageInfo, parseKeywordPageInfo, normalizeKeywordTableData, normalizeKeywordReverseTableData, normalizeKeywordConversionRateTableData } = require('./lib/pageInfoParser');
 const { getSite, listSites } = require('./lib/siteRegistry');
+const { searchSellerSpriteCategories, getSellerSpriteCategoryIndexInfo } = require('./lib/sellerspriteCategorySearch');
 
 let pluginConfig = {};
 let debugMode = false;
@@ -1054,6 +1055,19 @@ async function handleBuildSellerSpriteUrl(args) {
     ],
     unknown_filters: normalized.unknown_filters
   };
+}
+
+async function handleSearchSellerSpriteCategories(args) {
+  const result = searchSellerSpriteCategories(args);
+  lastRun = {
+    command: 'search_sellersprite_categories',
+    site: 'sellersprite',
+    timestamp: nowIso(),
+    success: result.success !== false,
+    query: result.query,
+    result_count: Array.isArray(result.categories) ? result.categories.length : 0
+  };
+  return result;
 }
 
 async function handleBuildSellerSpriteKeywordUrl(args) {
@@ -3399,6 +3413,7 @@ function getStatus() {
       zh: category.zh,
       en: category.en
     })),
+    sellersprite_category_index: getSellerSpriteCategoryIndexInfo(),
     chromeBridgeClientReady: Boolean(chromeBridgeClient),
     browserQueue: {
       queued: browserTaskQueueDepth,
@@ -3424,6 +3439,8 @@ async function processToolCall(args = {}) {
         return await enqueueBrowserTask(command, () => runSellerSpriteResearch(args));
       case 'build_sellersprite_url':
         return await handleBuildSellerSpriteUrl(args);
+      case 'search_sellersprite_categories':
+        return await handleSearchSellerSpriteCategories(args);
       case 'run_sellersprite_competitor_lookup':
         return await enqueueBrowserTask(command, () => runSellerSpriteCompetitorLookup(args));
       case 'build_sellersprite_competitor_url':
@@ -3459,6 +3476,7 @@ async function processToolCall(args = {}) {
           supported_commands: [
             'run_sellersprite_research',
             'build_sellersprite_url',
+            'search_sellersprite_categories',
             'run_sellersprite_competitor_lookup',
             'build_sellersprite_competitor_url',
             'run_sellersprite_keyword_research',

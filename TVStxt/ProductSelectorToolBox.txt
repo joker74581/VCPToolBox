@@ -45,7 +45,9 @@ ProductSelector 只负责选品数据抓取与证据分析。自动选品的 run
 
 ### 抽象需求的自主处理
 - 当用户只给出抽象方向时，Agent 可以自主选择入口，不要机械追问参数。
-- 如果需要类目参数，优先调用 `get_status` 查看 `supported_categories`，只使用支持的顶层类目或插件内置别名，不要自造 nodeId。
+- 如果只是泛方向调研、初筛或看关键词大盘，产品选品默认可以不限定细分类目，直接用全类目/顶层类目看盘面。
+- 如果产品词明显是具体产品形态、容易跨类目，或首轮结果混杂，Agent 可以自主先调用 `search_sellersprite_categories` 找 SellerSprite 细分类目，再把选中的完整 `nodeIdPath` 作为 `nodeIdPaths` 传给 `run_sellersprite_research`。不要让用户必须显式下达“查类目”指令。
+- 细分类目只用于产品选品/必要时查竞品；关键词选品 `run_sellersprite_keyword_research` 仍只支持一级 `departments/categories`，不要把 `nodeIdPaths` 拼到关键词选品 URL。
 - 产品选品可无关键词：`run_sellersprite_research` 可以省略 `keywords`，只传合法 `categories` 和必要筛选条件。
 - 关键词选品可无关键词：`run_sellersprite_keyword_research` 可以省略 `includeKeywords`，只传 `departments` 和必要筛选条件。
 - 涉及月份趋势时，`month` 使用 `YYYYMM`。没有明确月份时，优先使用上一个已完整结算的数据月份；若用户明确问未来月份，可参考往年同期或最近完整月份，并在结论中说明口径。
@@ -110,7 +112,8 @@ keywords:「始」mushroom lamp「末」
 - `keywords` (String): 包含的关键词（若为全类目调研可省略）。
 - `market` (String): 站点，常用 `US`。
 - `size` (Number): 页面拉取条数，只允许 `20` / `60` / `100`。
-- `categories` (String): 顶层大类名/英文名/nodeId，必须来自 `get_status.supported_categories`。
+- `categories` (String): 顶层大类名/英文名/nodeId；用于粗类目。
+- `nodeIdPaths` (String/Array): SellerSprite 完整类目 id 路径；用于精准细分类目，优先来自 `search_sellersprite_categories` 返回的 `nodeIdPath`。
 - `minPrice` / `maxPrice` (Number): 价格范围。
 - `minReviews` / `maxReviews` (Number): 评论数范围。
 - `minSales` / `maxSales` (Number): 月销量范围。
@@ -136,6 +139,44 @@ keywords:「始」mushroom lamp「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
+## 细分类目检索 (`search_sellersprite_categories`)
+
+用于在产品选品前本地检索 SellerSprite 美国站细分类目，返回可传给 `run_sellersprite_research` 的完整 `nodeIdPath`。它不打开浏览器，不登录，不抓取数据，只帮助 Agent 把“咖啡机/咖啡杯/咖啡桌”这类跨类目词拆清楚。
+
+### 什么时候自主调用
+- 用户说的是具体产品形态：如“浴帘套装”“咖啡机”“猫砂盆”“台灯”。
+- 关键词天然跨类目：如 `coffee`、`case`、`cover`、`rack`、`storage`。
+- 第一次全类目产品选品结果混杂，需要二次收窄。
+- 用户要求限定在某个品类、类目或细分市场。
+
+### 什么时候不要调用
+- 用户只是要求泛方向初筛、看某关键词市场或先观察大盘时，可以直接全类目产品选品。
+- 关键词选品 `run_sellersprite_keyword_research` 不使用这个命令的子类目结果；关键词选品只传一级 `departments/categories`。
+
+### 常用调用示例
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」search_sellersprite_categories「末」
+query:「始」coffee maker「末」
+maxResults:「始」8「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
+返回候选后，选择最贴合的 1 个 `nodeIdPath`；如果方向天然分叉，选择 2-4 个分别串行验证。继续产品选品时保留用户原本的关键词、价格、销量、评论、评分、配送方式等筛选，只额外追加 `nodeIdPaths`：
+
+```text
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ProductSelector「末」
+command:「始」run_sellersprite_research「末」
+keywords:「始」coffee maker「末」
+nodeIdPaths:「始」1055398:284507:915194:7740213011:289745「末」
+minPrice:「始」20「末」
+maxPrice:「始」80「末」
+<<<[END_TOOL_REQUEST]>>>
+```
+
 
 ## 卖家精灵查竞品细则 (`run_sellersprite_competitor_lookup`)
 
@@ -158,7 +199,7 @@ seller:「始」Mapille「末」
 - **至少一个查询条件**：`asin/asins/product_url`、`keywords`、`brand/includeBrands`、`seller/includeSellers` 至少传一个。
 - **默认口径**：`market=US`，`monthName=bsr_sales_nearly`（最近30天），`nodeIdPaths=[]`（不选类目），`size=60`，按 `amz_unit` 倒序。
 - **ASIN 提取**：可直接传 ASIN，也可传 Amazon 商品链接；插件会自动提取 ASIN。
-- **类目**：用户明确要求限定类目时才传 `categories` 或 `nodeIdPaths`；类目仍必须来自 `get_status.supported_categories`。
+- **类目**：用户明确要求限定类目或结果混杂时才传 `categories` 或 `nodeIdPaths`；精准细分类目应来自 `search_sellersprite_categories`，顶层粗类目可来自 `get_status.supported_categories`。
 - **返回字段**：读取方式与产品选品完全一致。默认读取 `summary_markdown` 合并表；不要期待默认返回完整 `candidates`、`title`、`brand`、图片或详情链接。排障时才传 `include_candidates=true` 或 `result_mode=debug/full`。
 
 ### 常用参数说明
@@ -527,4 +568,4 @@ command:「始」get_status「末」
    - Agent 必须捕捉该状态，明确判定为商品下架/不存在，并告知用户商品已变狗/下架，停止重试。
 4. **账号密码错误**：如果返回结果包含 `credential_error=true`，说明系统配置的卖家精灵账号信息有误，必须立即终止调用并通知用户。
 5. **拦截与验证码**：如果调用任何抓取任务返回 `page_blocked=true` 或 `needs_manual_action=true`，说明页面触发了验证码。**此时不要重试或死循环调用**，应当请求主人在远程浏览器页面中进行人工滑块解锁。
-6. **类目参数限制**：产品选品和查竞品的 `categories` 只能传入 `get_status` 接口返回的 `supported_categories` 的 `nodeId`、英文名或中文名，禁止随意虚构不支持的类目名称。
+6. **类目参数限制**：产品选品和查竞品的粗类目 `categories` 使用 `get_status.supported_categories`；精准细分类目 `nodeIdPaths` 使用 `search_sellersprite_categories` 返回的完整 `nodeIdPath`。禁止随意虚构不存在的 nodeId。

@@ -39,7 +39,38 @@
       "type": "string",
       "description": "用于识别 reviewer AgentTask 归档文件的逗号分隔前缀。",
       "default": "APS_REVIEWER_,ProductSelectionReviewer_"
-    }
+    },
+    "APS_SCORE_SELLER_LISTING_SKILL": {
+      "type": "number",
+      "description": "v3评分：卖家的结构性Listing优势(0-1)。仅对'场景代入'型产品(listing_leverage高)放大机会分，对纯功能件几乎不影响。",
+      "default": 0.8
+    },
+    "APS_SCORE_LISTING_LEVERAGE_DEFAULT": {
+      "type": "number",
+      "description": "v3评分：当熔炉未给出 listing_leverage_score 时的默认代入感弹性(0-1)。0=纯功能/规格驱动，1=纯场景/情绪驱动。",
+      "default": 0.5
+    },
+    "APS_SCORE_LISTING_LEVERAGE_GAIN": {
+      "type": "number",
+      "description": "v3评分：Listing杠杆对差异化支柱的增益系数。越大，卖家Listing优势在感性产品上放大越明显。",
+      "default": 0.5
+    },
+    "APS_SCORE_W_DEMAND": { "type": "number", "description": "v3评分：需求支柱权重。", "default": 0.25 },
+    "APS_SCORE_W_COMPETITION": { "type": "number", "description": "v3评分：竞争余地支柱权重。", "default": 0.2 },
+    "APS_SCORE_W_PROFIT": { "type": "number", "description": "v3评分：利润支柱权重。", "default": 0.25 },
+    "APS_SCORE_W_DIFFERENTIATION": { "type": "number", "description": "v3评分：差异化支柱权重。", "default": 0.18 },
+    "APS_SCORE_W_EXECUTION": { "type": "number", "description": "v3评分：执行适配支柱权重。", "default": 0.12 },
+    "APS_SCORE_TRUST_DEMAND": { "type": "number", "description": "v3评分：需求字段信任度(DOM直抓，高)。", "default": 0.9 },
+    "APS_SCORE_TRUST_COMPETITION": { "type": "number", "description": "v3评分：竞争字段信任度。", "default": 0.85 },
+    "APS_SCORE_TRUST_PROFIT": { "type": "number", "description": "v3评分：利润/广告字段信任度(商机探测器派生，冷门词常失真，低)。", "default": 0.55 },
+    "APS_SCORE_TRUST_DIFFERENTIATION": { "type": "number", "description": "v3评分：差异化字段信任度。", "default": 0.7 },
+    "APS_SCORE_TRUST_EXECUTION": { "type": "number", "description": "v3评分：执行适配字段信任度。", "default": 0.75 },
+    "APS_SCORE_RECOMMEND_FLOOR": { "type": "number", "description": "v3评分：区间决策推荐线。悲观估计>=此值才按RECOMMEND原样发布。", "default": 62 },
+    "APS_SCORE_DROP_CEILING": { "type": "number", "description": "v3评分：区间决策淘汰线。乐观估计<此值才DROP，否则一律WATCHLIST发布(不静默丢弃)。", "default": 42 },
+    "APS_SCORE_UNCERTAINTY_MIN": { "type": "number", "description": "v3评分：满信任时的不确定带半宽。", "default": 5 },
+    "APS_SCORE_UNCERTAINTY_MAX": { "type": "number", "description": "v3评分：零信任时的不确定带半宽。", "default": 22 },
+    "APS_SCORE_PILLAR_FLOOR": { "type": "number", "description": "v3评分：几何平均支柱下限(避免log(0))。", "default": 0.05 },
+    "APS_SCORE_COMPLIANCE_MULT_FLOOR": { "type": "number", "description": "v3评分：非硬门区间的合规软降权下限。", "default": 0.55 }
   },
   "capabilities": {
     "invocationCommands": [
@@ -50,6 +81,18 @@
       {
         "command": "auto_selection_debug_status",
         "description": "One-click comprehensive workflow diagnostics. Returns a Markdown report with: 1) Memory state (isWorkflowRunning, workflowState, consecutiveErrorCount, lastWorkflowError), 2) Physical lock files in runs/locks/, 3) Queue status (active_runs, next_action_hint, stage file counts), 4) Circuit breaker counters from active tasks, 5) Diagnostic recommendations. No parameters required. Use this to understand what the workflow is doing, where it's stuck, or why it stopped."
+      },
+      {
+        "command": "auto_selection_toggle_debug",
+        "description": "Dynamically enable or disable detailed workflow logging (debugMode) in the running process. Parameters: optional enable (boolean, defaults to toggling current state). Returns the new debugMode value."
+      },
+      {
+        "command": "auto_selection_pause_workflow",
+        "description": "Pause the automated product-selection workflow. Stops the background timer and clears the coordinator lock, leaving all brief/raw/scored files intact. Running auto_selection_trigger_run will resume the workflow."
+      },
+      {
+        "command": "auto_selection_abort_workflow",
+        "description": "Abort the automated product-selection workflow and reset all state files. Stops the background timer, clears the coordinator lock, and deletes all active run files (brief, raw, scored, failed, and locks). Next run will start fresh."
       },
       {
         "command": "auto_selection_queue_status",

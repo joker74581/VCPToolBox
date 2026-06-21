@@ -184,11 +184,22 @@ function normalizeProductNodeIdPaths(value) {
   for (const item of raw) {
     const text = String(item || '').trim();
     if (!text) continue;
-    const topId = text.includes(':') ? text.split(':')[0] : text;
-    if (TOP_LEVEL_NODE_IDS.has(topId)) {
-      values.push(topId);
-    } else if (DESCENDANT_NODE_TOP_IDS.has(topId)) {
-      values.push(DESCENDANT_NODE_TOP_IDS.get(topId));
+    if (/^\d+(?::\d+)+$/.test(text)) {
+      const topId = text.split(':')[0];
+      if (TOP_LEVEL_NODE_IDS.has(topId)) {
+        values.push(text);
+      }
+      continue;
+    }
+    if (TOP_LEVEL_NODE_IDS.has(text)) {
+      values.push(text);
+    } else if (DESCENDANT_NODE_TOP_IDS.has(text)) {
+      values.push(DESCENDANT_NODE_TOP_IDS.get(text));
+    } else if (text.includes(':')) {
+      const topId = text.split(':')[0];
+      if (DESCENDANT_NODE_TOP_IDS.has(topId)) {
+        values.push(DESCENDANT_NODE_TOP_IDS.get(topId));
+      }
     }
   }
   return values.length > 0 ? Array.from(new Set(values)) : undefined;

@@ -50,8 +50,8 @@
 - 默认 `size=20`
 - `size` 只允许 `20 / 60 / 100`
 - 用户没有明确要求时，不要自动加价格、评论数、评分、销量等筛选
-- `categories` 必须来自 `get_status.supported_categories`
-- 不要自己猜 nodeId
+- 默认可全类目/顶层类目搜索；需要精准细分类目时，先调用 `search_sellersprite_categories`，再把返回的完整 `nodeIdPath` 作为 `nodeIdPaths` 传入
+- 完整 `nodeIdPaths` 必须原样保留，不要截断成顶层类目；价格、销量、评论、评分等筛选仍走原有参数拼接
 - 返回结果要精简，默认不保留 `title`、`brand`、`image_url`、`detail_url`、`id`
 - 默认 compact 结果通过 `summary_markdown` 返回一张合并 ASIN 表，不再返回完整 `candidates` JSON
 - 需要排障或机器消费完整候选对象时，使用 `result_mode=debug/full` 或显式 `include_candidates=true`
@@ -170,11 +170,12 @@
 
 类目是这次开发里最容易出错的点，所以统一规则如下：
 
-- 先调用 `get_status`
-- 读 `supported_categories`
-- 只用顶层类目
-- 不要自己拼不存在的 nodeId
-- 多个类目可能都合理时，可以分开尝试，但每次都要用合法白名单值
+- 泛方向/初筛产品选品默认可以不限定细分类目，保持全类目或顶层类目搜索。
+- 当产品词是明确形态、关键词跨类目、全类目结果混杂，或用户要求限定品类时，先调用 `search_sellersprite_categories`。
+- `search_sellersprite_categories` 只查本地索引，不打开浏览器；返回的 `nodeIdPath` 可直接传给 `run_sellersprite_research` / `build_sellersprite_url` 的 `nodeIdPaths`。
+- 传入完整 `nodeIdPaths` 时必须保留全路径，例如 `1055398:1063236:1063238:1063246:13159327011`，不要退化成 `1055398`。
+- `run_sellersprite_keyword_research` 不使用细分类目路径，仍只支持一级 `departments/categories`。
+- 多个细分类目都合理时，可以分开尝试，但每次都要使用 `search_sellersprite_categories` 返回的合法路径。
 
 ## 4. 输出字段
 

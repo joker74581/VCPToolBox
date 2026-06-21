@@ -35,6 +35,40 @@ function debugLog(...args) {
   if (debugMode) console.log('[AutoProductSelection]', ...args);
 }
 
+function logWorkflowEvent(message, isError = false) {
+  const time = nowIso();
+  const formatted = `[${time}] ${message}`;
+
+  if (isError) {
+    console.error(`[AutoProductSelection] ${message}`);
+  } else if (debugMode) {
+    console.log(`[AutoProductSelection] ${message}`);
+  }
+
+  const historyPath = path.join(AUTO_SELECTION_RUNS_DIR, 'workflow_history.log');
+  try {
+    const fsSync = require('fs');
+    const dir = path.dirname(historyPath);
+    if (!fsSync.existsSync(dir)) {
+      fsSync.mkdirSync(dir, { recursive: true });
+    }
+
+    let content = '';
+    if (fsSync.existsSync(historyPath)) {
+      content = fsSync.readFileSync(historyPath, 'utf8');
+    }
+    const lines = content.split('\n').filter(Boolean);
+    lines.push(formatted);
+    if (lines.length > 500) {
+      lines.splice(0, lines.length - 500);
+    }
+    fsSync.writeFileSync(historyPath, lines.join('\n') + '\n', 'utf8');
+  } catch (err) {
+    console.error('[AutoProductSelection] Failed to write workflow history log:', err.message);
+  }
+}
+
+
 function parsePrefixList(value) {
   return String(value || '')
     .split(',')
@@ -42,7 +76,63 @@ function parsePrefixList(value) {
     .filter(Boolean);
 }
 
+// --- v3 Scoring Engine config (every constant overridable via config.env) ---
+// The scoring engine is fully data-driven so different sellers can retune it for
+// their own edge without touching code. Each key maps to an env var APS_SCORE_<KEY>.
+// Opportunity is a WEIGHTED GEOMETRIC MEAN of pillars (not the old fully-
+// multiplicative chain), so several "good enough" pillars no longer collapse a
+// direction to an un-publishable score, while a near-dead pillar still drags hard.
+const SCORING_DEFAULTS = {
+  // Pillar weights (relative; normalized at use).
+  w_demand: 0.25,
+  w_competition: 0.20,
+  w_profit: 0.25,
+  w_differentiation: 0.18,
+  w_execution: 0.12,
+  // Per-pillar input trust (0-1). High for DOM-scraped fields (search volume, BSR,
+  // review_count, price); low for 商机探测器-derived CVR/CPA/ACOS on cold keywords,
+  // which the seller has flagged as frequently distorted.
+  trust_demand: 0.90,
+  trust_competition: 0.85,
+  trust_profit: 0.55,
+  trust_differentiation: 0.70,
+  trust_execution: 0.75,
+  // Listing leverage = how much the BUY decision is scene/emotion/presentation driven
+  // (decor/toys/gifts -> high) vs raw-spec driven (tools/replacement parts -> low).
+  // seller_listing_skill is the seller's fixed structural edge in presentation.
+  // The differentiation pillar is boosted by leverage*skill, so the seller's listing
+  // edge pays off on 代入感 products and barely moves on purely functional ones.
+  seller_listing_skill: 0.8,
+  listing_leverage_default: 0.5,
+  listing_leverage_gain: 0.5,
+  // Geometric-mean pillar floor (avoid log(0); a truly dead pillar still bottoms out).
+  pillar_floor: 0.05,
+  // Interval decision thresholds on the 0-100 point estimate.
+  recommend_floor: 62, // P - U >= this -> strong enough to publish as-is (RECOMMEND)
+  drop_ceiling: 42,    // P + U <  this -> even the optimistic estimate fails -> DROP
+  uncertainty_min: 5,  // band half-width at full trust
+  uncertainty_max: 22, // band half-width at zero trust
+  // Compliance soft multiplier floor for the non-gate range (>=9 is a hard gate).
+  compliance_mult_floor: 0.55
+};
+let SCORING_CONFIG = { ...SCORING_DEFAULTS };
+
+function loadScoringConfig(config = {}) {
+  const next = { ...SCORING_DEFAULTS };
+  for (const key of Object.keys(SCORING_DEFAULTS)) {
+    const envKey = `APS_SCORE_${key.toUpperCase()}`;
+    const raw = config[envKey] ?? process.env[envKey];
+    if (raw !== undefined && raw !== null && String(raw).trim() !== '') {
+      const num = Number(raw);
+      if (Number.isFinite(num)) next[key] = num;
+    }
+  }
+  SCORING_CONFIG = next;
+  return SCORING_CONFIG;
+}
+
 function configureAutoSelectionRuntime(config = {}) {
+  loadScoringConfig(config);
   AUTO_SELECTION_SCOUT_AGENT_NAME = String(
     config.AUTO_SELECTION_SCOUT_AGENT_NAME ||
     process.env.AUTO_SELECTION_SCOUT_AGENT_NAME ||
@@ -714,7 +804,8 @@ async function autoSelectionWriteRunFile(args = {}) {
       const scoreResults = calculateScoringModel(content);
       const originalAction = normalizeForgeAction(args.action || extractForgeAction(content) || '');
       const writeReselectCount = Math.max(parseLoopbackCounters(content).reselect_count || 0, reselectCountThisTrigger || 0);
-      const action = decideBackendAction(originalAction, scoreResults, content, writeReselectCount);
+      const isForceDecision = await isForgeLockInForceDecisionMode(runId) || parseBoolean(args.force_decision_mode ?? args.forceDecisionMode, false);
+      const action = decideBackendAction(originalAction, scoreResults, content, writeReselectCount, isForceDecision);
       fileContent = updateScoredContentWithMath(content, scoreResults, action, originalAction);
     } catch (e) {
       debugLog(`Error applying math scoring model during file write: ${e.message}`);
@@ -790,15 +881,21 @@ ${callRhythmInstruction}
 ## 你的任务
 读取 brief 并基于其指示抓取数据。如果是回环补采，请保留旧数据合并写回 raw。
 
+## 多方向廉价预筛（核心工作法）
+brief 通常给你 2-3 个并列候选方向。你必须**先用最便宜的工具横向体检所有方向，只把最有潜力的 1 个深挖**，避免在弱方向上浪费昂贵抓取。
+1. **横向 Level 1 体检（便宜，先做）**：对每个候选方向，只用 run_sellersprite_keyword_research / run_sellersprite_competitor_lookup（必要时 keyword_conversion_rate）快速取需求、购买、价格带、需供比、评论门槛、FBA/price、头部集中度。给每个方向一个粗评级（强/中/弱）并写入 prescreen_log（方向、关键指标、评级、理由）。
+2. **挑最优 1 个纵向深挖（贵，后做）**：只对体检最强的方向做 Level 2（关键词反查、fetch_amazon_product_info、fetch_amazon_reviews）。落选方向写入 elimination_log，不再花昂贵抓取。
+3. **全部方向都弱**：直接 EARLY_REJECT，在 prescreen_log 说明依据，不要硬深挖。
+
 ## 硬性约束
-- ProductSelector 数据命令最多 6 次
+- ProductSelector 数据命令最多 6 次（横向体检尽量每方向 1-2 次，把预算留给深挖）
 - 遇到 429/500、账号错误、验证码、页面阻断等系统级错误立即停止，写 failed 或 partial raw，绝不循环重试
 - 普通冷门长尾词空结果不是失败结论：允许同义词/父词重试 1 次；同类数据连续 2 次为空后写入 unfetchable_gaps
 - 不要死板遵循固定流程，灵活 Pivot（关键词、价格带、市场），但回环补采只能补 reviewer 指定字段
 
 ## 数据采集原则
-1. **Level 1 方向体检**: 优先抓关键词选品、关键词转化率、产品/竞品基础表。判断需求、购买、PPC、CVR、价格带、评论门槛、FBA占比、头部集中度。
-2. **Level 2 候选验证**: 只有方向有潜力时，再做关键词反查、Amazon 商品页、Amazon 评论。
+1. **Level 1 方向体检**: 优先抓关键词选品、竞品基础表（便宜入口）。判断需求、购买、PPC、CVR、价格带、评论门槛、FBA占比、头部集中度。
+2. **Level 2 候选验证**: 只有方向胜出时，再做关键词反查、Amazon 商品页、Amazon 评论。
 3. **Level 3 回环补采**: 只补 brief/loopback_request 指定的 tool、keyword、asin、field；保留旧 raw，合并写回，overwrite=true。
 4. **证据最小化**: raw 输出聚合摘要、样本统计、异常说明和 source_map，不塞长评论原文或超长关键词表。
 5. **果断早停**: 如果低客单价高 PPC、需求低供给高、Review/ABA 高集中、FBA/price>25%、红线品类或广告明显倒挂，允许 EARLY_REJECT。
@@ -810,8 +907,10 @@ ${counterInstruction}
 ## 交付要求
 成功或部分成功时写 raw_data_pack 到 raw；工具阻断或完全无数据写 failed。必须在 YAML 中包含：
 - route_decision (EARLY_REJECT | PIVOT | DEEPEN | READY_FOR_FORGE)
+- prescreen_log（每个候选方向的关键指标、强/中/弱评级、为何胜出或落选）
 - data_audit_inputs.tools_called / sample_counts / unfetchable_gaps / outlier_notes
 - keyword_market_summary / competitor_summary / profitability_raw_estimates / review_insight_summary
+- review_insight_summary 中尽量给出 scene_vs_function_signal：评论高频词偏"好看/送礼/氛围/设计"还是偏"能用/结实/尺寸/功能"，供熔炉判定 listing_leverage
 - source_map / evidence_matrix / elimination_log
 - conversion_rate_matrix 与 candidate_products 旧字段仍要保留，方便兼容旧报告读取
 - 每个候选 ASIN 必须带 Amazon URL、售价、月销量或销量口径、review_count、rating、FBA费用或缺失说明
@@ -853,11 +952,18 @@ SellerSprite click_conversion_rate 是行业参考，必须保守修正。默认
 
 空数据不是自动失败。如果 Scout 已把字段写入 unfetchable_gaps，你不得因同一字段继续 LOOPBACK，只能降低 DataReliabilityScore 并裁决。
 
+## Listing 场景代入杠杆（listing_leverage_score，重要）
+本卖家的核心优势是 Listing 呈现能力（主图、A+、场景代入）显著强于同档竞品。但这个优势只在"购买决策由场景/情绪/呈现驱动"的产品上有效，对"纯功能/规格驱动"的产品意义不大。你必须输出 listing_leverage_score（0-1）供后端放大差异化机会分：
+- 偏 1（高杠杆）：摆件、装饰、玩具、礼品、家居氛围、收纳美学等——评论高频词偏"好看/送礼/氛围/搭配/设计"，主图与场景图能强烈影响转化。
+- 偏 0（低杠杆）：锤子、扳手、线缆、替换件、纯工具件——评论高频词偏"能用/结实/尺寸/兼容/功能"，listing 做得再好也难拉开差距。
+- 判定依据：优先用 Scout 的 review_insight_summary.scene_vs_function_signal 与差评痛点类型；无评论样本时按品类常识保守取 0.4-0.6 并说明口径。
+
 ## 输出要求
 必须包含：
 - analysis_status (SUCCESS | PARTIAL | DATA_CORRUPTED)
 - final_disposition (verdict: RECOMMEND | WATCHLIST | RESEARCH_GAP | REJECT | DATA_INSUFFICIENT)
 - post_forge_action (action: PUBLISH_FINAL | LOOPBACK_TO_SCOUT | DROP_AND_RESELECT)
+- listing_leverage_score（0-1，场景代入弹性，附一句判定理由）
 - loopback_request（如回环，必须指定 missing_field/requested_tool/target_keywords/target_asins/required_fields/max_additional_tool_calls/stop_after_this_loop）
 - hard_gates / scores / score_inputs / multipliers / financial_factors / data_reliability_audit
 - business_analysis / product_optimization_directions / key_risks / kill_criteria / next_validation_steps / elimination_summary
@@ -1270,7 +1376,8 @@ async function autoSelectionApplyForgeDecision(args = {}, commandName = 'auto_se
   // Fall back to the in-memory counter if the file has no persisted value yet.
   const persistedCounters = parseLoopbackCounters(scoredContent);
   const effectiveReselectCount = Math.max(persistedCounters.reselect_count || 0, reselectCountThisTrigger || 0);
-  const action = decideBackendAction(originalAction, scoreResults, scoredContent, effectiveReselectCount);
+  const isForceDecision = await isForgeLockInForceDecisionMode(runId) || parseBoolean(args.force_decision_mode ?? args.forceDecisionMode, false);
+  const action = decideBackendAction(originalAction, scoreResults, scoredContent, effectiveReselectCount, isForceDecision);
 
   // Update scored file content with calculated score on disk
   const updatedScoredContent = updateScoredContentWithMath(scoredContent, scoreResults, action, originalAction);
@@ -1349,21 +1456,24 @@ async function autoSelectionApplyForgeDecision(args = {}, commandName = 'auto_se
         force_decision_mode: true,
         reviewer_instruction: reviewerInstruction
       });
+      if (dispatch.success && dispatch.agent_assistant_request) {
+        await callAgentAssistant(dispatch.agent_assistant_request);
+      }
       return {
         success: true,
         command: commandName,
         run_id: runId,
         action: 'FORCE_DECISION_REVIEW',
         original_action: action,
-        state_transition: 'loopback_denied_force_review_prepared',
+        state_transition: 'loopback_denied_force_review_dispatched_automatically',
         denied_loopback_reason: loopbackGuard.reason,
         loopback_request: loopbackGuard.request,
         removed_scored: removedScored.removed,
         lock_cleanup: lockCleanup.removed || [],
-        agent_assistant_request: dispatch.agent_assistant_request,
+        message: '后端已自动向评审人员（Reviewer）派发强制决策命令，请输出 [[TaskComplete]] 结束当前轮次。',
         next_actions: [
-          'Call AgentAssistant with agent_assistant_request.',
-          'Do not post forum or write DailyNote before the force-decision scored file is written.'
+          'Output [[TaskComplete]] immediately to end your turn.',
+          'Do not call prepare_dispatch or AgentAssistant manually.'
         ]
       };
     }
@@ -1385,20 +1495,22 @@ async function autoSelectionApplyForgeDecision(args = {}, commandName = 'auto_se
       overwrite_lock: true,
       dispatch_reason: 'forge_loopback'
     });
+    if (dispatch.success && dispatch.agent_assistant_request) {
+      await callAgentAssistant(dispatch.agent_assistant_request);
+    }
     return {
       success: true,
       command: commandName,
       run_id: runId,
       action,
-      state_transition: 'scored_deleted_raw_preserved_scout_redispatch_prepared',
+      state_transition: 'loopback_dispatched_automatically',
       removed_scored: removedScored.removed,
       lock_cleanup: lockCleanup.removed || [],
       loopback_counters: newCounters,
-      agent_assistant_request: dispatch.agent_assistant_request,
+      message: '后端已自动向鹰眼（Scout）派发回环补采任务，请输出 [[TaskComplete]] 结束当前轮次。',
       next_actions: [
-        'Call AgentAssistant with agent_assistant_request.',
-        'Do not post forum or write DailyNote for a loopback.',
-        'After AgentAssistant succeeds, output [[NextHeartbeat::120]].'
+        'Output [[TaskComplete]] immediately to end your turn.',
+        'Do not call prepare_dispatch or AgentAssistant manually.'
       ]
     };
   }
@@ -1777,6 +1889,7 @@ async function autoSelectionTriggerRun(args = {}) {
     if (recoveryMode === 'clear_and_new') {
       // Clear all pending tasks and start fresh
       console.log(`[AutoProductSelection] Recovery mode: clear_and_new. Clearing ${activeRuns} pending tasks.`);
+      logWorkflowEvent(`Workflow triggered with recoveryMode=clear_and_new. Clearing ${activeRuns} pending tasks.`);
 
       const runIds = new Set();
       queue.derived?.active_briefs?.forEach(f => runIds.add(f.run_id));
@@ -1790,6 +1903,7 @@ async function autoSelectionTriggerRun(args = {}) {
 
       // Start new workflow
       console.log('[AutoProductSelection] Starting new workflow after cleanup...');
+      logWorkflowEvent('Starting new workflow after clear_and_new cleanup.');
       isWorkflowRunning = true;
       workflowState = 'INIT';
       startWorkflowDriver();
@@ -1806,6 +1920,7 @@ async function autoSelectionTriggerRun(args = {}) {
     } else if (recoveryMode === 'oldest_first' && activeRuns > 1) {
       // Multiple tasks: process oldest first, clean others
       console.log(`[AutoProductSelection] Recovery mode: oldest_first. Processing oldest, cleaning ${activeRuns - 1} others.`);
+      logWorkflowEvent(`Workflow triggered with recoveryMode=oldest_first. Cleaning ${activeRuns - 1} tasks.`);
 
       const allTasks = [
         ...(queue.derived?.active_briefs || []),
@@ -1833,6 +1948,7 @@ async function autoSelectionTriggerRun(args = {}) {
         }
 
         console.log(`[AutoProductSelection] Resuming oldest task: ${oldestRunId}`);
+        logWorkflowEvent(`Resuming oldest task: ${oldestRunId}`);
         isWorkflowRunning = true;
         workflowState = 'ACTIVE';
         startWorkflowDriver();
@@ -1852,6 +1968,7 @@ async function autoSelectionTriggerRun(args = {}) {
 
     // Default: resume mode (process all existing tasks)
     console.log(`[AutoProductSelection] Resuming ${activeRuns} existing task(s)...`);
+    logWorkflowEvent(`Workflow triggered. Resuming ${activeRuns} existing task(s).`);
 
     let warningMessage = '';
     if (activeRuns > 1) {
@@ -1874,6 +1991,7 @@ async function autoSelectionTriggerRun(args = {}) {
 
   // Start new workflow
   console.log('[AutoProductSelection] Starting new workflow...');
+  logWorkflowEvent('Workflow triggered. Starting new workflow.');
   isWorkflowRunning = true;
   workflowState = 'INIT';  // Mark as initiated
   startWorkflowDriver();
@@ -1894,10 +2012,23 @@ async function processToolCall(args = {}) {
         return await autoSelectionTriggerRun(args);
       case 'auto_selection_debug_status':
         return await autoSelectionDebugStatus(args);
+      case 'auto_selection_toggle_debug':
+        return await autoSelectionToggleDebug(args);
+      case 'auto_selection_pause_workflow':
+        return await autoSelectionPauseWorkflow(args);
+      case 'auto_selection_abort_workflow':
+        return await autoSelectionAbortWorkflow(args);
       case 'auto_selection_queue_status':
         return await autoSelectionQueueStatus(args);
-      case 'auto_selection_write_run_file':
-        return await autoSelectionWriteRunFile(args);
+      case 'auto_selection_write_run_file': {
+        const result = await autoSelectionWriteRunFile(args);
+        if (result && result.success !== false) {
+          const stage = args.stage;
+          const runId = args.run_id || args.runId;
+          triggerImmediateWorkflowTick(`agent_${stage}_write_file`, { runId, stage });
+        }
+        return result;
+      }
       case 'auto_selection_read_run_file':
         return await autoSelectionReadRunFile(args);
       case 'auto_selection_prepare_dispatch': {
@@ -1908,12 +2039,23 @@ async function processToolCall(args = {}) {
         return result;
       }
       case 'auto_selection_apply_forge_decision':
-      case 'auto_selection_apply_reviewer_decision':
-        return await autoSelectionApplyForgeDecision(args, command);
+      case 'auto_selection_apply_reviewer_decision': {
+        const result = await autoSelectionApplyForgeDecision(args, command);
+        if (result && result.success !== false) {
+          if (result.action !== 'PUBLISH_FINAL') {
+            await removeCoordinatorLock();
+          }
+          const runId = args.run_id || args.runId;
+          triggerImmediateWorkflowTick('coordinator_decision_applied', { runId, action: result.action });
+        }
+        return result;
+      }
       case 'auto_selection_archive_run': {
         const result = await autoSelectionArchiveRun(args);
         if (result && result.success !== false) {
           await removeCoordinatorLock();
+          const runId = args.run_id || args.runId;
+          triggerImmediateWorkflowTick('coordinator_archive_completed', { runId });
         }
         return result;
       }
@@ -1936,6 +2078,7 @@ async function processToolCall(args = {}) {
           supported_commands: [
             'auto_selection_trigger_run',
             'auto_selection_debug_status',
+            'auto_selection_toggle_debug',
             'auto_selection_queue_status',
             'auto_selection_write_run_file',
             'auto_selection_read_run_file',
@@ -1964,6 +2107,7 @@ async function processToolCall(args = {}) {
 
 // --- Workflow Driver State ---
 let isWorkflowRunning = false;        // 内存运行状态锁
+let isDriverExecuting = false;        // 并发互斥标志
 let workflowState = 'IDLE';           // 工作流生命周期状态: 'IDLE' | 'INIT' | 'ACTIVE'
 let workflowInterval = null;          // 定时器引用
 let consecutiveErrorCount = 0;        // 连续异常计数器
@@ -2053,17 +2197,18 @@ async function createCoordinatorLock(reason = 'delegation') {
     `reason: ${reason}`
   ].join('\n') + '\n';
   await fs.writeFile(lockPath, content, 'utf8');
-  debugLog('Coordinator lock created.');
+  logWorkflowEvent(`Created coordinator lock. Reason: ${reason}`);
 }
 
 async function removeCoordinatorLock() {
   const lockPath = path.join(AUTO_SELECTION_RUNS_DIR, 'locks', 'coordinator.lock');
   try {
     await fs.unlink(lockPath);
-    debugLog('Coordinator lock removed.');
+    logWorkflowEvent('Removed coordinator lock.');
   } catch (error) {
     if (error.code !== 'ENOENT') {
       console.error('[AutoProductSelection] Failed to remove coordinator lock:', error);
+      logWorkflowEvent(`Failed to remove coordinator lock: ${error.message}`, true);
     }
   }
 }
@@ -2110,6 +2255,131 @@ async function checkActiveCoordinatorTask() {
     return false; // 检查失败时假设无活跃任务
   }
 }
+
+/**
+ * Check if there is a failed coordinator task (破壁_枢纽) in the last 15 minutes
+ */
+async function checkFailedCoordinatorTask() {
+  try {
+    const entries = await fs.readdir(AGENT_TASK_DIR, { withFileTypes: true });
+    const coordinatorFiles = entries.filter(entry =>
+      entry.isFile() &&
+      entry.name.startsWith('破壁_枢纽_') &&
+      entry.name.endsWith('.md')
+    );
+
+    const matches = [];
+    for (const entry of coordinatorFiles) {
+      const fullPath = path.join(AGENT_TASK_DIR, entry.name);
+      const stat = await fs.stat(fullPath);
+      const fileAge = (Date.now() - stat.mtimeMs) / 1000 / 60; // minutes
+
+      // Only check tasks modified in the last 15 minutes
+      if (fileAge > 15) continue;
+
+      const content = await fs.readFile(fullPath, 'utf8');
+
+      // Check if it is related to AutoProductSelection and is marked Failed
+      if (content.includes('AutoProductSelection') || content.includes('auto_selection_')) {
+        if (content.includes('任务状态:** Failed')) {
+          matches.push({
+            name: entry.name,
+            modified_at: stat.mtimeMs,
+            content
+          });
+        }
+      }
+    }
+
+    if (matches.length === 0) return null;
+    // Sort by modified time descending to get the latest
+    matches.sort((a, b) => b.modified_at - a.modified_at);
+
+    const latest = matches[0];
+    const finalResult = latest.content.split('## 最终执行结果')[1]?.trim() || '';
+    const delegationId = (latest.name.match(/(aa-delegation-[^.]+)\.md$/) || [])[1] || '';
+
+    let detailError = '';
+    if (delegationId) {
+      const asyncResultPath = path.join(VCP_ROOT_DIR, 'VCPAsyncResults', `AgentAssistant-${delegationId}.json`);
+      try {
+        const asyncResult = JSON.parse(await fs.readFile(asyncResultPath, 'utf8'));
+        if (asyncResult && asyncResult.message) {
+          detailError = asyncResult.message;
+        }
+      } catch (_) { }
+    }
+
+    let errorSummary = finalResult.slice(0, 500);
+    if (detailError) {
+      errorSummary += ` (详细错误: ${detailError.slice(0, 500)})`;
+    }
+
+    return {
+      name: latest.name,
+      error: errorSummary || '未知错误导致任务失败'
+    };
+  } catch (error) {
+    debugLog(`Failed to check failed coordinator task: ${error.message}`);
+    return null;
+  }
+}
+
+async function checkLatestCoordinatorTaskStatus(lockMtimeMs) {
+  try {
+    const entries = await fs.readdir(AGENT_TASK_DIR, { withFileTypes: true });
+    const coordinatorFiles = entries.filter(entry =>
+      entry.isFile() &&
+      entry.name.startsWith('破壁_枢纽_') &&
+      entry.name.endsWith('.md')
+    );
+
+    if (coordinatorFiles.length === 0) return null;
+
+    const fileStats = [];
+    for (const entry of coordinatorFiles) {
+      const fullPath = path.join(AGENT_TASK_DIR, entry.name);
+      const stat = await fs.stat(fullPath);
+      // Filter by modification time first: must be within/after the lock creation time (with 5s grace period)
+      if (stat.mtimeMs >= lockMtimeMs - 5000) {
+        fileStats.push({ entry, mtimeMs: stat.mtimeMs, fullPath });
+      }
+    }
+
+    if (fileStats.length === 0) return null;
+
+    // Check files to find the latest AutoProductSelection task
+    const selectionTasks = [];
+    for (const file of fileStats) {
+      try {
+        const content = await fs.readFile(file.fullPath, 'utf8');
+        if (content.includes('AutoProductSelection') || content.includes('auto_selection_')) {
+          const isSucceed = content.includes('任务状态:** Succeed');
+          const isFailed = content.includes('任务状态:** Failed');
+          selectionTasks.push({
+            name: file.entry.name,
+            mtimeMs: file.mtimeMs,
+            status: isSucceed ? 'Succeed' : (isFailed ? 'Failed' : 'Running')
+          });
+        }
+      } catch (err) {
+        debugLog(`Failed to read coordinator task file ${file.fullPath}: ${err.message}`);
+      }
+    }
+
+    if (selectionTasks.length === 0) return null;
+
+    // Sort matching tasks by modification time descending
+    selectionTasks.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    return selectionTasks[0];
+  } catch (error) {
+    debugLog(`Failed to check latest coordinator task status: ${error.message}`);
+    return null;
+  }
+}
+
+
 
 /**
  * Parse loopback counters from run state file
@@ -2221,10 +2491,76 @@ function shouldTriggerCircuitBreaker(counters) {
 }
 
 /**
+ * Detect if a coordinator task (破壁_枢纽) for the given run has completed execution (Succeed/Failed).
+ */
+async function findCompletedCoordinatorTask(runId, taskType) {
+  try {
+    const entries = await fs.readdir(AGENT_TASK_DIR, { withFileTypes: true });
+    const coordinatorPrefixes = ['破壁_枢纽_'];
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+      const hasExpectedPrefix = coordinatorPrefixes.some(prefix => entry.name.startsWith(prefix));
+      if (!hasExpectedPrefix) continue;
+      const fullPath = path.join(AGENT_TASK_DIR, entry.name);
+      const content = await fs.readFile(fullPath, 'utf8');
+      if (!content.includes(runId)) continue;
+      if (!content.includes(taskType)) continue;
+      if (content.includes('任务状态:** Succeed') || content.includes('任务状态:** Failed')) {
+        return {
+          name: entry.name,
+          path: fullPath,
+          status: content.includes('任务状态:** Failed') ? 'Failed' : 'Succeed'
+        };
+      }
+    }
+    return null;
+  } catch (error) {
+    debugLog(`findCompletedCoordinatorTask failed for ${runId}: ${error.message}`);
+    return null;
+  }
+}
+
+/**
+ * Helper to check if a forge lock is configured in force_decision_mode.
+ */
+async function isForgeLockInForceDecisionMode(runId) {
+  try {
+    const lockPath = resolveAutoSelectionFile('locks', runId, 'forge');
+    const content = await fs.readFile(lockPath, 'utf8');
+    return content.includes('force_decision_mode: true');
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Trigger immediate workflow tick with 150ms buffer delay for filesystem flushing.
+ */
+function triggerImmediateWorkflowTick(source, context = {}) {
+  if (isWorkflowRunning && !isDriverExecuting) {
+    setTimeout(() => {
+      workflowDriver(source, context).catch(err => {
+        console.error(`[AutoProductSelection] Immediate tick triggered by ${source} failed:`, err);
+      });
+    }, 150);
+  }
+}
+
+/**
  * Main workflow driver that autonomously pushes the state machine forward.
  * Called on the WORKFLOW_TICK_INTERVAL_MS timer.
  */
-async function workflowDriver() {
+async function workflowDriver(triggerSource = 'watchdog', context = {}) {
+  if (isDriverExecuting) {
+    if (debugMode) {
+      logWorkflowEvent(`[WorkflowDriver] 收到来自 ${triggerSource} 的 Tick，但当前已有实例正在运行，跳过重入。`);
+    }
+    return;
+  }
+  isDriverExecuting = true;
+  if (debugMode) {
+    logWorkflowEvent(`>>> Tick 开始 | 触发源: ${triggerSource} | 上下文: ${JSON.stringify(context)}`);
+  }
   try {
     debugLog('Workflow driver tick started.');
 
@@ -2236,21 +2572,39 @@ async function workflowDriver() {
         const stat = await fs.stat(lockPath);
         const lockAge = (Date.now() - stat.mtimeMs) / 1000 / 60; // minutes
 
-        // Check if there's an active coordinator task
-        const hasActiveTask = await checkActiveCoordinatorTask();
-
-        if (!hasActiveTask && lockAge > 10) {
-          // No active coordinator task and lock is older than 10 minutes - orphaned lock
-          console.warn(`[AutoProductSelection WorkflowDriver] Coordinator lock orphaned (${Math.floor(lockAge)} minutes, no active task). Removing it.`);
-          await removeCoordinatorLock();
-        } else if (lockAge > 25) {
-          // Force cleanup after 25 minutes (increased from 15 to accommodate slow runs)
-          console.warn(`[AutoProductSelection WorkflowDriver] Coordinator lock is stale (${Math.floor(lockAge)} minutes old). Removing it.`);
+        // Check if there is a failed coordinator task
+        const failedTask = await checkFailedCoordinatorTask();
+        if (failedTask) {
+          logWorkflowEvent(`[Coordinator Task Failed] 协调器任务失败: ${failedTask.name}。错误原因: ${failedTask.error}。立即清除协调器锁以允许下一次重试。`, true);
           await removeCoordinatorLock();
         } else {
-          debugLog(`Coordinator lock exists (${Math.floor(lockAge)} minutes old) - waiting for delegation to complete.`);
-          consecutiveErrorCount = 0; // Reset error count on normal wait
-          return;
+          // Check if the latest coordinator task has successfully completed
+          const completedTask = await checkLatestCoordinatorTaskStatus(stat.mtimeMs);
+          if (completedTask && completedTask.status === 'Succeed') {
+            logWorkflowEvent(`[Coordinator Task Succeeded] 检测到协调器任务已执行完毕 (${completedTask.name})，但锁依然残留，后端执行自动解锁。`);
+            await removeCoordinatorLock();
+          } else {
+            // Check if there's an active coordinator task
+            const hasActiveTask = await checkActiveCoordinatorTask();
+
+            if (!hasActiveTask && lockAge > 10) {
+              // No active coordinator task and lock is older than 10 minutes - orphaned lock
+              console.warn(`[AutoProductSelection WorkflowDriver] Coordinator lock orphaned (${Math.floor(lockAge)} minutes, no active task). Removing it.`);
+              logWorkflowEvent(`Coordinator lock orphaned (${Math.floor(lockAge)} minutes old, no active task). Removing it.`);
+              await removeCoordinatorLock();
+            } else if (lockAge > 25) {
+              // Force cleanup after 25 minutes (increased from 15 to accommodate slow runs)
+              console.warn(`[AutoProductSelection WorkflowDriver] Coordinator lock is stale (${Math.floor(lockAge)} minutes old). Removing it.`);
+              logWorkflowEvent(`Coordinator lock is stale (${Math.floor(lockAge)} minutes old). Removing it.`);
+              await removeCoordinatorLock();
+            } else {
+              if (debugMode) {
+                logWorkflowEvent(`Coordinator lock exists (${Math.floor(lockAge)} minutes old, activeTask: ${hasActiveTask}) - waiting for delegation to complete.`);
+              }
+              consecutiveErrorCount = 0; // Reset error count on normal wait
+              return;
+            }
+          }
         }
       } catch (error) {
         // Lock file doesn't exist anymore, continue
@@ -2305,7 +2659,7 @@ async function workflowDriver() {
 
     // Check if this round has completed (lifecycle closure detection)
     if (workflowState === 'ACTIVE' && activeRuns === 0) {
-      console.log('[AutoProductSelection WorkflowDriver] Round completed - active runs returned to zero. Entering self-termination.');
+      logWorkflowEvent('Round completed - active runs returned to zero. Entering self-termination.');
       await stopWorkflowDriver();
       return;
     }
@@ -2363,11 +2717,18 @@ async function workflowDriver() {
     }
   } catch (error) {
     console.error('[AutoProductSelection WorkflowDriver] Error:', error);
+    logWorkflowEvent(`Error in workflowDriver: ${error.message || error}`, true);
     lastWorkflowError = error.stack || error.message || String(error);  // Record error
     consecutiveErrorCount++;
     if (consecutiveErrorCount >= MAX_CONSECUTIVE_ERRORS) {
       console.error('[AutoProductSelection WorkflowDriver] Max consecutive errors reached. Stopping workflow.');
+      logWorkflowEvent(`Max consecutive errors reached (${consecutiveErrorCount}). Stopping workflow.`, true);
       await stopWorkflowDriver();
+    }
+  } finally {
+    isDriverExecuting = false;
+    if (debugMode) {
+      logWorkflowEvent(`<<< Tick 结束 | 触发源: ${triggerSource}`);
     }
   }
 }
@@ -2400,6 +2761,21 @@ async function handleFailedRuns(queue) {
 
   const failed = failedFiles[0];
   debugLog(`Handling failed run: ${failed.run_id}`);
+
+  // Check if coordinator task has already completed but file remains unarchived (autocorrect / safety net)
+  const completedTask = await findCompletedCoordinatorTask(failed.run_id, 'handle_failed');
+  if (completedTask) {
+    console.warn(`[AutoProductSelection WorkflowDriver] 检测到协调器任务 "${completedTask.name}" 已执行完毕 (${completedTask.status})，但 failed 文件依然残留，后端执行自动归档兜底。`);
+    try {
+      await autoSelectionArchiveRun({ run_id: failed.run_id, stage: 'failed' });
+    } catch (err) {
+      console.error(`[AutoProductSelection WorkflowDriver] 自动归档 failed 残留文件失败:`, err.message);
+      await autoSelectionCleanupRun({ run_id: failed.run_id }).catch(() => { });
+    }
+    await removeCoordinatorLock();
+    failedDelegationAttempts.delete(failed.run_id);
+    return;
+  }
 
   // Loop backstop: count how many times we have delegated this failed run. If the
   // coordinator keeps failing to archive it, force-archive here so the queue drains.
@@ -2492,6 +2868,21 @@ async function handleEvaluateScored(queue) {
   const scored = scoredFiles[0];
   debugLog(`Handling scored evaluation: ${scored.run_id}`);
 
+  // Check if coordinator task has already completed but file remains unarchived (autocorrect / safety net)
+  const completedTask = await findCompletedCoordinatorTask(scored.run_id, 'evaluate_scored');
+  if (completedTask) {
+    console.warn(`[AutoProductSelection WorkflowDriver] 检测到协调器任务 "${completedTask.name}" 已执行完毕 (${completedTask.status})，但 scored 文件依然残留，后端执行自动归档兜底。`);
+    try {
+      await autoSelectionArchiveRun({ run_id: scored.run_id, stage: 'scored' });
+    } catch (err) {
+      console.error(`[AutoProductSelection WorkflowDriver] 自动归档 scored 残留文件失败:`, err.message);
+      await autoSelectionCleanupRun({ run_id: scored.run_id }).catch(() => { });
+    }
+    await removeCoordinatorLock();
+    scoredDelegationAttempts.delete(scored.run_id);
+    return;
+  }
+
   // Loop backstop: count how many times we have delegated this scored run. If the
   // coordinator keeps failing to archive/publish it, force-archive here so the queue drains.
   const attempts = (scoredDelegationAttempts.get(scored.run_id) || 0) + 1;
@@ -2577,25 +2968,38 @@ scored_file: ${scored.path}
 
    **如果返回 ready_for_final_publication（PUBLISH_FINAL）**：
 
-   a) 发布论坛帖子（VCPForum 工具）。标题格式：
-   [verdict] 自动选品研报：[产品方向] | FinalScore XX/100
+   a) 发布论坛帖子（VCPForum 工具）。这是一份**辅助商业决策的选品研报**，不是数据堆砌——读者要在 3 分钟内判断"这个机会要不要投入下一步真金白银验证"。标题格式：
+   [verdict] 选品研报：[产品方向] | 综合 XX/100（区间 YY-ZZ）
 
-   正文必须从 scored 文件提取，不要编造。结构：
-   - 一句话裁决：RECOMMEND / WATCHLIST / RESEARCH_GAP / REJECT / DATA_INSUFFICIENT
-   - 四分展示：OpportunityScore / DataReliabilityScore / ExecutionFitScore / FinalScore
-   - Hard Gates：是否通过、触发项和 warning
-   - 后端数学与广告压力测试：UnitContribution、base/stress CVR、used/stress PPC、base/stress CPA、BreakEvenACOS、base/stress ad ratio
-   - 市场需求证据：关键词搜索、购买、购买率、增长、需供比
-   - 竞争结构证据：Top ASIN、评论门槛、销量、ABA 集中度、自然/广告流量
-   - 利润与广告容错：费用表、贡献利润、FBA 占比、PPC 压力
-   - 差异化机会：来自差评痛点和场景组合的低成本改良
-   - 合规/侵权/平台风险
-   - 供应链与资金压力
-   - 数据置信度审计：missing_critical_fields、conflicting_signals、accepted_unfetchable_gaps、CVR 保守修正说明
-   - 缺口与假设：哪些数据最影响结论，关键假设错了是否会反转
-   - Kill Criteria
-   - Next Validation Plan
-   - 淘汰记录与经验标签
+   正文必须从 scored 文件提取真实数据，不要编造；缺失项写"未取得/不适用"。按以下结构（v3 算法口径）：
+
+   【一、决策摘要 TL;DR】（最重要，放最前）
+   - 一句话裁决 + 推荐动作：RECOMMEND（值得投入打样验证）/ WATCHLIST（有潜力，需人工确认关键假设）/ RESEARCH_GAP（方向可以，数据不足）/ REJECT / DATA_INSUFFICIENT。
+   - 综合分与置信区间：point_estimate XX/100，区间 [pessimistic, optimistic]，overall_trust。一句话解释区间宽窄意味着什么（带越宽=数据越不确定=结论越需人工复核）。
+   - 这条机会"成立的核心理由"和"最可能翻车的点"各一句。
+
+   【二、五支柱机会拆解】（v3 核心，用表格或清单）
+   逐个给出归一化值与权重：需求 demand / 竞争余地 competition / 利润 profit / 差异化 differentiation / 执行适配 execution。指出哪个支柱在拉高、哪个在拖累，几何平均下短板的影响。
+
+   【三、卖家优势契合度（Listing 场景代入杠杆）】（本系统差异化亮点）
+   - listing_leverage_score 及判定依据（评论偏"场景/情绪/送礼"还是"功能/规格"）。
+   - 明确说明：本品类能否发挥卖家"主图/A+/场景代入"的结构性优势？是感性代入型（优势显著）还是纯功能型（优势有限）？这直接影响是否值得投入做精品 Listing。
+
+   【四、市场需求证据】关键词搜索量/购买量/购买率/增长/需供比；真实需求是否被三角验证（关键词×竞品销量×评论增长）。
+
+   【五、竞争结构证据】Top ASIN 集中度、评论门槛、销量分布、ABA 点击/转化集中度、自然 vs 广告流量；头部是否垄断、有无利基缝隙。
+
+   【六、利润与广告容错】费用表（售价/referral/BOM/头程/FBA/包装/退货/优惠券/仓储）、UnitContribution 与利润率、base/stress CVR、used/stress PPC、base/stress CPA、BreakEvenACOS、base/stress ad ratio、paid_traffic_ratio 混合口径。明确：广告压力是否通过、亏不亏得起。
+
+   【七、差异化与低成本改良机会】来自差评痛点与场景组合、可低成本实现（不依赖开模/大 MOQ/长交期）的具体改良点。
+
+   【八、风险盘点】合规/侵权/专利/平台、供应链/资金/MOQ/交期、售后/退货/物流（重货易碎）；逐条标注严重度。
+
+   【九、数据置信度审计】missing_critical_fields、conflicting_signals、accepted_unfetchable_gaps、data_distortion_suspected 及失真信号、CVR 保守修正说明。点明"哪个假设错了结论会反转"。
+
+   【十、Kill Criteria（一票否决线）与 Next Validation Plan（最低成本下一步验证动作）】
+
+   【十一、本轮淘汰记录与经验标签】（若有淘汰汇总）
 
    b) 写入选品公共日记本。本轮只写一条合并日记，日记必须极简，不要复制研报全文。
    【重要：必须在 DailyNote.create 调用中显式传入 Date 参数（格式 YYYY-MM-DD，例如 Date:「始」2026-06-20「末」），绝对不能省略！】
@@ -2787,10 +3191,11 @@ async function handleRetryWorker(queue) {
 
   if (!eligible) return;
 
+  const worker = eligible.lock_name === 'forge' ? 'reviewer' : 'scout';
+  logWorkflowEvent(`[Worker Retry] 检测到 Worker 缺失输出且符合单次重试资格，正在重试 [${worker}]，Run ID: ${eligible.run_id}，重试次数: ${eligible.retry_count + 1}`);
   debugLog(`Retrying worker for run: ${eligible.run_id}, retry_count: ${eligible.retry_count}`);
 
   try {
-    const worker = eligible.lock_name === 'forge' ? 'reviewer' : 'scout';
     const dispatch = await autoSelectionPrepareDispatch({
       worker,
       run_id: eligible.run_id,
@@ -2801,21 +3206,23 @@ async function handleRetryWorker(queue) {
 
     if (dispatch.success && dispatch.agent_assistant_request) {
       await callAgentAssistant(dispatch.agent_assistant_request);
+      logWorkflowEvent(`[Worker Retry Success] 成功发起 Worker [${worker}] 重试，Run ID: ${eligible.run_id}`);
       debugLog(`Successfully retried worker for ${eligible.run_id}`);
+    } else {
+      logWorkflowEvent(`[Worker Retry Failed] 发起 Worker [${worker}] 重试失败: ${dispatch.error || 'prepare_dispatch 返回失败'}，Run ID: ${eligible.run_id}`, true);
     }
   } catch (error) {
     console.error(`[AutoProductSelection WorkflowDriver] Failed to retry worker for ${eligible.run_id}:`, error);
+    logWorkflowEvent(`[Worker Retry Failed] 发起 Worker [${worker}] 重试抛出异常: ${error.message}，Run ID: ${eligible.run_id}`, true);
   }
 }
 
-/**
- * Handle worker_missing_output - mark as failed and delegate to coordinator.
- */
 async function handleWorkerMissingOutput(queue) {
   const missingOutputs = queue.derived?.worker_missing_outputs || [];
   if (missingOutputs.length === 0) return;
 
   const missing = missingOutputs[0];
+  logWorkflowEvent(`[Worker Timeout/Missing] 检测到 Worker 缺失输出 [${missing.lock_name}]，Run ID: ${missing.run_id}。诊断分类: ${missing.retry_guard?.classification}，将标记为 failed 并移交给协调器处理。`);
   debugLog(`Handling worker missing output: ${missing.run_id}`);
 
   try {
@@ -2825,23 +3232,24 @@ async function handleWorkerMissingOutput(queue) {
     });
 
     if (markResult.success) {
+      logWorkflowEvent(`[Worker Timeout/Missing Handled] 成功标记 Run ID: ${missing.run_id} 为 failed 并清除其锁，移交协调器。`);
       debugLog(`Marked worker missing output for ${missing.run_id}, delegating to coordinator.`);
       await handleFailedRuns(await autoSelectionQueueStatus({ include_content: true }));
+    } else {
+      logWorkflowEvent(`[Worker Timeout/Missing Failed] 标记 Run ID: ${missing.run_id} 失败: ${markResult.error}`, true);
     }
   } catch (error) {
     console.error(`[AutoProductSelection WorkflowDriver] Failed to mark worker missing output for ${missing.run_id}:`, error);
+    logWorkflowEvent(`[Worker Timeout/Missing Failed] 标记 Run ID: ${missing.run_id} 发生异常: ${error.message}`, true);
   }
 }
 
-/**
- * Handle send_existing_brief_to_scout - dispatch scout with existing brief.
- * Fixed: Use overwrite_lock: true to prevent lock conflicts on restart.
- */
 async function handleSendBriefToScout(queue) {
   const activeBriefs = queue.derived?.active_briefs || [];
   if (activeBriefs.length === 0) return;
 
   const brief = activeBriefs[0];
+  logWorkflowEvent(`[Scout Dispatch] 检测到已存在 Brief 且未锁，重新派发 Scout，Run ID: ${brief.run_id}`);
   debugLog(`Dispatching scout for existing brief: ${brief.run_id}`);
 
   try {
@@ -2853,10 +3261,14 @@ async function handleSendBriefToScout(queue) {
 
     if (dispatch.success && dispatch.agent_assistant_request) {
       await callAgentAssistant(dispatch.agent_assistant_request);
+      logWorkflowEvent(`[Scout Dispatch Success] 成功发起 Scout 派发，Run ID: ${brief.run_id}`);
       debugLog(`Successfully dispatched scout for ${brief.run_id}`);
+    } else {
+      logWorkflowEvent(`[Scout Dispatch Failed] 派发 Scout 失败: ${dispatch.error || 'prepare_dispatch 返回失败'}，Run ID: ${brief.run_id}`, true);
     }
   } catch (error) {
     console.error(`[AutoProductSelection WorkflowDriver] Failed to dispatch scout for ${brief.run_id}:`, error);
+    logWorkflowEvent(`[Scout Dispatch Failed] 派发 Scout 发生异常: ${error.message}，Run ID: ${brief.run_id}`, true);
   }
 }
 
@@ -2864,6 +3276,7 @@ async function handleSendBriefToScout(queue) {
  * Handle create_brief_and_send_scout - delegate to 破壁_枢纽 to create new brief.
  */
 async function handleCreateBriefAndSendScout() {
+  logWorkflowEvent('Initiating new brief creation delegation to coordinator (破壁_枢纽).');
   debugLog('Delegating new brief creation to coordinator.');
 
   let strategyContent = '';
@@ -2914,6 +3327,7 @@ ${strategyContent}
 async function callAgentAssistant(agentRequest) {
   if (!resolveAgentAssistant()) {
     console.error('[AutoProductSelection WorkflowDriver] AgentAssistant plugin not available.');
+    logWorkflowEvent(`[Worker Dispatch Failed] AgentAssistant plugin not available to dispatch worker [${agentRequest?.agent_name}].`, true);
     return;
   }
 
@@ -2924,6 +3338,8 @@ async function callAgentAssistant(agentRequest) {
       finalPrompt = `${TOOLBOX_CONTENT}\n\n---\n\n${agentRequest.prompt}`;
     }
 
+    logWorkflowEvent(`[Worker Dispatch] 正在向 AgentAssistant 发送派发请求 [${agentRequest.agent_name}]`);
+
     const result = await AgentAssistantPlugin.processToolCall({
       command: 'request_agent_assistance',
       agent_name: agentRequest.agent_name,
@@ -2933,9 +3349,11 @@ async function callAgentAssistant(agentRequest) {
       inject_tools: agentRequest.inject_tools
     });
 
+    logWorkflowEvent(`[Worker Dispatch Success] 成功向 AgentAssistant 派发 [${agentRequest.agent_name}]`);
     debugLog(`AgentAssistant call result: ${JSON.stringify(result).slice(0, 200)}`);
   } catch (error) {
     console.error('[AutoProductSelection WorkflowDriver] Failed to call AgentAssistant:', error);
+    logWorkflowEvent(`[Worker Dispatch Failed] 派发 Worker [${agentRequest?.agent_name}] 失败: ${error.message}`, true);
   }
 }
 
@@ -2946,6 +3364,7 @@ async function callAgentAssistant(agentRequest) {
 async function delegateToCoordinator(taskType, runId, prompt) {
   if (!resolveAgentAssistant()) {
     console.error('[AutoProductSelection WorkflowDriver] AgentAssistant plugin not available for delegation.');
+    logWorkflowEvent(`AgentAssistant plugin not available for delegation [${taskType}] for run [${runId}].`, true);
 
     // Write failed state file to allow proper cleanup
     try {
@@ -2982,6 +3401,7 @@ async function delegateToCoordinator(taskType, runId, prompt) {
   try {
     // Create coordinator lock before delegation
     await createCoordinatorLock(taskType);
+    logWorkflowEvent(`Delegating task [${taskType}] for run [${runId}] to coordinator.`);
 
     // Inject ToolBox content if available
     let finalPrompt = prompt;
@@ -2998,9 +3418,11 @@ async function delegateToCoordinator(taskType, runId, prompt) {
       inject_tools: 'AutoProductSelection,ServerFileOperator,VCPForum,DailyNote'
     });
 
+    logWorkflowEvent(`Successfully called processToolCall to delegate [${taskType}] for run [${runId}].`);
     debugLog(`Delegated ${taskType} for ${runId} to coordinator: ${JSON.stringify(result).slice(0, 200)}`);
   } catch (error) {
     console.error(`[AutoProductSelection WorkflowDriver] Failed to delegate ${taskType} for ${runId}:`, error);
+    logWorkflowEvent(`Failed to delegate [${taskType}] for run [${runId}]: ${error.message}`, true);
 
     // Remove lock on delegation failure
     await removeCoordinatorLock();
@@ -3017,8 +3439,8 @@ function startWorkflowDriver() {
   }
 
   // Run immediately on startup, then on the configured interval
-  process.nextTick(workflowDriver);
-  workflowInterval = setInterval(workflowDriver, WORKFLOW_TICK_INTERVAL_MS);
+  process.nextTick(() => workflowDriver('trigger_run'));
+  workflowInterval = setInterval(() => workflowDriver('watchdog'), WORKFLOW_TICK_INTERVAL_MS);
   console.log(`[AutoProductSelection] Workflow driver started (${WORKFLOW_TICK_INTERVAL_MS / 1000}-second interval).`);
 }
 
@@ -3254,6 +3676,38 @@ async function autoSelectionDebugStatus(args = {}) {
       report.push('- 🔒 协调器锁存在，工作流暂停等待委托完成');
     }
 
+    const failedTask = await checkFailedCoordinatorTask();
+    if (failedTask) {
+      report.push(`- 🔴 **检测到协调器任务失败**: 最近 15 分钟内存在失败的协调器任务 [${failedTask.name}]。`);
+      report.push(`  - 失败原因: ${failedTask.error}`);
+      report.push(`  - 💡 协调器锁应已被自动清除，以防止工作流锁死。如果依然被锁，请尝试重新触发。`);
+    }
+
+    // 6. Workflow Execution History
+    report.push('');
+    report.push('## 6. 工作流执行历史');
+    report.push('');
+    try {
+      const historyPath = path.join(AUTO_SELECTION_RUNS_DIR, 'workflow_history.log');
+      const fsSync = require('fs');
+      if (fsSync.existsSync(historyPath)) {
+        const historyContent = fsSync.readFileSync(historyPath, 'utf8');
+        const lines = historyContent.split('\n').filter(Boolean).slice(-20);
+        if (lines.length === 0) {
+          report.push('- 🟢 暂无历史记录');
+        } else {
+          report.push('```text');
+          report.push(...lines);
+          report.push('```');
+        }
+      } else {
+        report.push('- 🟢 暂无历史记录文件');
+      }
+    } catch (historyErr) {
+      report.push(`- ⚠️  无法读取历史日志: ${historyErr.message}`);
+    }
+    report.push('');
+
     return {
       success: true,
       command: 'auto_selection_debug_status',
@@ -3288,11 +3742,13 @@ async function stopWorkflowDriver() {
     clearInterval(workflowInterval);
     workflowInterval = null;
     console.log('[AutoProductSelection] Workflow driver stopped.');
+    logWorkflowEvent('Workflow driver watchdog timer stopped.');
   }
 
   // Reset state
   isWorkflowRunning = false;
   workflowState = 'IDLE';  // Reset lifecycle flag
+  logWorkflowEvent('Workflow running state set to IDLE.');
   consecutiveErrorCount = 0;
   reselectCountThisTrigger = 0;  // Reset cross-direction reselect budget for next trigger
   createBriefCountThisTrigger = 0;  // Reset create_brief ceiling for next trigger
@@ -3366,9 +3822,24 @@ function findFirstNumber(content, keys = [], defaultValue = null) {
 }
 
 function findFirstRate(content, keys = [], defaultValue = null) {
-  const value = findFirstNumber(content, keys, defaultValue);
-  if (value === null || value === undefined || !Number.isFinite(Number(value))) return defaultValue;
-  return Number(value) > 1 ? Number(value) / 100 : Number(value);
+  // Percent-aware rate parsing. The authoritative signal for "this is a percentage"
+  // is a literal '%' in the source text, NOT the magnitude. Magnitude-guessing alone
+  // mis-reads any percent value <=1% (e.g. "1%", "1.0%", "0.5%") as a raw decimal,
+  // because parseMetricValue strips the '%'. So we re-extract the raw matched span and
+  // check for '%' first; only when no '%' is present do we fall back to the >1 heuristic.
+  for (const key of keys) {
+    for (const candidateKey of [key, `estimated_${key}`]) {
+      const regex = new RegExp(`\\b${escapeRegExp(candidateKey)}\\s*:\\s*['"]?([^\\r\\n#'"]+)`, 'i');
+      const match = String(content || '').match(regex);
+      if (!match) continue;
+      const rawSpan = match[1];
+      const num = parseMetricValue(rawSpan);
+      if (num === null || !Number.isFinite(num)) continue;
+      if (/%/.test(rawSpan)) return num / 100; // explicit percent: "1%"->0.01, "55%"->0.55
+      return num > 1 ? num / 100 : num;          // bare number: keep legacy magnitude heuristic
+    }
+  }
+  return defaultValue;
 }
 
 function hasAnyNumber(content, keys = []) {
@@ -3418,6 +3889,48 @@ function executionMultiplier(score) {
   if (score >= 50) return smoothMultiplier(score, 50, 65, 0.75, 0.92);
   if (score >= 35) return smoothMultiplier(score, 35, 50, 0.55, 0.75);
   return 0.45;
+}
+
+// --- v3 scoring helpers ---------------------------------------------------
+function clamp01(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(1, Math.max(0, n));
+}
+
+// Logistic-ish saturating map: value at `mid` -> 0.5, rising smoothly to 1.
+function saturate(value, mid, steepness = 1) {
+  const x = (Number(value) - mid) * steepness;
+  return 1 / (1 + Math.exp(-x));
+}
+
+// Listing-leverage boost on the differentiation pillar. L is how scene/emotion-driven
+// the category's buy decision is; sigma is the seller's structural listing edge. On a
+// purely functional product (L~0) the boost vanishes; on a 代入感 product (L~1) the
+// seller's edge meaningfully lifts achievable differentiation.
+function applyListingLeverage(diffBase, leverage, cfg) {
+  const L = clamp01(leverage);
+  const sigma = clamp01(cfg.seller_listing_skill);
+  const gain = Math.max(0, cfg.listing_leverage_gain);
+  const base = clamp01(diffBase);
+  return clamp01(base + L * sigma * (1 - base) * gain);
+}
+
+// Weighted geometric mean of pillars in [0,1]. A near-zero pillar drags the result
+// toward zero (a missing essential dimension is fatal), but several mid pillars
+// aggregate to a mid score instead of the multiplicative collapse of the old chain.
+function weightedGeometricMean(pillars, floor) {
+  let wSum = 0;
+  let logSum = 0;
+  for (const { value, weight } of pillars) {
+    const w = Math.max(0, weight);
+    if (w <= 0) continue;
+    const v = Math.max(floor, clamp01(value));
+    wSum += w;
+    logSum += w * Math.log(v);
+  }
+  if (wSum <= 0) return 0;
+  return Math.exp(logSum / wSum);
 }
 
 function calculateScoringModel(content) {
@@ -3694,15 +4207,67 @@ function calculateScoringModel(content) {
   const hardGateTriggered = detectHardGateFromContent(text, complianceRisk) || estimatedUnitContribution <= 0;
   if (hardGateTriggered) warnings.push('Hard Gate 或负贡献利润触发，FinalScore 强制为 0。');
 
-  const finalScore = hardGateTriggered
-    ? 0
-    : clampNumber(opportunityScore * confidence.multiplier * mExecutionFit);
+  // --- v3 pillar aggregation (weighted geometric mean + listing leverage) ---
+  const cfg = SCORING_CONFIG;
+  // listing_leverage: how scene/emotion-driven the buy decision is (0=pure spec/function,
+  // 1=pure 代入感/decor/gift). Reviewer may set listing_leverage_score directly; else default.
+  const leverageRaw = findFirstRate(text, ['listing_leverage_score', 'listing_leverage'], null);
+  const listingLeverage = leverageRaw !== null ? clamp01(leverageRaw) : clamp01(cfg.listing_leverage_default);
+
+  // Each pillar normalized to [0,1].
+  const demandPillar = clamp01(0.45 * (clampNumber(demandScore) / 100) +
+    0.30 * (clampNumber(growthScore) / 100) +
+    0.25 * (clampNumber(marketEntryScore) / 100));
+  // Competition headroom: lower severity -> more room. Geometric so a brutal market hurts.
+  const competitionPillar = clamp01(1 - (competitionSeverity / 10) * 0.85);
+  // Profit pillar from the (already sanitized) ad-economics multiplier, mapped to [0,1].
+  const profitPillar = estimatedUnitContribution <= 0 ? cfg.pillar_floor : clamp01(mProfitEffective / 1.2);
+  // Differentiation pillar gets the seller's listing-leverage boost.
+  const diffBase = clampNumber(differentiationScore) / 100;
+  const differentiationPillar = applyListingLeverage(diffBase, listingLeverage, cfg);
+  const executionPillar = clamp01(executionFitScore / 100);
+
+  // Compliance is a soft de-rate in the non-gate range (>=9 handled by hard gate).
+  const compliancePillarMult = clamp01(Math.max(cfg.compliance_mult_floor, 1 - (complianceRisk / 10) * 0.6));
+
+  const pillars = [
+    { key: 'demand', value: demandPillar, weight: cfg.w_demand, trust: cfg.trust_demand },
+    { key: 'competition', value: competitionPillar, weight: cfg.w_competition, trust: cfg.trust_competition },
+    { key: 'profit', value: profitPillar, weight: cfg.w_profit, trust: cfg.trust_profit },
+    { key: 'differentiation', value: differentiationPillar, weight: cfg.w_differentiation, trust: cfg.trust_differentiation },
+    { key: 'execution', value: executionPillar, weight: cfg.w_execution, trust: cfg.trust_execution }
+  ];
+
+  const opportunityCore = weightedGeometricMean(pillars, cfg.pillar_floor) * compliancePillarMult;
+
+  // Overall trust blends per-pillar input trust with measured data reliability and any
+  // distortion penalty, then sets the width of the decision uncertainty band.
+  const pillarTrust = pillars.reduce((acc, p) => acc + p.weight * p.trust, 0) /
+    pillars.reduce((acc, p) => acc + p.weight, 0);
+  const reliabilityTrust = clamp01(dataReliabilityScore / 100);
+  const distortionPenalty = dataDistortionSuspected ? 0.85 : 1.0;
+  const overallTrust = clamp01(0.5 * pillarTrust + 0.5 * reliabilityTrust) * distortionPenalty;
+
+  const pointEstimate = clampNumber(100 * opportunityCore);
+  const uncertaintyBand = cfg.uncertainty_min + (cfg.uncertainty_max - cfg.uncertainty_min) * (1 - overallTrust);
+  const optimisticScore = clampNumber(pointEstimate + uncertaintyBand);
+  const pessimisticScore = clampNumber(pointEstimate - uncertaintyBand);
+
+  const finalScore = hardGateTriggered ? 0 : pointEstimate;
   const totalScore = Math.round(finalScore);
 
   return {
-    scoringVersion: 'v2',
+    scoringVersion: 'v3',
     baseScore: potentialScore,
     potentialScore,
+    // v3 interval decision fields
+    pointEstimate: Math.round(pointEstimate),
+    optimisticScore: Math.round(optimisticScore),
+    pessimisticScore: Math.round(pessimisticScore),
+    uncertaintyBand: Number(uncertaintyBand.toFixed(1)),
+    overallTrust: Number(overallTrust.toFixed(3)),
+    listingLeverage: Number(listingLeverage.toFixed(3)),
+    pillars: pillars.map(p => ({ key: p.key, value: Number(p.value.toFixed(3)), weight: p.weight })),
     opportunityScore: Math.round(opportunityScore),
     dataReliabilityScore: Math.round(dataReliabilityScore),
     executionFitScore: Math.round(executionFitScore),
@@ -3754,8 +4319,12 @@ function calculateScoringModel(content) {
   };
 }
 
-function decideBackendAction(originalAction, scoreResults, content = '', reselectCount = 0) {
-  const action = normalizeForgeAction(originalAction || '');
+function decideBackendAction(originalAction, scoreResults, content = '', reselectCount = 0, forceDecision = false) {
+  let action = normalizeForgeAction(originalAction || '');
+  if (forceDecision && (action === 'LOOPBACK_TO_HAWKEYE' || action === 'LOOPBACK_TO_SCOUT')) {
+    console.warn(`[AutoProductSelection decideBackendAction] 检查到 forceDecisionMode 激活但 Reviewer 仍请求 LOOPBACK，后端越权覆盖为 PUBLISH_FINAL。`);
+    action = 'PUBLISH_FINAL';
+  }
   if (action !== 'PUBLISH_FINAL') return action;
   const verdict = extractFinalVerdict(content);
   // A real hard gate (negative contribution, compliance red line, etc.) always
@@ -3785,27 +4354,27 @@ function decideBackendAction(originalAction, scoreResults, content = '', reselec
     return budgetExhausted ? toTerminalPublish() : 'LOOPBACK_TO_HAWKEYE';
   }
 
-  // Ad-stress failure is a SOFT signal now (the ad-economics inputs — cpa/acos/
-  // ad_budget — are the least reliable SellerSprite fields). It must not by itself
-  // drop a direction NOR rescue a genuinely weak one. It only annotates; the score
-  // thresholds below (driven mostly by market/CVR/execution) remain the real gate.
+  // --- v3 interval decision -------------------------------------------------
+  // Decide on the CONFIDENCE INTERVAL [pessimistic, optimistic], not a point score.
+  // This is the structural fix for "熔炉打回太多 + 触顶强出一个产品":
+  //   - Drop only when even the OPTIMISTIC estimate fails (optimistic < drop_ceiling).
+  //     A merely-uncertain direction is never silently discarded.
+  //   - Publish as-is (reviewer's verdict stands) when the PESSIMISTIC estimate already
+  //     clears the recommend floor (genuinely strong, robust to the uncertainty band).
+  //   - Everything in between is published as a cautious WATCHLIST for human validation,
+  //     which is exactly the "可初步作为商业决策" artifact the seller wants.
+  const cfg = SCORING_CONFIG;
+  const optimistic = Number.isFinite(scoreResults.optimisticScore) ? scoreResults.optimisticScore : scoreResults.totalScore;
+  const pessimistic = Number.isFinite(scoreResults.pessimisticScore) ? scoreResults.pessimisticScore : scoreResults.totalScore;
 
-  // Publish/drop bands. The system is a high-confidence REFERENCE for a human who
-  // does the final validation, so the bias is "surface for review, don't silently
-  // discard". Only genuinely weak directions are dropped.
-  //   >= 75            → publish as-is (strong; reviewer's RECOMMEND/etc. stands)
-  //   50 <= score < 75 → publish, but as a cautious WATCHLIST for human validation
-  //                      (do NOT drop — this is what fixes "永远选不出产品")
-  //   < 50             → drop and try a new direction (within reselect budget)
-  const score = scoreResults.totalScore;
-  if (score >= 75) return action;
-  if (score >= 50) return 'PUBLISH_FINAL'; // mid band: surface for human validation
-  // Weak band (<50): drop within budget, else converge to a terminal publish.
-  if (['WATCHLIST', 'RESEARCH_GAP', 'DATA_INSUFFICIENT'].includes(verdict)) {
-    // Reviewer already chose a cautious terminal verdict — let it publish.
-    return action;
+  if (optimistic < cfg.drop_ceiling) {
+    // Even the optimistic case is weak. If the reviewer already chose a cautious
+    // terminal verdict, honor it; otherwise drop within budget, else converge to publish.
+    if (['WATCHLIST', 'RESEARCH_GAP', 'DATA_INSUFFICIENT'].includes(verdict)) return action;
+    return budgetExhausted ? toTerminalPublish() : 'DROP_AND_RESELECT';
   }
-  return budgetExhausted ? toTerminalPublish() : 'DROP_AND_RESELECT';
+  if (pessimistic >= cfg.recommend_floor) return action; // robustly strong: reviewer's verdict stands
+  return 'PUBLISH_FINAL'; // mid/uncertain band: surface for human validation, never drop
 }
 
 function yamlString(value) {
@@ -3856,6 +4425,19 @@ function updateScoredContentWithMath(content, scoreResults, action, originalActi
     ...(scoreResults.distortionSignals && scoreResults.distortionSignals.length
       ? ['  distortion_signals:', ...scoreResults.distortionSignals.map(s => `    - "${yamlString(s)}"`)]
       : []),
+    ...(scoreResults.scoringVersion === 'v3'
+      ? [
+        `  v3_interval_decision:`,
+        `    point_estimate: ${scoreResults.pointEstimate}`,
+        `    optimistic_score: ${scoreResults.optimisticScore}`,
+        `    pessimistic_score: ${scoreResults.pessimisticScore}`,
+        `    uncertainty_band: ${scoreResults.uncertaintyBand}`,
+        `    overall_trust: ${scoreResults.overallTrust}`,
+        `    listing_leverage: ${scoreResults.listingLeverage}`,
+        `  v3_pillars:`,
+        ...(scoreResults.pillars || []).map(p => `    ${p.key}: ${p.value} (w=${p.weight})`)
+      ]
+      : []),
     `  multipliers:`,
     `    profit: ${scoreResults.mProfit.toFixed(3)}`,
     `    profit_effective: ${scoreResults.mProfitEffective.toFixed(3)}`,
@@ -3900,6 +4482,92 @@ function updateScoredContentWithMath(content, scoreResults, action, originalActi
   return `---\n${updatedFrontMatter}\n---${body}`;
 }
 
+async function saveDebugModeToConfig(enable) {
+  const configEnvPath = path.join(__dirname, 'config.env');
+  try {
+    const fsSync = require('fs');
+    let lines = [];
+    if (fsSync.existsSync(configEnvPath)) {
+      const content = fsSync.readFileSync(configEnvPath, 'utf8');
+      lines = content.split('\n');
+    }
+    let found = false;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim().startsWith('DebugMode=')) {
+        lines[i] = `DebugMode=${enable}`;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      lines.push(`DebugMode=${enable}`);
+    }
+    fsSync.writeFileSync(configEnvPath, lines.join('\n').trim() + '\n', 'utf8');
+    logWorkflowEvent(`调试模式 (DebugMode) 已持久化写入 config.env 并设为 ${enable}`);
+  } catch (error) {
+    console.error('[AutoProductSelection] Failed to save DebugMode to config.env:', error.message);
+    logWorkflowEvent(`持久化写入 config.env 失败: ${error.message}`, true);
+  }
+}
+
+async function autoSelectionToggleDebug(args = {}) {
+  const enable = parseBoolean(args.enable ?? args.debugMode ?? args.debug_mode, !debugMode);
+  debugMode = enable;
+  const message = `已将调试模式 (debugMode) 设置为: ${debugMode ? '启用 (true)' : '禁用 (false)'}。`;
+  logWorkflowEvent(`调试模式切换为: ${debugMode}`);
+  await saveDebugModeToConfig(enable);
+  return {
+    success: true,
+    command: 'auto_selection_toggle_debug',
+    debugMode,
+    message
+  };
+}
+
+async function autoSelectionPauseWorkflow(args = {}) {
+  logWorkflowEvent('手动暂停选品工作流 (User manually paused the workflow).');
+  await stopWorkflowDriver();
+  return {
+    success: true,
+    command: 'auto_selection_pause_workflow',
+    message: '工作流已成功暂停。所有中间运行文件均已保留，下次调用 auto_selection_trigger_run 将自动恢复推进。'
+  };
+}
+
+async function autoSelectionAbortWorkflow(args = {}) {
+  logWorkflowEvent('手动中止并重置选品工作流 (User manually aborted and reset the workflow).');
+  await stopWorkflowDriver();
+
+  const queue = await autoSelectionQueueStatus({ include_content: false });
+  const runIds = new Set();
+
+  if (queue.success) {
+    queue.derived?.active_briefs?.forEach(f => runIds.add(f.run_id));
+    queue.stages?.raw?.forEach(f => runIds.add(f.run_id));
+    queue.stages?.scored?.forEach(f => runIds.add(f.run_id));
+    queue.derived?.valid_locks?.forEach(f => runIds.add(f.run_id));
+
+    for (const runId of runIds) {
+      await cleanupAutoSelectionRunResidue(runId);
+    }
+
+    // Clean up malformed locks
+    const malformedLocks = queue.derived?.malformed_locks || [];
+    for (const malformed of malformedLocks) {
+      await fs.unlink(malformed.path).catch(() => { });
+    }
+  }
+
+  logWorkflowEvent(`工作流已成功重置，清除了 ${runIds.size} 个活动任务的文件和所有锁。`);
+
+  return {
+    success: true,
+    command: 'auto_selection_abort_workflow',
+    message: '工作流已中止，且已清除全部选品状态机文件。下一次触发自动任务时将全新开始。',
+    cleaned_runs: Array.from(runIds)
+  };
+}
+
 async function shutdown() {
   await stopWorkflowDriver();
   debugLog('Plugin shutdown.');
@@ -3910,5 +4578,8 @@ module.exports = {
   processToolCall,
   shutdown,
   decideBackendAction,
-  calculateScoringModel
+  calculateScoringModel,
+  autoSelectionToggleDebug,
+  autoSelectionPauseWorkflow,
+  autoSelectionAbortWorkflow
 };

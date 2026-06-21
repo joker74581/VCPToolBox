@@ -603,7 +603,7 @@ function normalizeNodeIdPaths(value) {
     if (/^\d+(?::\d+)+$/.test(trimmed)) {
       const topId = trimmed.split(':')[0];
       if (TOP_LEVEL_CATEGORY_IDS.has(topId)) {
-        values.push(topId);
+        values.push(trimmed);
       } else {
         unknown.push(trimmed);
       }

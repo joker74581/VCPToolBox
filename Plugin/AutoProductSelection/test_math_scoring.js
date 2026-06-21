@@ -210,8 +210,8 @@ scored_candidate_pack:
       command: 'auto_selection_apply_reviewer_decision',
       run_id: RUN_ID
     });
-    if (resultLoopback.state_transition !== 'loopback_denied_force_review_prepared') {
-      throw new Error(`Expected loopback_denied_force_review_prepared, got ${resultLoopback.state_transition}`);
+    if (resultLoopback.state_transition !== 'loopback_denied_force_review_dispatched_automatically') {
+      throw new Error(`Expected loopback_denied_force_review_dispatched_automatically, got ${resultLoopback.state_transition}`);
     }
     console.log('✓ Scenario C passed');
 
