@@ -112,7 +112,12 @@ function normalizeAsin(value) {
   const pathMatch = raw.match(/(?:\/(?:dp|gp\/product|product-reviews)\/)([A-Z0-9]{10})/i);
   if (pathMatch) return pathMatch[1].toUpperCase();
   const directMatch = raw.match(/\b([A-Z0-9]{10})\b/i);
-  return directMatch ? directMatch[1].toUpperCase() : null;
+  if (directMatch) {
+    const asin = directMatch[1].toUpperCase();
+    const isValid = (/^B[A-Z0-9]{9}$/.test(asin) && /[0-9]/.test(asin)) || /^[0-9]{9}[0-9X]$/.test(asin);
+    if (isValid) return asin;
+  }
+  return null;
 }
 
 function getMarketDomain(market) {

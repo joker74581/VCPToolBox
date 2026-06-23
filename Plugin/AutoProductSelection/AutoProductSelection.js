@@ -133,6 +133,7 @@ function loadScoringConfig(config = {}) {
 
 function configureAutoSelectionRuntime(config = {}) {
   loadScoringConfig(config);
+  loadWorkflowBudgetConfig(config);
   AUTO_SELECTION_SCOUT_AGENT_NAME = String(
     config.AUTO_SELECTION_SCOUT_AGENT_NAME ||
     process.env.AUTO_SELECTION_SCOUT_AGENT_NAME ||
@@ -503,9 +504,117 @@ async function stageDroppedRunFiles(runId) {
 }
 
 /**
+ * Extract the keywords/seed terms a scout already probed and rejected, from a raw/brief's
+ * prescreen_log / elimination_log / keyword fields. Returns a compact deduped list so the
+ * coordinator can diary them ("tried X/Y/Z, all weak") and future rounds skip repeats.
+ */
+function extractRejectedKeywords(content = '') {
+  const text = String(content || '');
+  const found = new Set();
+  // Pull values of common keyword-bearing fields within prescreen/elimination sections.
+  const keyPatterns = [
+    /(?:keyword|keywords|seed_keyword|seed_keywords|target_keywords|direction_keyword)\s*:\s*([^\r\n#]+)/gi,
+    /(?:probed_keywords|rejected_keywords|tried_keywords)\s*:\s*([^\r\n#]+)/gi
+  ];
+  for (const re of keyPatterns) {
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const raw = m[1].replace(/^[\["']+|[\]"']+$/g, '').trim();
+      for (const piece of raw.split(/[,，、;；]/)) {
+        const kw = piece.replace(/^[-\s"'\[]+|[\s"'\]]+$/g, '').trim();
+        if (kw && kw.length <= 60 && !/^(none|n\/a|null|-)$/i.test(kw)) found.add(kw);
+      }
+      if (found.size >= 24) break;
+    }
+  }
+  return [...found].slice(0, 24);
+}
+
+/**
+ * Extract deferred_candidates from a run's raw content: directions that PASSED prescreen
+ * but were not deep-dived this round. These are NOT eliminations — they become priority
+ * directions for a future trigger via a [待观察] diary entry. Returns a compact list.
+ */
+function extractDeferredCandidates(content = '') {
+  const lines = String(content || '').split(/\r?\n/);
+  const startIdx = lines.findIndex(l => /^\s*deferred_candidates\s*:/i.test(l));
+  if (startIdx < 0) return [];
+  const headerIndent = (lines[startIdx].match(/^(\s*)/) || ['', ''])[1].length;
+  // Collect the block: lines after the header that are more-indented than the header (the
+  // YAML list items + their nested keys). Stop at the first line indented <= header that is
+  // itself a key/content line (the next sibling field) or a markdown heading.
+  const blockLines = [];
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === '') { blockLines.push(line); continue; }
+    const indent = (line.match(/^(\s*)/) || ['', ''])[1].length;
+    if (indent <= headerIndent) break;
+    blockLines.push(line);
+  }
+  // Split into list items on lines like "  - ..." and parse each.
+  const items = [];
+  let current = null;
+  const flush = () => {
+    if (!current) return;
+    const dir = String(current.direction || current.firstLine || '').replace(/^[\["']+|[\]"']+$/g, '').trim();
+    if (dir && dir.length <= 120) {
+      items.push({ direction: dir, keywords: String(current.keywords || '').trim(), rating: String(current.rating || '').trim() });
+    }
+    current = null;
+  };
+  for (const raw of blockLines) {
+    const itemMatch = raw.match(/^\s*-\s+(.*)$/);
+    if (itemMatch) {
+      flush();
+      current = { firstLine: '', direction: '', keywords: '', rating: '' };
+      const inline = itemMatch[1];
+      const kv = inline.match(/^(direction|product_direction)\s*:\s*(.+)$/i);
+      if (kv) current.direction = kv[2];
+      else current.firstLine = inline;
+      continue;
+    }
+    if (!current) continue;
+    const d = raw.match(/(?:direction|product_direction)\s*:\s*(.+)$/i);
+    if (d) { current.direction = d[1]; continue; }
+    const k = raw.match(/(?:seed_keywords|keywords|keyword)\s*:\s*(.+)$/i);
+    if (k) { current.keywords = k[1].replace(/^[\["']+|[\]"']+$/g, ''); continue; }
+    const r = raw.match(/(?:rating|grade|level)\s*:\s*(.+)$/i);
+    if (r) { current.rating = r[1]; continue; }
+  }
+  flush();
+  return items.slice(0, 12);
+}
+
+/**
+ * Build the Markdown block instructing the coordinator to diary [待观察] deferred directions
+ * so they sediment into memory and get prioritized next trigger. '' when none.
+ */
+function buildDeferredCandidatesPromptBlock(items) {
+  if (!items || items.length === 0) return '';
+  const lines = items.map(it => {
+    const kw = it.keywords ? ` | 种子词: ${it.keywords}` : '';
+    const rt = it.rating ? ` | 预筛评级: ${it.rating}` : '';
+    return `- 方向: ${it.direction}${kw}${rt}`;
+  });
+  return [
+    '',
+    '---',
+    '',
+    '【本轮过线但未深挖的待观察方向】：',
+    ...lines,
+    '',
+    '这些方向通过了 Level-1 预筛、值得后续深挖，但本轮聚焦深挖了最优方向，未对它们展开。请在写选品公共日记本时，**额外写一条 [待观察] 日记**（与主结论合并或单独一条均可，但要极简）：',
+    '- 逐条列出上述待观察方向与其种子词，标注"下一轮优先深挖"。',
+    '- Tag 行放在 Content 最后一行，至少含 `#待观察`，并尽量把方向核心词作为标签，便于枢纽下轮检索优先重拾。',
+    '- 这是机会暂存，不是淘汰，措辞上不要写成否决。'
+  ].join('\n');
+}
+
+/**
  * Scan the dropped staging area and summarize each eliminated direction. Reads the
  * scored file when present (richest), else raw, else brief. Extracts product_direction,
- * final verdict and total_score so the coordinator can publish/diary them in one pass.
+ * final verdict, total_score and rejected keywords so the coordinator can publish/diary
+ * them in one pass.
  */
 async function collectDroppedSummaries() {
   await fs.mkdir(AUTO_SELECTION_DROPPED_DIR, { recursive: true });
@@ -554,7 +663,10 @@ async function collectDroppedSummaries() {
       extractScalarValue(content, 'final_score') || '';
     const reason = extractScalarValue(content, 'elimination_summary') ||
       extractScalarValue(content, 'primary_reason') || '';
-    summaries.push({ run_id: runId, source_stage: stage, direction, verdict, total_score: totalScore, reason });
+    // Capture the specific keywords/directions the scout already tried and rejected, so the
+    // coordinator can diary them and future rounds avoid repeating the same dead-end probes.
+    const rejectedKeywords = extractRejectedKeywords(content);
+    summaries.push({ run_id: runId, source_stage: stage, direction, verdict, total_score: totalScore, reason, rejected_keywords: rejectedKeywords });
   }
   summaries.sort((a, b) => a.run_id.localeCompare(b.run_id));
   return summaries;
@@ -569,7 +681,10 @@ function buildDroppedSummaryPromptBlock(summaries) {
   const lines = summaries.map(item => {
     const scorePart = item.total_score ? ` | 评分: ${item.total_score}` : '';
     const reasonPart = item.reason ? ` | 原因: ${String(item.reason).slice(0, 120)}` : '';
-    return `- 选品 ID: ${item.run_id} | 方向: ${item.direction || '(未标注)'}${scorePart} | 结果: ${item.verdict}${reasonPart}`;
+    const kwPart = (item.rejected_keywords && item.rejected_keywords.length)
+      ? ` | 已试关键词: ${item.rejected_keywords.slice(0, 12).join(', ')}`
+      : '';
+    return `- 选品 ID: ${item.run_id} | 方向: ${item.direction || '(未标注)'}${scorePart} | 结果: ${item.verdict}${reasonPart}${kwPart}`;
   });
   return [
     '',
@@ -580,8 +695,8 @@ function buildDroppedSummaryPromptBlock(summaries) {
     '',
     '请你在撰写最终论坛研报和写入选品公共日记本时，将上述淘汰方向一并汇总：',
     '- 论坛帖中增加一个「本轮淘汰记录」小节，逐条列出被排除方向、评分和核心原因。',
-    '- 日记只写一条（本轮合并）：在本轮主结论日记里追加一个「本轮淘汰清单」段落，逐条列出被淘汰方向与核心原因，不要为每个淘汰方向单独写多条日记。',
-    '- 该条合并日记的 Tag 行必须放在 Content 最后一行，标签需同时覆盖主结论与淘汰（至少含 `#排除`）。',
+    '- 日记只写一条（本轮合并）：在本轮主结论日记里追加一个「本轮淘汰清单」段落，逐条列出被淘汰方向、核心原因，以及上面列出的「已试关键词」（让后续选品可检索避坑、不再重复探测同一批关键词）。',
+    '- 该条合并日记的 Tag 行必须放在 Content 最后一行，标签需同时覆盖主结论与淘汰（至少含 `#排除`），并尽量把被淘汰的核心关键词作为标签（如 `#关键词名`）以便未来检索。',
     '- 这些淘汰方向已由后端暂存，归档时会自动清空，你无需手动删除。'
   ].join('\n');
 }
@@ -700,6 +815,16 @@ async function autoSelectionQueueStatus(args = {}) {
     if (hasOutput) continue;
     const completed_task = await findCompletedWorkerWithoutOutput(lock);
     if (completed_task) {
+      // Grace window against a RACE: a worker reports its AgentTask done at the transport
+      // layer a few seconds BEFORE its raw/scored write lands (the write is a separate tool
+      // call). Without a grace period the driver declares "missing output" and force-fails a
+      // run whose output arrives moments later. Only treat it as truly missing if the task
+      // completed at least WORKER_OUTPUT_GRACE_MS ago; otherwise wait one more tick.
+      const completedAgeMs = nowMs - new Date(completed_task.modified_at).getTime();
+      if (Number.isFinite(completedAgeMs) && completedAgeMs < WORKER_OUTPUT_GRACE_MS) {
+        debugLog(`Worker ${lock.run_id} task completed ${Math.round(completedAgeMs / 1000)}s ago (< grace ${WORKER_OUTPUT_GRACE_MS / 1000}s); waiting for late output write before declaring missing.`);
+        continue;
+      }
       const retryDiagnosis = classifyMissingWorkerOutput(completed_task);
       missingOutputs.push({
         run_id: lock.run_id,
@@ -803,9 +928,13 @@ async function autoSelectionWriteRunFile(args = {}) {
     try {
       const scoreResults = calculateScoringModel(content);
       const originalAction = normalizeForgeAction(args.action || extractForgeAction(content) || '');
-      const writeReselectCount = Math.max(parseLoopbackCounters(content).reselect_count || 0, reselectCountThisTrigger || 0);
-      const isForceDecision = await isForgeLockInForceDecisionMode(runId) || parseBoolean(args.force_decision_mode ?? args.forceDecisionMode, false);
+      // Read budgets/force-decision from the authoritative state file (v4), not lock files.
+      const st = await readRunState(runId);
+      const writeReselectCount = Math.max(parseLoopbackCounters(content).reselect_count || 0, st?.counters?.reselect || 0);
+      const isForceDecision = (st?.force_decision_mode === true) || parseBoolean(args.force_decision_mode ?? args.forceDecisionMode, false);
       const action = decideBackendAction(originalAction, scoreResults, content, writeReselectCount, isForceDecision);
+      // This only ANNOTATES the scored file with the math block + computed action for the
+      // report to read; the authoritative decision is re-run in advanceEvaluating.
       fileContent = updateScoredContentWithMath(content, scoreResults, action, originalAction);
     } catch (e) {
       debugLog(`Error applying math scoring model during file write: ${e.message}`);
@@ -882,13 +1011,20 @@ ${callRhythmInstruction}
 读取 brief 并基于其指示抓取数据。如果是回环补采，请保留旧数据合并写回 raw。
 
 ## 多方向廉价预筛（核心工作法）
-brief 通常给你 2-3 个并列候选方向。你必须**先用最便宜的工具横向体检所有方向，只把最有潜力的 1 个深挖**，避免在弱方向上浪费昂贵抓取。
-1. **横向 Level 1 体检（便宜，先做）**：对每个候选方向，只用 run_sellersprite_keyword_research / run_sellersprite_competitor_lookup（必要时 keyword_conversion_rate）快速取需求、购买、价格带、需供比、评论门槛、FBA/price、头部集中度。给每个方向一个粗评级（强/中/弱）并写入 prescreen_log（方向、关键指标、评级、理由）。
-2. **挑最优 1 个纵向深挖（贵，后做）**：只对体检最强的方向做 Level 2（关键词反查、fetch_amazon_product_info、fetch_amazon_reviews）。落选方向写入 elimination_log，不再花昂贵抓取。
-3. **全部方向都弱**：直接 EARLY_REJECT，在 prescreen_log 说明依据，不要硬深挖。
+brief 通常给你 2-3 个并列候选方向。你必须**先用最便宜的工具横向体检所有方向，本轮只深挖最有潜力的方向**，避免在弱方向上浪费昂贵抓取，也避免一轮塞太多数据稀释注意力。
+1. **横向 Level 1 体检（便宜，先做）**：对每个候选方向，只用 run_sellersprite_keyword_research / run_sellersprite_competitor_lookup（必要时 keyword_conversion_rate）快速取需求、购买、价格带、需供比、评论门槛、FBA/price、头部集中度。给每个方向粗评级（强/中/弱）并写入 prescreen_log（方向、关键指标、评级、理由）。
+2. **本轮只深挖最优方向（贵，后做）**：本轮最多深挖 ${MAX_DEEP_DIVE_PER_RUN} 个方向——选预筛评级最高的那个做 Level 2（关键词反查、fetch_amazon_product_info、fetch_amazon_reviews），把它的证据一次铺厚。一轮能深挖出一个"好产品/好关键词"就已经很好。
+3. **其它过线但未选中的方向不要淘汰**：把它们写入 raw 的 deferred_candidates（方向、种子词、预筛评级、为何值得后续重拾）。它们不是淘汰，而是**留给后续 trigger 优先深挖的方向**，由后端写入 [待观察] 日记沉淀进记忆。只有真正弱/死的方向才写 elimination_log。
+4. **全部方向都弱**：直接 EARLY_REJECT，在 prescreen_log 说明依据，不要硬深挖。
+
+## 冷门/利基方向纪律（重要）
+低搜索量、低成交量**本身不是 EARLY_REJECT 的理由**。无人做的冷门细分常是"先入场"机会（竞争弱、头部未垄断、评论壁垒低）。预筛时区分：
+- **真死方向**（可 EARLY_REJECT）：需求几乎为零且无趋势、品类萎缩、或触红线（合规/重货/侵权/利润倒挂）。
+- **冷门机会**（应保留深挖）：需求小但稳定或上升、需供比好（商品数 < 搜索量）、痛点/场景清晰、头部不集中。
+判断小而美优先看需供比、增长趋势（含往年同期）、头部集中度、痛点清晰度，而不是绝对搜索量。
 
 ## 硬性约束
-- ProductSelector 数据命令最多 6 次（横向体检尽量每方向 1-2 次，把预算留给深挖）
+- ProductSelector 数据命令最多 9 次（横向体检每方向 1-2 次×最多3方向 ≈ 6 次，深挖最优方向 ≤3 次；留 1 次缓冲。不要在弱方向上超额抓取）
 - 遇到 429/500、账号错误、验证码、页面阻断等系统级错误立即停止，写 failed 或 partial raw，绝不循环重试
 - 普通冷门长尾词空结果不是失败结论：允许同义词/父词重试 1 次；同类数据连续 2 次为空后写入 unfetchable_gaps
 - 不要死板遵循固定流程，灵活 Pivot（关键词、价格带、市场），但回环补采只能补 reviewer 指定字段
@@ -908,6 +1044,7 @@ ${counterInstruction}
 成功或部分成功时写 raw_data_pack 到 raw；工具阻断或完全无数据写 failed。必须在 YAML 中包含：
 - route_decision (EARLY_REJECT | PIVOT | DEEPEN | READY_FOR_FORGE)
 - prescreen_log（每个候选方向的关键指标、强/中/弱评级、为何胜出或落选）
+- deferred_candidates（过线但本轮未深挖的方向：方向、种子词、预筛评级、为何值得后续重拾；这些不是淘汰）
 - data_audit_inputs.tools_called / sample_counts / unfetchable_gaps / outlier_notes
 - keyword_market_summary / competitor_summary / profitability_raw_estimates / review_insight_summary
 - review_insight_summary 中尽量给出 scene_vs_function_signal：评论高频词偏"好看/送礼/氛围/设计"还是偏"能用/结实/尺寸/功能"，供熔炉判定 listing_leverage
@@ -1457,7 +1594,12 @@ async function autoSelectionApplyForgeDecision(args = {}, commandName = 'auto_se
         reviewer_instruction: reviewerInstruction
       });
       if (dispatch.success && dispatch.agent_assistant_request) {
-        await callAgentAssistant(dispatch.agent_assistant_request);
+        // Fire-and-forget: this runs INSIDE the coordinator's delegated task. Awaiting a
+        // long worker dispatch here would block the coordinator past DELEGATION_TIMEOUT and
+        // trap the workflow in a re-delegate-on-timeout loop. Dispatch async; the worker's
+        // raw/scored write re-drives the workflow via triggerImmediateWorkflowTick.
+        callAgentAssistant(dispatch.agent_assistant_request).catch(err =>
+          logWorkflowEvent(`[Worker Dispatch Failed] force-decision reviewer dispatch error: ${err.message}`, true));
       }
       return {
         success: true,
@@ -1496,7 +1638,10 @@ async function autoSelectionApplyForgeDecision(args = {}, commandName = 'auto_se
       dispatch_reason: 'forge_loopback'
     });
     if (dispatch.success && dispatch.agent_assistant_request) {
-      await callAgentAssistant(dispatch.agent_assistant_request);
+      // Fire-and-forget (see force-decision branch above): never block the coordinator's
+      // delegated task on a long worker dispatch, or it times out and re-delegates forever.
+      callAgentAssistant(dispatch.agent_assistant_request).catch(err =>
+        logWorkflowEvent(`[Worker Dispatch Failed] loopback scout dispatch error: ${err.message}`, true));
     }
     return {
       success: true,
@@ -1840,166 +1985,48 @@ function getStatus() {
 }
 
 async function autoSelectionTriggerRun(args = {}) {
-  // Check if workflow is already running
+  // The coordinator (破壁_枢纽) calls this as the VCPTaskAssistant "switch" to start a round.
   if (isWorkflowRunning) {
     return {
       success: false,
       command: 'auto_selection_trigger_run',
       error: 'workflow_already_running',
-      message: '工作流已在运行中。后端驱动器正在自动推进，你（破壁_枢纽）当前无需采取任何行动，请直接输出 [[TaskComplete]] 结束本次调度。',
-      next_actions: [
-        'Do not create a new brief.',
-        'Do not dispatch any worker.',
-        'Output [[TaskComplete]] immediately to end this activation.'
-      ]
+      message: '工作流已在运行中。后端状态机正在自动推进，你（破壁_枢纽）当前无需任何行动，请直接输出 [[TaskComplete]]。',
+      next_actions: ['Output [[TaskComplete]] immediately to end this activation.']
     };
   }
 
-  // Check queue status
-  const queue = await autoSelectionQueueStatus({ include_content: false });
-  if (!queue.success) {
-    return {
-      success: false,
-      command: 'auto_selection_trigger_run',
-      error: 'queue_status_failed',
-      message: '无法获取队列状态。'
-    };
-  }
+  await ensureAutoSelectionRunDirs();
+  const states = await listRunStates();
+  const active = states.filter(s => s && s.status !== APS_STATE.DONE);
 
-  // New trigger lifecycle: reset the cross-direction reselect budget and loop guards.
-  reselectCountThisTrigger = 0;
-  createBriefCountThisTrigger = 0;
-  failedDelegationAttempts.clear();
-  scoredDelegationAttempts.clear();
-
-  // Calculate active runs (locks + briefs + raw + scored)
-  const activeRuns = (queue.derived?.valid_locks?.length || 0) +
-    (queue.derived?.active_briefs?.length || 0) +
-    (queue.stages?.raw?.length || 0) +
-    (queue.stages?.scored?.length || 0);
-
-  // Recovery strategy configuration
-  const recoveryMode = args.recovery_mode || args.recoveryMode || 'auto';
-  // 'auto' (default): auto-resume existing tasks
-  // 'clear_and_new': clear all pending and start fresh
-  // 'oldest_first': process oldest task first, clean others
-
-  if (activeRuns > 0) {
-    // Unfinished tasks detected - apply recovery strategy
-    if (recoveryMode === 'clear_and_new') {
-      // Clear all pending tasks and start fresh
-      console.log(`[AutoProductSelection] Recovery mode: clear_and_new. Clearing ${activeRuns} pending tasks.`);
-      logWorkflowEvent(`Workflow triggered with recoveryMode=clear_and_new. Clearing ${activeRuns} pending tasks.`);
-
-      const runIds = new Set();
-      queue.derived?.active_briefs?.forEach(f => runIds.add(f.run_id));
-      queue.stages?.raw?.forEach(f => runIds.add(f.run_id));
-      queue.stages?.scored?.forEach(f => runIds.add(f.run_id));
-      queue.derived?.valid_locks?.forEach(f => runIds.add(f.run_id));
-
-      for (const runId of runIds) {
-        await autoSelectionCleanupRun({ run_id: runId });
-      }
-
-      // Start new workflow
-      console.log('[AutoProductSelection] Starting new workflow after cleanup...');
-      logWorkflowEvent('Starting new workflow after clear_and_new cleanup.');
-      isWorkflowRunning = true;
-      workflowState = 'INIT';
-      startWorkflowDriver();
-
-      return {
-        success: true,
-        command: 'auto_selection_trigger_run',
-        mode: 'new',
-        recovery_mode: 'clear_and_new',
-        cleared_tasks: activeRuns,
-        message: `已清理 ${activeRuns} 个未完成任务，准备启动新任务。`
-      };
-
-    } else if (recoveryMode === 'oldest_first' && activeRuns > 1) {
-      // Multiple tasks: process oldest first, clean others
-      console.log(`[AutoProductSelection] Recovery mode: oldest_first. Processing oldest, cleaning ${activeRuns - 1} others.`);
-      logWorkflowEvent(`Workflow triggered with recoveryMode=oldest_first. Cleaning ${activeRuns - 1} tasks.`);
-
-      const allTasks = [
-        ...(queue.derived?.active_briefs || []),
-        ...(queue.stages?.raw || []),
-        ...(queue.stages?.scored || [])
-      ];
-
-      if (allTasks.length > 0) {
-        allTasks.sort((a, b) => String(a.modified_at || '').localeCompare(String(b.modified_at || '')));
-        const oldestRunId = allTasks[0].run_id;
-
-        // Clean up all except oldest
-        for (const task of allTasks) {
-          if (task.run_id !== oldestRunId) {
-            await autoSelectionCleanupRun({ run_id: task.run_id });
-          }
-        }
-
-        // Also clean locks for non-oldest tasks
-        const allLocks = queue.derived?.valid_locks || [];
-        for (const lock of allLocks) {
-          if (lock.run_id !== oldestRunId) {
-            await autoSelectionClearLocks({ run_id: lock.run_id });
-          }
-        }
-
-        console.log(`[AutoProductSelection] Resuming oldest task: ${oldestRunId}`);
-        logWorkflowEvent(`Resuming oldest task: ${oldestRunId}`);
-        isWorkflowRunning = true;
-        workflowState = 'ACTIVE';
-        startWorkflowDriver();
-
-        return {
-          success: true,
-          command: 'auto_selection_trigger_run',
-          mode: 'resume',
-          recovery_mode: 'oldest_first',
-          active_runs: 1,
-          cleared_tasks: activeRuns - 1,
-          oldest_run_id: oldestRunId,
-          message: `已清理 ${activeRuns - 1} 个任务，恢复处理最早的任务: ${oldestRunId}。`
-        };
-      }
-    }
-
-    // Default: resume mode (process all existing tasks)
-    console.log(`[AutoProductSelection] Resuming ${activeRuns} existing task(s)...`);
-    logWorkflowEvent(`Workflow triggered. Resuming ${activeRuns} existing task(s).`);
-
-    let warningMessage = '';
-    if (activeRuns > 1) {
-      warningMessage = ` 注意：检测到多个任务，将按队列顺序依次处理。如需清理请使用 recovery_mode='clear_and_new' 或 'oldest_first'。`;
-    }
-
+  if (active.length > 0) {
+    // Resume: a prior round left non-terminal runs (e.g. after a restart). The state machine
+    // picks up exactly where each run's status says, no inference needed.
     isWorkflowRunning = true;
-    workflowState = 'ACTIVE';
     startWorkflowDriver();
-
+    logWorkflowEvent(`Workflow triggered. Resuming ${active.length} active run(s) from state files.`);
     return {
       success: true,
       command: 'auto_selection_trigger_run',
       mode: 'resume',
-      recovery_mode: 'auto',
-      active_runs: activeRuns,
-      message: `工作流已启动，接管 ${activeRuns} 个未完成任务。${warningMessage}`
+      active_runs: active.length,
+      message: `工作流已启动，接管 ${active.length} 个未完成 run（依据 state.json 续跑）。`
     };
   }
 
-  // Start new workflow
-  console.log('[AutoProductSelection] Starting new workflow...');
-  logWorkflowEvent('Workflow triggered. Starting new workflow.');
+  // New round: create one fresh run in PENDING_BRIEF BEFORE starting the driver, so the
+  // driver's first tick sees a non-empty active set (otherwise it self-terminates immediately).
+  const runId = normalizeAutoSelectionRunId(`${buildTimestampRunPrefix()}-new`);
+  await writeRunState(freshRunState(runId));
   isWorkflowRunning = true;
-  workflowState = 'INIT';  // Mark as initiated
   startWorkflowDriver();
-
+  logWorkflowEvent(`Workflow triggered. Created new run ${runId} (PENDING_BRIEF).`);
   return {
     success: true,
     command: 'auto_selection_trigger_run',
     mode: 'new',
+    run_id: runId,
     message: '工作流已启动，将创建新的选品任务。'
   };
 }
@@ -2033,18 +2060,15 @@ async function processToolCall(args = {}) {
         return await autoSelectionReadRunFile(args);
       case 'auto_selection_prepare_dispatch': {
         const result = await autoSelectionPrepareDispatch(args);
-        if (result && result.success !== false) {
-          await removeCoordinatorLock();
-        }
         return result;
       }
       case 'auto_selection_apply_forge_decision':
       case 'auto_selection_apply_reviewer_decision': {
+        // Compat shim: in the v4 state machine the BACKEND decides (advanceEvaluating), so the
+        // coordinator no longer needs to call this. Kept functional for manual/legacy use; it
+        // just triggers a tick so the state machine re-derives the next step.
         const result = await autoSelectionApplyForgeDecision(args, command);
         if (result && result.success !== false) {
-          if (result.action !== 'PUBLISH_FINAL') {
-            await removeCoordinatorLock();
-          }
           const runId = args.run_id || args.runId;
           triggerImmediateWorkflowTick('coordinator_decision_applied', { runId, action: result.action });
         }
@@ -2053,7 +2077,6 @@ async function processToolCall(args = {}) {
       case 'auto_selection_archive_run': {
         const result = await autoSelectionArchiveRun(args);
         if (result && result.success !== false) {
-          await removeCoordinatorLock();
           const runId = args.run_id || args.runId;
           triggerImmediateWorkflowTick('coordinator_archive_completed', { runId });
         }
@@ -2135,6 +2158,15 @@ const failedDelegationAttempts = new Map();
 const scoredDelegationAttempts = new Map();
 const MAX_FAILED_DELEGATIONS = 3;
 
+// Backstop against an infinite COORDINATOR-FAILURE loop. When a delegated coordinator
+// task fails (e.g. persistent HTTP 500 from the model provider, or repeated tool errors),
+// the driver removes the lock and re-delegates the same task next tick. With no ceiling a
+// persistent 500 re-delegates forever every ~30s. We track consecutive coordinator
+// failures per run_id; after MAX_COORDINATOR_FAILURES the run is force-failed/terminated
+// so the round stops burning tokens on an unrecoverable transport/system error.
+const coordinatorFailureAttempts = new Map();
+const MAX_COORDINATOR_FAILURES = 3;
+
 // Structural backstop against an unbounded create_brief loop: even if a coordinator
 // misbehaves (e.g. publishes then re-triggers, or keeps reselecting outside the
 // scored path), the driver must not keep launching brand-new briefs forever within
@@ -2152,13 +2184,243 @@ const SOFT_MAX_GLOBAL_LOOPBACK = 3;   // 普通数据缺口全局回环上限；
 // DROP_AND_RESELECT 会换一个全新方向并重置 loopback 计数器，因此 per-run 的
 // shouldTriggerCircuitBreaker 永远看不到跨方向的累计。reselect_count 跨方向累加，
 // 用于给单次 trigger 闭环一个硬预算，防止"评分不够好就一直换方向"无界烧 Token。
-const MAX_RESELECT_PER_TRIGGER = 4;   // 单次 trigger 闭环内最多重选方向次数；达到后强制收尾休眠
-let reselectCountThisTrigger = 0;     // 当前 trigger 生命周期内已累计的跨方向重选次数
+//
+// 两套独立预算，成本量级不同，故分开计：
+//   · MAX_RESELECT_PER_TRIGGER  —— 昂贵的 post-forge DROP_AND_RESELECT（鹰眼完整深挖 +
+//     熔炉评审一整轮后才否决），保守取小。
+//   · MAX_EARLY_REJECT_PER_TRIGGER —— 廉价的 EARLY_REJECT（鹰眼仅 Level-1 横向体检即否决
+//     全部候选，没深挖、没评审），成本低，预算给得更宽松，多给探索空间。
+// 两者都可经 config.env 覆盖（APS_MAX_RESELECT_PER_TRIGGER / APS_MAX_EARLY_REJECT_PER_TRIGGER）。
+let MAX_RESELECT_PER_TRIGGER = 4;       // 昂贵深挖后换方向上限
+let MAX_EARLY_REJECT_PER_TRIGGER = 8;   // 廉价预筛换方向上限（独立、更宽松）
+let reselectCountThisTrigger = 0;       // 当前 trigger 内累计的昂贵 post-forge 重选次数
+let earlyRejectCountThisTrigger = 0;    // 当前 trigger 内累计的廉价 EARLY_REJECT 换方向次数
+
+// Grace window (ms) before a worker whose AgentTask reports done — but whose raw/scored
+// file has not yet appeared — is declared "missing output". Guards the RACE where the
+// transport-level task completes a few seconds before the actual file write lands. Must
+// comfortably exceed the gap between task-completion and file-write (observed ~4s).
+let WORKER_OUTPUT_GRACE_MS = 90 * 1000;
+
+// How many directions the scout may DEEP-DIVE (Level-2) in a single run. The scout focuses
+// the round on the single best direction; other prescreen-passing directions are NOT
+// rejected — they are recorded as deferred_candidates and become priority directions for a
+// later trigger (via the [待观察] diary). Keeps each round focused and token-bounded while
+// avoiding the "force-pick-1, drop-2" mis-elimination of genuinely good directions.
+let MAX_DEEP_DIVE_PER_RUN = 1;
+
+function loadWorkflowBudgetConfig(config = {}) {
+  const read = (key, fallback) => {
+    const raw = config[key] ?? process.env[key];
+    const num = Number(raw);
+    return (raw !== undefined && raw !== null && String(raw).trim() !== '' && Number.isFinite(num)) ? num : fallback;
+  };
+  MAX_RESELECT_PER_TRIGGER = read('APS_MAX_RESELECT_PER_TRIGGER', 4);
+  MAX_EARLY_REJECT_PER_TRIGGER = read('APS_MAX_EARLY_REJECT_PER_TRIGGER', 8);
+  WORKER_OUTPUT_GRACE_MS = read('APS_WORKER_OUTPUT_GRACE_SECONDS', 90) * 1000;
+  MAX_DEEP_DIVE_PER_RUN = Math.max(1, read('APS_MAX_DEEP_DIVE_PER_RUN', 1));
+}
 
 // --- Workflow Driver Tick Interval ---
-// 60s 偏短：AgentAssistant 委托是异步的，单个 worker 通常要数分钟，60s tick 大量空转。
-// 但在测试/开发调试期间，180s 偏慢，调小为 30s 以加快 manual 响应和状态机流转。
+// Watchdog now ONLY does timeout sweeps (normal progression is callback-driven via
+// triggerImmediateWorkflowTick). 30s keeps timeout detection responsive without polling work.
 const WORKFLOW_TICK_INTERVAL_MS = 30 * 1000;
+
+// ===========================================================================
+//  v4 EXPLICIT STATE MACHINE — single source of truth per run
+// ===========================================================================
+// Each run owns ONE authoritative file: runs/state/<run_id>.state.json. The driver
+// reads `status` to decide the next action; nothing is inferred from file existence,
+// mtimes, lock files, or AgentTask markdown anymore. This removes the entire class of
+// double-action races (duplicate posts/diaries, orphan raws, re-delegation storms).
+//
+// Lifecycle:
+//   PENDING_BRIEF -> SCOUTING -> SCORING -> EVALUATING -> PUBLISHING -> DONE
+//   any step may branch to FAILED (then publish blocking report -> DONE)
+//   EVALUATING may branch back to SCOUTING (loopback) or spawn a fresh PENDING_BRIEF (reselect)
+const APS_STATE = {
+  PENDING_BRIEF: 'PENDING_BRIEF',
+  SCOUTING: 'SCOUTING',
+  SCORING: 'SCORING',
+  EVALUATING: 'EVALUATING',
+  PUBLISHING: 'PUBLISHING',
+  DONE: 'DONE',
+  FAILED: 'FAILED'
+};
+
+// Per-status timeout (ms): if a run sits in this status longer than the limit with no
+// progress, the watchdog records a (non-system) failure against it. Dispatch-bearing
+// states (waiting on an async agent) get the worker grace; instantaneous backend states
+// get a short ceiling.
+function statusTimeoutMs(status) {
+  switch (status) {
+    case APS_STATE.SCOUTING:
+    case APS_STATE.SCORING:
+      return Math.max(WORKER_OUTPUT_GRACE_MS, 15 * 60 * 1000); // worker is running an agent
+    case APS_STATE.PENDING_BRIEF:
+    case APS_STATE.PUBLISHING:
+    case APS_STATE.FAILED:
+      return 10 * 60 * 1000; // coordinator content task
+    case APS_STATE.EVALUATING:
+      return 5 * 60 * 1000;  // pure backend decision, should be near-instant
+    default:
+      return 15 * 60 * 1000;
+  }
+}
+
+const APS_SYSTEM_ERROR_CAP = 2;     // 403/429/500/凭证/页面阻断：连续 2 次直接阻断
+const APS_NONSYSTEM_ERROR_CAP = 3;  // 超时/无明确原因失败：连续 3 次阻断
+
+function stateFilePath(runId) {
+  const safe = normalizeAutoSelectionRunId(runId);
+  return path.join(AUTO_SELECTION_RUNS_DIR, 'state', `${safe}.state.json`);
+}
+
+function freshRunState(runId, overrides = {}) {
+  return {
+    run_id: normalizeAutoSelectionRunId(runId),
+    status: APS_STATE.PENDING_BRIEF,
+    claimed_by: null,
+    claimed_at: null,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+    last_action: 'created',
+    last_action_result: '',
+    // Persisted budgets/counters (survive restarts; authoritative copy).
+    counters: {
+      global_loopback: 0,
+      scout_loopback: 0,
+      reviewer_loopback: 0,
+      reselect: 0,
+      early_reject: 0
+    },
+    failure_tracking: { system_error_count: 0, nonsystem_error_count: 0, last_error: '' },
+    // Idempotency flags for the multi-step terminal publish (root-fix for duplicate diaries).
+    publish_flags: { post_published: false, diary_written: false, archived: false },
+    force_decision_mode: false,
+    history: [],
+    ...overrides
+  };
+}
+
+async function readRunState(runId) {
+  try {
+    const content = await fs.readFile(stateFilePath(runId), 'utf8');
+    return JSON.parse(content);
+  } catch (_) {
+    return null;
+  }
+}
+
+// Atomic write: temp file + rename, so a crash mid-write never leaves a half-JSON state.
+async function writeRunState(state) {
+  const dir = path.join(AUTO_SELECTION_RUNS_DIR, 'state');
+  await fs.mkdir(dir, { recursive: true });
+  state.updated_at = nowIso();
+  const finalPath = stateFilePath(state.run_id);
+  const tmpPath = `${finalPath}.tmp`;
+  await fs.writeFile(tmpPath, JSON.stringify(state, null, 2), 'utf8');
+  await fs.rename(tmpPath, finalPath);
+  return finalPath;
+}
+
+async function listRunStates() {
+  const dir = path.join(AUTO_SELECTION_RUNS_DIR, 'state');
+  await fs.mkdir(dir, { recursive: true });
+  let entries = [];
+  try {
+    entries = await fs.readdir(dir);
+  } catch (_) {
+    return [];
+  }
+  const states = [];
+  for (const name of entries) {
+    if (!name.endsWith('.state.json')) continue;
+    try {
+      states.push(JSON.parse(await fs.readFile(path.join(dir, name), 'utf8')));
+    } catch (_) { /* skip corrupt/partial */ }
+  }
+  return states;
+}
+
+// Atomic claim: only one tick may hold a run. Returns the claimed state, or null if it is
+// already claimed and not yet timed out. This is the structural guard against double-action.
+async function claimRun(runId, role) {
+  const state = await readRunState(runId);
+  if (!state) return null;
+  if (state.claimed_by) {
+    const age = Date.now() - new Date(state.claimed_at || 0).getTime();
+    if (Number.isFinite(age) && age < statusTimeoutMs(state.status)) {
+      return null; // genuinely in-flight; another tick owns it
+    }
+    // else: stale claim (worker died / crash) — reclaim it.
+  }
+  state.claimed_by = role;
+  state.claimed_at = nowIso();
+  await writeRunState(state);
+  return state;
+}
+
+async function commitTransition(state, nextStatus, note = '') {
+  const from = state.status;
+  state.history = (state.history || []).slice(-40);
+  state.history.push({ at: nowIso(), from, to: nextStatus, note: String(note).slice(0, 200) });
+  state.status = nextStatus;
+  state.last_action_result = note;
+  state.claimed_by = null;
+  state.claimed_at = null;
+  // Track dispatch time for worker-waiting states so the watchdog can time out a worker that
+  // dies WITHOUT writing its handoff file (e.g. a 500 inside ProductSelector). SCOUTING/SCORING
+  // are entered right before dispatching scout/forge. Clear it elsewhere.
+  if (nextStatus === APS_STATE.SCOUTING || nextStatus === APS_STATE.SCORING) {
+    state.dispatched_at = nowIso();
+  } else {
+    state.dispatched_at = null;
+  }
+  // A successful transition clears the consecutive-failure streak.
+  if (nextStatus !== APS_STATE.FAILED) {
+    state.failure_tracking.system_error_count = 0;
+    state.failure_tracking.nonsystem_error_count = 0;
+  }
+  await writeRunState(state);
+  logWorkflowEvent(`[StateMachine] ${state.run_id}: ${from} -> ${nextStatus}${note ? ' (' + note + ')' : ''}`);
+}
+
+// Record a failure against a run with the user-chosen caps:
+//   system error (403/429/500/credential/page-block) -> cap 2
+//   non-system (timeout / unknown) -> cap 3
+// Returns true if the run was force-failed (cap reached).
+async function recordRunFailure(state, errType, reason = '') {
+  const isSystem = errType === 'system';
+  state.failure_tracking.last_error = String(reason).slice(0, 300);
+  if (isSystem) state.failure_tracking.system_error_count += 1;
+  else state.failure_tracking.nonsystem_error_count += 1;
+  const sys = state.failure_tracking.system_error_count;
+  const non = state.failure_tracking.nonsystem_error_count;
+  state.claimed_by = null;
+  state.claimed_at = null;
+  const capped = (isSystem && sys >= APS_SYSTEM_ERROR_CAP) || (!isSystem && non >= APS_NONSYSTEM_ERROR_CAP);
+  if (capped) {
+    logWorkflowEvent(`[StateMachine] ${state.run_id}: 失败上限触发 (system ${sys}/${APS_SYSTEM_ERROR_CAP}, nonsystem ${non}/${APS_NONSYSTEM_ERROR_CAP})，转入 FAILED。原因: ${reason}`, true);
+    await commitTransition(state, APS_STATE.FAILED, `failure cap: ${reason}`.slice(0, 180));
+    return true;
+  }
+  logWorkflowEvent(`[StateMachine] ${state.run_id}: 记录失败 (system ${sys}/${APS_SYSTEM_ERROR_CAP}, nonsystem ${non}/${APS_NONSYSTEM_ERROR_CAP})，将重试。原因: ${reason}`, true);
+  await writeRunState(state);
+  return false;
+}
+
+// Classify an error string/object into 'system' vs 'nonsystem' for the caps above.
+function classifyErrorType(text = '') {
+  const s = String(text || '').toLowerCase();
+  if (/status code (4\d\d|5\d\d)|\b(403|408|429|500|502|503|504)\b|credential|凭证|page_blocked|needs_manual_action|验证码|captcha|账号|rate.?limit/i.test(s)) {
+    return 'system';
+  }
+  return 'nonsystem';
+}
+
+// --- Workflow Driver Tick Interval (legacy marker kept for old references below) ---
+
 
 // --- Workflow Driver Functions ---
 
@@ -2177,211 +2439,6 @@ async function loadToolBoxContent() {
 }
 
 /**
- * Check and manage coordinator lock to prevent duplicate delegations
- */
-async function checkCoordinatorLock() {
-  const lockPath = path.join(AUTO_SELECTION_RUNS_DIR, 'locks', 'coordinator.lock');
-  try {
-    await fs.access(lockPath);
-    return true; // Lock exists
-  } catch {
-    return false; // Lock doesn't exist
-  }
-}
-
-async function createCoordinatorLock(reason = 'delegation') {
-  const lockPath = path.join(AUTO_SELECTION_RUNS_DIR, 'locks', 'coordinator.lock');
-  const content = [
-    `lock_type: coordinator`,
-    `created_at: ${nowIso()}`,
-    `reason: ${reason}`
-  ].join('\n') + '\n';
-  await fs.writeFile(lockPath, content, 'utf8');
-  logWorkflowEvent(`Created coordinator lock. Reason: ${reason}`);
-}
-
-async function removeCoordinatorLock() {
-  const lockPath = path.join(AUTO_SELECTION_RUNS_DIR, 'locks', 'coordinator.lock');
-  try {
-    await fs.unlink(lockPath);
-    logWorkflowEvent('Removed coordinator lock.');
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      console.error('[AutoProductSelection] Failed to remove coordinator lock:', error);
-      logWorkflowEvent(`Failed to remove coordinator lock: ${error.message}`, true);
-    }
-  }
-}
-
-/**
- * Check if there's an active coordinator task (破壁_枢纽)
- */
-async function checkActiveCoordinatorTask() {
-  try {
-    const entries = await fs.readdir(AGENT_TASK_DIR, { withFileTypes: true });
-    const coordinatorFiles = entries.filter(entry =>
-      entry.isFile() &&
-      entry.name.startsWith('破壁_枢纽_') &&
-      entry.name.endsWith('.md')
-    );
-
-    for (const entry of coordinatorFiles) {
-      const fullPath = path.join(AGENT_TASK_DIR, entry.name);
-      const stat = await fs.stat(fullPath);
-      const fileAge = (Date.now() - stat.mtimeMs) / 1000 / 60;
-
-      // 只检查最近15分钟内的文件，避免网络请求过慢被跳过
-      if (fileAge > 15) continue;
-
-      const content = await fs.readFile(fullPath, 'utf8');
-
-      // 检查是否包含自动选品相关内容且未完成
-      if (content.includes('AutoProductSelection') || content.includes('auto_selection_')) {
-        // 如果任务状态是 Succeed 或 Failed，认为已完成
-        if (content.includes('任务状态:** Succeed') || content.includes('任务状态:** Failed')) {
-          continue;
-        }
-
-        // 如果文件在10分钟内被修改，认为任务仍在活跃（适配慢网络/慢API及大模型长耗时）
-        if (fileAge < 10) {
-          return true;
-        }
-      }
-    }
-
-    return false;
-  } catch (error) {
-    debugLog(`Failed to check active coordinator task: ${error.message}`);
-    return false; // 检查失败时假设无活跃任务
-  }
-}
-
-/**
- * Check if there is a failed coordinator task (破壁_枢纽) in the last 15 minutes
- */
-async function checkFailedCoordinatorTask() {
-  try {
-    const entries = await fs.readdir(AGENT_TASK_DIR, { withFileTypes: true });
-    const coordinatorFiles = entries.filter(entry =>
-      entry.isFile() &&
-      entry.name.startsWith('破壁_枢纽_') &&
-      entry.name.endsWith('.md')
-    );
-
-    const matches = [];
-    for (const entry of coordinatorFiles) {
-      const fullPath = path.join(AGENT_TASK_DIR, entry.name);
-      const stat = await fs.stat(fullPath);
-      const fileAge = (Date.now() - stat.mtimeMs) / 1000 / 60; // minutes
-
-      // Only check tasks modified in the last 15 minutes
-      if (fileAge > 15) continue;
-
-      const content = await fs.readFile(fullPath, 'utf8');
-
-      // Check if it is related to AutoProductSelection and is marked Failed
-      if (content.includes('AutoProductSelection') || content.includes('auto_selection_')) {
-        if (content.includes('任务状态:** Failed')) {
-          matches.push({
-            name: entry.name,
-            modified_at: stat.mtimeMs,
-            content
-          });
-        }
-      }
-    }
-
-    if (matches.length === 0) return null;
-    // Sort by modified time descending to get the latest
-    matches.sort((a, b) => b.modified_at - a.modified_at);
-
-    const latest = matches[0];
-    const finalResult = latest.content.split('## 最终执行结果')[1]?.trim() || '';
-    const delegationId = (latest.name.match(/(aa-delegation-[^.]+)\.md$/) || [])[1] || '';
-
-    let detailError = '';
-    if (delegationId) {
-      const asyncResultPath = path.join(VCP_ROOT_DIR, 'VCPAsyncResults', `AgentAssistant-${delegationId}.json`);
-      try {
-        const asyncResult = JSON.parse(await fs.readFile(asyncResultPath, 'utf8'));
-        if (asyncResult && asyncResult.message) {
-          detailError = asyncResult.message;
-        }
-      } catch (_) { }
-    }
-
-    let errorSummary = finalResult.slice(0, 500);
-    if (detailError) {
-      errorSummary += ` (详细错误: ${detailError.slice(0, 500)})`;
-    }
-
-    return {
-      name: latest.name,
-      error: errorSummary || '未知错误导致任务失败'
-    };
-  } catch (error) {
-    debugLog(`Failed to check failed coordinator task: ${error.message}`);
-    return null;
-  }
-}
-
-async function checkLatestCoordinatorTaskStatus(lockMtimeMs) {
-  try {
-    const entries = await fs.readdir(AGENT_TASK_DIR, { withFileTypes: true });
-    const coordinatorFiles = entries.filter(entry =>
-      entry.isFile() &&
-      entry.name.startsWith('破壁_枢纽_') &&
-      entry.name.endsWith('.md')
-    );
-
-    if (coordinatorFiles.length === 0) return null;
-
-    const fileStats = [];
-    for (const entry of coordinatorFiles) {
-      const fullPath = path.join(AGENT_TASK_DIR, entry.name);
-      const stat = await fs.stat(fullPath);
-      // Filter by modification time first: must be within/after the lock creation time (with 5s grace period)
-      if (stat.mtimeMs >= lockMtimeMs - 5000) {
-        fileStats.push({ entry, mtimeMs: stat.mtimeMs, fullPath });
-      }
-    }
-
-    if (fileStats.length === 0) return null;
-
-    // Check files to find the latest AutoProductSelection task
-    const selectionTasks = [];
-    for (const file of fileStats) {
-      try {
-        const content = await fs.readFile(file.fullPath, 'utf8');
-        if (content.includes('AutoProductSelection') || content.includes('auto_selection_')) {
-          const isSucceed = content.includes('任务状态:** Succeed');
-          const isFailed = content.includes('任务状态:** Failed');
-          selectionTasks.push({
-            name: file.entry.name,
-            mtimeMs: file.mtimeMs,
-            status: isSucceed ? 'Succeed' : (isFailed ? 'Failed' : 'Running')
-          });
-        }
-      } catch (err) {
-        debugLog(`Failed to read coordinator task file ${file.fullPath}: ${err.message}`);
-      }
-    }
-
-    if (selectionTasks.length === 0) return null;
-
-    // Sort matching tasks by modification time descending
-    selectionTasks.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-    return selectionTasks[0];
-  } catch (error) {
-    debugLog(`Failed to check latest coordinator task status: ${error.message}`);
-    return null;
-  }
-}
-
-
-
-/**
  * Parse loopback counters from run state file
  */
 function parseLoopbackCounters(content = '') {
@@ -2390,6 +2447,7 @@ function parseLoopbackCounters(content = '') {
   const scoutMatch = text.match(/scout_loopback_count:\s*(\d+)/i);
   const reviewerMatch = text.match(/reviewer_loopback_count:\s*(\d+)/i);
   const reselectMatch = text.match(/reselect_count:\s*(\d+)/i);
+  const earlyRejectMatch = text.match(/early_reject_count:\s*(\d+)/i);
 
   return {
     global_loopback_count: globalMatch ? parseInt(globalMatch[1], 10) : 0,
@@ -2397,7 +2455,9 @@ function parseLoopbackCounters(content = '') {
     reviewer_loopback_count: reviewerMatch ? parseInt(reviewerMatch[1], 10) : 0,
     // Cross-direction reselect budget, persisted so it survives DROP_AND_RESELECT
     // (which changes run_id + resets loopback counters) and process restarts.
-    reselect_count: reselectMatch ? parseInt(reselectMatch[1], 10) : 0
+    reselect_count: reselectMatch ? parseInt(reselectMatch[1], 10) : 0,
+    // Cheap Level-1 EARLY_REJECT budget, persisted separately from the expensive reselect.
+    early_reject_count: earlyRejectMatch ? parseInt(earlyRejectMatch[1], 10) : 0
   };
 }
 
@@ -2410,6 +2470,7 @@ function injectLoopbackCounters(content = '', counters = {}) {
   const scout = counters.scout_loopback_count || 0;
   const reviewer = counters.reviewer_loopback_count || 0;
   const reselect = counters.reselect_count || 0;
+  const earlyReject = counters.early_reject_count || 0;
 
   // Build counter metadata block
   const counterBlock = [
@@ -2418,6 +2479,7 @@ function injectLoopbackCounters(content = '', counters = {}) {
     `scout_loopback_count: ${scout}`,
     `reviewer_loopback_count: ${reviewer}`,
     `reselect_count: ${reselect}`,
+    `early_reject_count: ${earlyReject}`,
     '<!-- End Counters -->'
   ].join('\n');
 
@@ -2434,6 +2496,12 @@ function injectLoopbackCounters(content = '', counters = {}) {
       updated = updated.replace(/reselect_count:\s*\d+/gi, `reselect_count: ${reselect}`);
     } else {
       updated = updated.replace(/(reviewer_loopback_count:\s*\d+)/i, `$1\nreselect_count: ${reselect}`);
+    }
+    // early_reject_count likewise may be absent in older files.
+    if (/early_reject_count:\s*\d+/i.test(updated)) {
+      updated = updated.replace(/early_reject_count:\s*\d+/gi, `early_reject_count: ${earlyReject}`);
+    } else {
+      updated = updated.replace(/(reselect_count:\s*\d+)/i, `$1\nearly_reject_count: ${earlyReject}`);
     }
     return updated;
   } else {
@@ -2491,36 +2559,6 @@ function shouldTriggerCircuitBreaker(counters) {
 }
 
 /**
- * Detect if a coordinator task (破壁_枢纽) for the given run has completed execution (Succeed/Failed).
- */
-async function findCompletedCoordinatorTask(runId, taskType) {
-  try {
-    const entries = await fs.readdir(AGENT_TASK_DIR, { withFileTypes: true });
-    const coordinatorPrefixes = ['破壁_枢纽_'];
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
-      const hasExpectedPrefix = coordinatorPrefixes.some(prefix => entry.name.startsWith(prefix));
-      if (!hasExpectedPrefix) continue;
-      const fullPath = path.join(AGENT_TASK_DIR, entry.name);
-      const content = await fs.readFile(fullPath, 'utf8');
-      if (!content.includes(runId)) continue;
-      if (!content.includes(taskType)) continue;
-      if (content.includes('任务状态:** Succeed') || content.includes('任务状态:** Failed')) {
-        return {
-          name: entry.name,
-          path: fullPath,
-          status: content.includes('任务状态:** Failed') ? 'Failed' : 'Succeed'
-        };
-      }
-    }
-    return null;
-  } catch (error) {
-    debugLog(`findCompletedCoordinatorTask failed for ${runId}: ${error.message}`);
-    return null;
-  }
-}
-
-/**
  * Helper to check if a forge lock is configured in force_decision_mode.
  */
 async function isForgeLockInForceDecisionMode(runId) {
@@ -2552,774 +2590,548 @@ function triggerImmediateWorkflowTick(source, context = {}) {
  */
 async function workflowDriver(triggerSource = 'watchdog', context = {}) {
   if (isDriverExecuting) {
-    if (debugMode) {
-      logWorkflowEvent(`[WorkflowDriver] 收到来自 ${triggerSource} 的 Tick，但当前已有实例正在运行，跳过重入。`);
-    }
+    if (debugMode) logWorkflowEvent(`[Driver] Tick from ${triggerSource} skipped — already executing.`);
     return;
   }
   isDriverExecuting = true;
-  if (debugMode) {
-    logWorkflowEvent(`>>> Tick 开始 | 触发源: ${triggerSource} | 上下文: ${JSON.stringify(context)}`);
-  }
+  if (debugMode) logWorkflowEvent(`>>> Tick start | source: ${triggerSource} | ctx: ${JSON.stringify(context)}`);
   try {
-    debugLog('Workflow driver tick started.');
-
-    // Check coordinator lock first
-    const hasCoordinatorLock = await checkCoordinatorLock();
-    if (hasCoordinatorLock) {
-      const lockPath = path.join(AUTO_SELECTION_RUNS_DIR, 'locks', 'coordinator.lock');
-      try {
-        const stat = await fs.stat(lockPath);
-        const lockAge = (Date.now() - stat.mtimeMs) / 1000 / 60; // minutes
-
-        // Check if there is a failed coordinator task
-        const failedTask = await checkFailedCoordinatorTask();
-        if (failedTask) {
-          logWorkflowEvent(`[Coordinator Task Failed] 协调器任务失败: ${failedTask.name}。错误原因: ${failedTask.error}。立即清除协调器锁以允许下一次重试。`, true);
-          await removeCoordinatorLock();
-        } else {
-          // Check if the latest coordinator task has successfully completed
-          const completedTask = await checkLatestCoordinatorTaskStatus(stat.mtimeMs);
-          if (completedTask && completedTask.status === 'Succeed') {
-            logWorkflowEvent(`[Coordinator Task Succeeded] 检测到协调器任务已执行完毕 (${completedTask.name})，但锁依然残留，后端执行自动解锁。`);
-            await removeCoordinatorLock();
-          } else {
-            // Check if there's an active coordinator task
-            const hasActiveTask = await checkActiveCoordinatorTask();
-
-            if (!hasActiveTask && lockAge > 10) {
-              // No active coordinator task and lock is older than 10 minutes - orphaned lock
-              console.warn(`[AutoProductSelection WorkflowDriver] Coordinator lock orphaned (${Math.floor(lockAge)} minutes, no active task). Removing it.`);
-              logWorkflowEvent(`Coordinator lock orphaned (${Math.floor(lockAge)} minutes old, no active task). Removing it.`);
-              await removeCoordinatorLock();
-            } else if (lockAge > 25) {
-              // Force cleanup after 25 minutes (increased from 15 to accommodate slow runs)
-              console.warn(`[AutoProductSelection WorkflowDriver] Coordinator lock is stale (${Math.floor(lockAge)} minutes old). Removing it.`);
-              logWorkflowEvent(`Coordinator lock is stale (${Math.floor(lockAge)} minutes old). Removing it.`);
-              await removeCoordinatorLock();
-            } else {
-              if (debugMode) {
-                logWorkflowEvent(`Coordinator lock exists (${Math.floor(lockAge)} minutes old, activeTask: ${hasActiveTask}) - waiting for delegation to complete.`);
-              }
-              consecutiveErrorCount = 0; // Reset error count on normal wait
-              return;
-            }
-          }
-        }
-      } catch (error) {
-        // Lock file doesn't exist anymore, continue
-        debugLog('Coordinator lock check failed, continuing.');
-      }
+    // Watchdog-only responsibility: sweep for runs stuck past their status timeout and
+    // record a (non-system) failure against them. Normal progression is callback-driven.
+    if (triggerSource === 'watchdog') {
+      await sweepTimeouts();
     }
 
-    const queue = await autoSelectionQueueStatus({ include_content: true });
+    // Pick the next actionable run and advance it exactly one step. A run is actionable if
+    // it is not terminal (DONE) and not currently claimed by an in-flight step.
+    const states = await listRunStates();
+    const active = states.filter(s => s && s.status !== APS_STATE.DONE);
 
-    if (!queue.success) {
-      console.error('[AutoProductSelection WorkflowDriver] Failed to get queue status:', queue);
-      consecutiveErrorCount++;
-      if (consecutiveErrorCount >= MAX_CONSECUTIVE_ERRORS) {
-        console.error('[AutoProductSelection WorkflowDriver] Max consecutive errors reached. Stopping workflow.');
+    if (active.length === 0) {
+      // No active runs. If we were running a round, the round is complete -> self-terminate.
+      if (isWorkflowRunning) {
+        logWorkflowEvent('Round complete — no active runs. Entering self-termination.');
         await stopWorkflowDriver();
       }
       return;
     }
 
-    // Reset consecutive error count on success
-    consecutiveErrorCount = 0;
-    lastWorkflowError = null;  // Clear error on success
-
-    // Auto-clean malformed worker locks (lock files without a hawkeye/forge suffix
-    // and without corresponding output). These never map to a real worker, so they
-    // would otherwise pin next_action_hint at cleanup_malformed_locks forever while
-    // also not counting toward activeRuns (causing a silent self-termination deadlock).
-    // coordinator.lock is intentionally excluded here — it is managed separately above.
-    const malformedLocks = queue.derived?.malformed_locks || [];
-    for (const malformed of malformedLocks) {
-      if (!malformed?.name || malformed.name === 'coordinator.lock') continue;
-      try {
-        await fs.unlink(malformed.path);
-        console.warn(`[AutoProductSelection WorkflowDriver] Removed malformed lock: ${malformed.name}`);
-      } catch (error) {
-        if (error.code !== 'ENOENT') {
-          console.error(`[AutoProductSelection WorkflowDriver] Failed to remove malformed lock ${malformed.name}:`, error.message);
-        }
-      }
-    }
-
-    // Calculate active runs. MUST include valid_locks (hawkeye/forge worker locks):
-    // active_briefs EXCLUDES locked briefs, so while a worker is running, brief is hidden
-    // and raw/scored not yet written -> activeRuns would be 0 and the driver would
-    // self-terminate mid-work. Counting valid_locks keeps the driver alive until the
-    // worker actually produces output (or its stale lock is cleaned up above).
-    // This mirrors the activeRuns calculation in autoSelectionTriggerRun.
-    const activeRuns = (queue.derived?.active_briefs?.length || 0) +
-      (queue.derived?.valid_locks?.length || 0) +
-      (queue.stages?.raw?.length || 0) +
-      (queue.stages?.scored?.length || 0);
-
-    // Check if this round has completed (lifecycle closure detection)
-    if (workflowState === 'ACTIVE' && activeRuns === 0) {
-      logWorkflowEvent('Round completed - active runs returned to zero. Entering self-termination.');
-      await stopWorkflowDriver();
-      return;
-    }
-
-    const hint = queue.next_action_hint;
-    debugLog(`Workflow driver: next_action_hint = ${hint}`);
-
-    switch (hint) {
-      case 'cleanup_archived_residue':
-        await handleCleanupArchivedResidue(queue);
-        break;
-      case 'handle_failed':
-        await handleFailedRuns(queue);
-        break;
-      case 'evaluate_scored':
-        await handleEvaluateScored(queue);
-        break;
-      case 'evaluate_raw':
-        await handleEvaluateRaw(queue);
-        break;
-      case 'retry_worker_once':
-        await handleRetryWorker(queue);
-        break;
-      case 'handle_worker_missing_output':
-        await handleWorkerMissingOutput(queue);
-        break;
-      case 'send_existing_brief_to_scout':
-        workflowState = 'ACTIVE'; // Mark state as active once we proceed
-        await handleSendBriefToScout(queue);
-        break;
-      case 'create_brief_and_send_scout':
-        if (workflowState === 'INIT') {
-          workflowState = 'ACTIVE'; // Move to ACTIVE to allow self-termination later
-          createBriefCountThisTrigger += 1;
-          await handleCreateBriefAndSendScout();
-        } else if (createBriefCountThisTrigger > MAX_RESELECT_PER_TRIGGER) {
-          // Hard ceiling: never relaunch beyond the reselect budget, regardless of state.
-          console.warn(`[AutoProductSelection WorkflowDriver] create_brief ceiling reached (${createBriefCountThisTrigger}); stopping to prevent an unbounded reselect loop.`);
-          await stopWorkflowDriver();
-        } else {
-          console.log('[AutoProductSelection WorkflowDriver] Queue is idle and workflow is not in INIT state. Refusing to auto-create new brief.');
-          await stopWorkflowDriver();
-        }
-        break;
-      case 'wait_for_worker':
-        debugLog('Workflow driver: waiting for worker to complete.');
-        break;
-      case 'cleanup_malformed_locks':
-        // Malformed locks were already unlinked above; nothing more to do this tick.
-        // The next tick re-derives next_action_hint from the cleaned-up queue.
-        debugLog('Workflow driver: malformed locks cleaned, will re-evaluate next tick.');
-        break;
-      default:
-        debugLog(`Workflow driver: unknown hint ${hint}, skipping.`);
-    }
+    // Advance the oldest active run (FIFO). One run at a time — ProductSelector is serial.
+    active.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
+    const target = active[0];
+    await advanceRun(target.run_id);
   } catch (error) {
-    console.error('[AutoProductSelection WorkflowDriver] Error:', error);
-    logWorkflowEvent(`Error in workflowDriver: ${error.message || error}`, true);
-    lastWorkflowError = error.stack || error.message || String(error);  // Record error
-    consecutiveErrorCount++;
-    if (consecutiveErrorCount >= MAX_CONSECUTIVE_ERRORS) {
-      console.error('[AutoProductSelection WorkflowDriver] Max consecutive errors reached. Stopping workflow.');
-      logWorkflowEvent(`Max consecutive errors reached (${consecutiveErrorCount}). Stopping workflow.`, true);
-      await stopWorkflowDriver();
-    }
+    console.error('[AutoProductSelection Driver] Error:', error);
+    logWorkflowEvent(`Driver error: ${error.message || error}`, true);
+    lastWorkflowError = error.stack || error.message || String(error);
   } finally {
     isDriverExecuting = false;
-    if (debugMode) {
-      logWorkflowEvent(`<<< Tick 结束 | 触发源: ${triggerSource}`);
-    }
+    if (debugMode) logWorkflowEvent(`<<< Tick end | source: ${triggerSource}`);
   }
 }
 
 /**
- * Cleanup archived residue files.
+ * Scan AgentTask + VCPAsyncResults for the most recent COMPLETED worker delegation of a run
+ * that ended WITHOUT producing its handoff file. Returns { found, errorText, errType } so the
+ * watchdog can fail fast (and classify system vs non-system) instead of waiting out the full
+ * status timeout. A scout/forge that 500s surfaces here within seconds of the callback.
  */
-async function handleCleanupArchivedResidue(queue) {
-  const residues = queue.derived?.archived_residues || [];
-  if (residues.length === 0) return;
-
-  debugLog(`Cleaning up ${residues.length} archived residues.`);
-  for (const residue of residues) {
-    try {
-      await autoSelectionCleanupRun({ run_id: residue.run_id });
-      debugLog(`Cleaned up residue for run_id: ${residue.run_id}`);
-    } catch (error) {
-      console.error(`[AutoProductSelection WorkflowDriver] Failed to cleanup ${residue.run_id}:`, error);
+async function detectWorkerDeliveryFailure(runId, status, sinceMs = 0) {
+  // Which worker role + expected output for this status.
+  const role = status === APS_STATE.SCORING ? '破壁_熔炉'
+    : status === APS_STATE.SCOUTING ? '破壁_鹰眼'
+      : null;
+  if (!role) return { found: false };
+  const expectedStage = status === APS_STATE.SCORING ? 'scored' : 'raw';
+  // If the handoff already exists, there is no failure to detect.
+  try { await fs.access(resolveAutoSelectionFile(expectedStage, runId)); return { found: false }; } catch (_) { }
+  try {
+    const entries = await fs.readdir(AGENT_TASK_DIR, { withFileTypes: true });
+    let best = null;
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.startsWith(`${role}_`) || !entry.name.endsWith('.md')) continue;
+      const full = path.join(AGENT_TASK_DIR, entry.name);
+      const stat = await fs.stat(full);
+      // Only consider a delegation result NEWER than the current dispatch, so a retry does not
+      // re-trip on the previous attempt's stale failed AgentTask.
+      if (sinceMs && stat.mtimeMs < sinceMs) continue;
+      const content = await fs.readFile(full, 'utf8');
+      if (!content.includes(runId)) continue;
+      if (!content.includes('任务状态:** Failed') && !content.includes('任务状态:** Succeed')) continue;
+      if (!best || stat.mtimeMs > best.mtimeMs) best = { name: entry.name, mtimeMs: stat.mtimeMs, content };
     }
+    if (!best) return { found: false };
+    // Pull the real error from the async result if present.
+    const did = (best.name.match(/(aa-delegation-[^.]+)\.md$/) || [])[1] || '';
+    let errText = '';
+    if (did) {
+      try {
+        const ar = JSON.parse(await fs.readFile(path.join(VCP_ROOT_DIR, 'VCPAsyncResults', `AgentAssistant-${did}.json`), 'utf8'));
+        errText = `${ar.status || ''} ${ar.message || ''}`;
+      } catch (_) { }
+    }
+    if (!errText) errText = best.content.includes('任务状态:** Failed') ? 'worker task Failed' : '';
+    // Only treat as a delivery failure if the task actually Failed, or Succeeded-but-no-output
+    // (the latter is a worker that finished its turn without writing — also a real failure).
+    const failed = best.content.includes('任务状态:** Failed');
+    if (!failed && !errText) return { found: false };
+    return { found: true, errorText: errText, errType: classifyErrorType(errText) };
+  } catch (_) {
+    return { found: false };
   }
 }
 
 /**
- * Handle failed runs - delegate to 破壁_枢纽 to publish blocking report and archive.
- * After completion, stop workflow driver.
+ * Watchdog: find runs sitting in a non-terminal status longer than allowed and record a
+ * timeout failure. Also fast-fails workers whose delegation already returned an error
+ * (e.g. HTTP 500) before the full status timeout. This is the ONLY thing the timer does now.
  */
-async function handleFailedRuns(queue) {
-  const failedFiles = queue.stages?.failed || [];
-  if (failedFiles.length === 0) return;
+async function sweepTimeouts() {
+  const states = await listRunStates();
+  const now = Date.now();
+  for (const state of states) {
+    if (!state || state.status === APS_STATE.DONE || state.status === APS_STATE.FAILED) continue;
 
-  const failed = failedFiles[0];
-  debugLog(`Handling failed run: ${failed.run_id}`);
-
-  // Check if coordinator task has already completed but file remains unarchived (autocorrect / safety net)
-  const completedTask = await findCompletedCoordinatorTask(failed.run_id, 'handle_failed');
-  if (completedTask) {
-    console.warn(`[AutoProductSelection WorkflowDriver] 检测到协调器任务 "${completedTask.name}" 已执行完毕 (${completedTask.status})，但 failed 文件依然残留，后端执行自动归档兜底。`);
-    try {
-      await autoSelectionArchiveRun({ run_id: failed.run_id, stage: 'failed' });
-    } catch (err) {
-      console.error(`[AutoProductSelection WorkflowDriver] 自动归档 failed 残留文件失败:`, err.message);
-      await autoSelectionCleanupRun({ run_id: failed.run_id }).catch(() => { });
-    }
-    await removeCoordinatorLock();
-    failedDelegationAttempts.delete(failed.run_id);
-    return;
-  }
-
-  // Loop backstop: count how many times we have delegated this failed run. If the
-  // coordinator keeps failing to archive it, force-archive here so the queue drains.
-  const attempts = (failedDelegationAttempts.get(failed.run_id) || 0) + 1;
-  failedDelegationAttempts.set(failed.run_id, attempts);
-  if (attempts > MAX_FAILED_DELEGATIONS) {
-    console.warn(`[AutoProductSelection WorkflowDriver] handle_failed for ${failed.run_id} exceeded ${MAX_FAILED_DELEGATIONS} delegations. Force-archiving to break the loop.`);
-    try {
-      await autoSelectionArchiveRun({ run_id: failed.run_id, stage: 'failed' });
-    } catch (error) {
-      console.error(`[AutoProductSelection WorkflowDriver] Force-archive failed for ${failed.run_id}:`, error.message);
-      // Last resort: clean residue so the queue cannot stay stuck on this run.
-      await autoSelectionCleanupRun({ run_id: failed.run_id }).catch(() => { });
-    }
-    await removeCoordinatorLock();
-    failedDelegationAttempts.delete(failed.run_id);
-    return;
-  }
-
-  // Classify the failure: system-level blocks (worker never produced data) must NOT
-  // be recorded as a product "淘汰" — there is no data basis to eliminate a direction.
-  // Only data-driven rejections become eliminations / diary 淘汰 records.
-  let failedContent = failed.content || '';
-  if (!failedContent) {
-    try {
-      failedContent = await fs.readFile(failed.path, 'utf8');
-    } catch (_) {
-      failedContent = '';
-    }
-  }
-  const failureTypeMatch = failedContent.match(/failure_type:\s*([a-z_]+)/i);
-  const failureType = failureTypeMatch ? failureTypeMatch[1].toLowerCase() : '';
-  const SYSTEM_BLOCK_TYPES = ['worker_missing_output', 'system_error', 'reselect_budget_exhausted'];
-  const isSystemBlock = SYSTEM_BLOCK_TYPES.includes(failureType) ||
-    /classification:\s*worker_timeout/i.test(failedContent) ||
-    /worker.*(timed out|timeout|missing output|未.*输出|缺交付)/i.test(failedContent);
-
-  const droppedSummaries = await collectDroppedSummaries();
-  const droppedBlock = buildDroppedSummaryPromptBlock(droppedSummaries);
-
-  const diaryStep = isSystemBlock
-    ? `3. 在选品公共日记本中写入一条系统阻断记录（注意：这不是商业淘汰，本轮未取得有效数据，不要把它当作"方向淘汰"）。
-   请使用 DailyNote.create 写入，必须在工具调用中显式传入 Date 参数（格式 YYYY-MM-DD，从当前时间提取）。
-   Content 部分按以下格式书写，且 Tag 行必须放在 Content 最后一行的尾部：
-   [系统阻断] 产品方向（若有）- 阻断原因摘要
-   outcome: 系统阻断/数据未取得
-   note: 本轮因 worker 超时/缺交付/系统错误中断，未对该方向做出商业结论，后续可重新探索。
-   Tag: #系统阻断 #未取得数据`
-    : `3. 在选品公共日记本中写入极简淘汰日志。
-   请使用 DailyNote.create 写入，必须在工具调用中显式传入 Date 参数（格式 YYYY-MM-DD，从当前时间提取）。
-   Content 部分按以下格式书写，且 Tag 行必须放在 Content 最后一行的尾部：
-   [淘汰] 产品方向 - 数据层面的核心淘汰原因
-   outcome: 淘汰
-   primary_reason: 核心淘汰原因
-   Tag: #排除 #主要原因`;
-
-  const prompt = `你好，破壁_枢纽。AutoProductSelection 工作流驱动器检测到失败 run，需要你处理：
-
-run_id: ${failed.run_id}
-failed_file: ${failed.path}
-failure_kind: ${isSystemBlock ? 'SYSTEM_BLOCK（系统阻断，非商业淘汰）' : 'DATA_REJECTION（基于数据的淘汰）'}
-
-请执行以下步骤：
-1. 调用 AutoProductSelection 的 auto_selection_read_run_file 读取 failed 文件内容（必须加 ink:「始」mark_history「末」）。
-2. 基于失败原因，在 VCP 论坛发布阻断报告。${isSystemBlock ? '帖子要明确这是系统层面阻断（worker 超时/缺交付/系统错误），不是对该方向的商业否决。' : ''}
-${diaryStep}
-4. 调用 auto_selection_archive_run，stage=failed，run_id=${failed.run_id}。
-5. 完成后输出 [[TaskComplete]]。
-
-注意：
-- 不要尝试重试或创建新 brief。
-- 只处理这一个 failed run。
-- 写入日记时，必须在 DailyNote.create 调用中显式传入 Date 参数（格式 YYYY-MM-DD，例如 Date:「始」2026-06-20「末」），绝对不能省略！
-- 日记 Tag 行必须是 Content 的最后一行，否则 DailyNote 会报错。
-- 归档完成后必须输出 [[TaskComplete]]。${isSystemBlock ? '' : droppedBlock}`;
-
-  await delegateToCoordinator('handle_failed', failed.run_id, prompt);
-
-  // After delegation, workflow will auto-terminate when coordinator completes
-}
-
-/**
- * Handle evaluate_scored - check circuit breaker then delegate or direct action.
- * After PUBLISH_FINAL, stop workflow driver.
- */
-async function handleEvaluateScored(queue) {
-  const scoredFiles = queue.stages?.scored || [];
-  if (scoredFiles.length === 0) return;
-
-  const scored = scoredFiles[0];
-  debugLog(`Handling scored evaluation: ${scored.run_id}`);
-
-  // Check if coordinator task has already completed but file remains unarchived (autocorrect / safety net)
-  const completedTask = await findCompletedCoordinatorTask(scored.run_id, 'evaluate_scored');
-  if (completedTask) {
-    console.warn(`[AutoProductSelection WorkflowDriver] 检测到协调器任务 "${completedTask.name}" 已执行完毕 (${completedTask.status})，但 scored 文件依然残留，后端执行自动归档兜底。`);
-    try {
-      await autoSelectionArchiveRun({ run_id: scored.run_id, stage: 'scored' });
-    } catch (err) {
-      console.error(`[AutoProductSelection WorkflowDriver] 自动归档 scored 残留文件失败:`, err.message);
-      await autoSelectionCleanupRun({ run_id: scored.run_id }).catch(() => { });
-    }
-    await removeCoordinatorLock();
-    scoredDelegationAttempts.delete(scored.run_id);
-    return;
-  }
-
-  // Loop backstop: count how many times we have delegated this scored run. If the
-  // coordinator keeps failing to archive/publish it, force-archive here so the queue drains.
-  const attempts = (scoredDelegationAttempts.get(scored.run_id) || 0) + 1;
-  scoredDelegationAttempts.set(scored.run_id, attempts);
-  if (attempts > MAX_FAILED_DELEGATIONS) {
-    console.warn(`[AutoProductSelection WorkflowDriver] evaluate_scored for ${scored.run_id} exceeded ${MAX_FAILED_DELEGATIONS} delegations. Force-archiving to break the loop.`);
-    try {
-      await autoSelectionArchiveRun({ run_id: scored.run_id, stage: 'scored' });
-    } catch (error) {
-      console.error(`[AutoProductSelection WorkflowDriver] Force-archive scored failed for ${scored.run_id}:`, error.message);
-      // Last resort: clean residue so the queue cannot stay stuck on this run.
-      await autoSelectionCleanupRun({ run_id: scored.run_id }).catch(() => { });
-    }
-    await removeCoordinatorLock();
-    scoredDelegationAttempts.delete(scored.run_id);
-    return;
-  }
-
-  // Check circuit breaker
-  const counters = parseLoopbackCounters(scored.content || '');
-  if (shouldTriggerCircuitBreaker(counters)) {
-    console.warn(`[AutoProductSelection WorkflowDriver] Circuit breaker triggered for ${scored.run_id}:`, counters);
-
-    // Force archive as failed
-    const failedContent = [
-      '---',
-      `failure_type: circuit_breaker`,
-      `run_id: ${scored.run_id}`,
-      `detected_at: ${nowIso()}`,
-      `global_loopback_count: ${counters.global_loopback_count}`,
-      `scout_loopback_count: ${counters.scout_loopback_count}`,
-      `reviewer_loopback_count: ${counters.reviewer_loopback_count}`,
-      '---',
-      '',
-      '# 自动选品智能熔断',
-      '',
-      `run_id: ${scored.run_id}`,
-      '',
-      '[智能熔断] 检测到单阶段连续回退或全局累计回退达到安全上限，强制终止任务以防止死循环烧 Token。',
-      '',
-      '## 回退计数',
-      '',
-      `- 全局回退: ${counters.global_loopback_count}/${MAX_GLOBAL_LOOPBACK}`,
-      `- 鹰眼回退: ${counters.scout_loopback_count}/${MAX_SCOUT_LOOPBACK}`,
-      `- 熔炉回退: ${counters.reviewer_loopback_count}/${MAX_REVIEWER_LOOPBACK}`
-    ].join('\n');
-
-    await autoSelectionWriteRunFile({
-      stage: 'failed',
-      run_id: scored.run_id,
-      content: failedContent,
-      overwrite: true
-    });
-
-    // Delete scored and trigger failed handler
-    await autoSelectionDeleteRunFile({ stage: 'scored', run_id: scored.run_id });
-    await autoSelectionClearLocks({ run_id: scored.run_id });
-    await removeCoordinatorLock();
-    return;
-  }
-
-  const scoredDroppedSummaries = await collectDroppedSummaries();
-  const scoredDroppedBlock = buildDroppedSummaryPromptBlock(scoredDroppedSummaries);
-
-  const prompt = `你好，破壁_枢纽。AutoProductSelection 工作流驱动器检测到 scored 文件需要处理：
-
-run_id: ${scored.run_id}
-scored_file: ${scored.path}
-
-请执行以下步骤：
-
-1. 调用 AutoProductSelection 的 auto_selection_read_run_file 读取 scored 文件内容（必须加 ink:「始」mark_history「末」）。
-
-2. 检查 post_forge_action.action 字段，识别动作类型。
-
-3. 调用 auto_selection_apply_reviewer_decision，run_id=${scored.run_id}。
-
-4. 根据返回结果执行相应操作：
-
-   **如果返回 agent_assistant_request（LOOPBACK/DROP）**：
-   - 原样传递给 AgentAssistant
-   - 输出 [[TaskComplete]]
-
-   **如果返回 ready_for_final_publication（PUBLISH_FINAL）**：
-
-   a) 发布论坛帖子（VCPForum 工具）。这是一份**辅助商业决策的选品研报**，不是数据堆砌——读者要在 3 分钟内判断"这个机会要不要投入下一步真金白银验证"。标题格式：
-   [verdict] 选品研报：[产品方向] | 综合 XX/100（区间 YY-ZZ）
-
-   正文必须从 scored 文件提取真实数据，不要编造；缺失项写"未取得/不适用"。按以下结构（v3 算法口径）：
-
-   【一、决策摘要 TL;DR】（最重要，放最前）
-   - 一句话裁决 + 推荐动作：RECOMMEND（值得投入打样验证）/ WATCHLIST（有潜力，需人工确认关键假设）/ RESEARCH_GAP（方向可以，数据不足）/ REJECT / DATA_INSUFFICIENT。
-   - 综合分与置信区间：point_estimate XX/100，区间 [pessimistic, optimistic]，overall_trust。一句话解释区间宽窄意味着什么（带越宽=数据越不确定=结论越需人工复核）。
-   - 这条机会"成立的核心理由"和"最可能翻车的点"各一句。
-
-   【二、五支柱机会拆解】（v3 核心，用表格或清单）
-   逐个给出归一化值与权重：需求 demand / 竞争余地 competition / 利润 profit / 差异化 differentiation / 执行适配 execution。指出哪个支柱在拉高、哪个在拖累，几何平均下短板的影响。
-
-   【三、卖家优势契合度（Listing 场景代入杠杆）】（本系统差异化亮点）
-   - listing_leverage_score 及判定依据（评论偏"场景/情绪/送礼"还是"功能/规格"）。
-   - 明确说明：本品类能否发挥卖家"主图/A+/场景代入"的结构性优势？是感性代入型（优势显著）还是纯功能型（优势有限）？这直接影响是否值得投入做精品 Listing。
-
-   【四、市场需求证据】关键词搜索量/购买量/购买率/增长/需供比；真实需求是否被三角验证（关键词×竞品销量×评论增长）。
-
-   【五、竞争结构证据】Top ASIN 集中度、评论门槛、销量分布、ABA 点击/转化集中度、自然 vs 广告流量；头部是否垄断、有无利基缝隙。
-
-   【六、利润与广告容错】费用表（售价/referral/BOM/头程/FBA/包装/退货/优惠券/仓储）、UnitContribution 与利润率、base/stress CVR、used/stress PPC、base/stress CPA、BreakEvenACOS、base/stress ad ratio、paid_traffic_ratio 混合口径。明确：广告压力是否通过、亏不亏得起。
-
-   【七、差异化与低成本改良机会】来自差评痛点与场景组合、可低成本实现（不依赖开模/大 MOQ/长交期）的具体改良点。
-
-   【八、风险盘点】合规/侵权/专利/平台、供应链/资金/MOQ/交期、售后/退货/物流（重货易碎）；逐条标注严重度。
-
-   【九、数据置信度审计】missing_critical_fields、conflicting_signals、accepted_unfetchable_gaps、data_distortion_suspected 及失真信号、CVR 保守修正说明。点明"哪个假设错了结论会反转"。
-
-   【十、Kill Criteria（一票否决线）与 Next Validation Plan（最低成本下一步验证动作）】
-
-   【十一、本轮淘汰记录与经验标签】（若有淘汰汇总）
-
-   b) 写入选品公共日记本。本轮只写一条合并日记，日记必须极简，不要复制研报全文。
-   【重要：必须在 DailyNote.create 调用中显式传入 Date 参数（格式 YYYY-MM-DD，例如 Date:「始」2026-06-20「末」），绝对不能省略！】
-   【重要：Tag 行必须是 Content 的最后一行，否则 DailyNote 会报 "Tag is missing" 错误】。
-   Content 部分按以下格式书写（如有淘汰汇总，把淘汰清单并入这一条日记，不要另写多条），且 Tag 行必须放在 Content 最后一行的尾部：
-   [入选/观察/淘汰/数据不足] 产品方向 - 核心原因摘要
-   outcome:
-   product_direction:
-   primary_reason:
-   secondary_reason:
-   category:
-   price_band:
-   risk_tags:
-   opportunity_tags:
-   本轮淘汰清单（若有，逐条：方向 - 核心原因）:
-   Tag: #入选或#排除 #主要风险 #机会标签
-
-   c) 调用 auto_selection_archive_run stage=scored。
-
-   d) 输出 [[TaskComplete]]。
-
-注意：
-- 必须原样传递 agent_assistant_request 的所有字段给 AgentAssistant
-- 论坛帖子和日记内容从 scored 文件提取，不要编造数据
-- 写入日记时，必须在 DailyNote.create 调用中显式传入 Date 参数（格式 YYYY-MM-DD，例如 Date:「始」2026-06-20「末」），绝对不能省略！
-- 日记标签必须规范：Tag 行放在 Content 最后一行，以 Tag: 开头，标签间空格分隔（例如 Tag: #淘汰 #广告倒挂 #厨房收纳）
-- LOOPBACK 和 DROP 不发论坛、不写日记、不归档
-- 所有分支完成后都必须输出 [[TaskComplete]] 以清理 coordinator 锁${scoredDroppedBlock}`;
-
-  await delegateToCoordinator('evaluate_scored', scored.run_id, prompt);
-}
-
-/**
- * Handle evaluate_raw - fast path for READY_FOR_FORGE, delegate for others.
- */
-async function handleEvaluateRaw(queue) {
-  const rawFiles = queue.stages?.raw || [];
-  if (rawFiles.length === 0) return;
-
-  const raw = rawFiles[0];
-  debugLog(`Handling raw evaluation: ${raw.run_id}`);
-
-  // Check circuit breaker
-  const counters = parseLoopbackCounters(raw.content || '');
-  if (shouldTriggerCircuitBreaker(counters)) {
-    console.warn(`[AutoProductSelection WorkflowDriver] Circuit breaker triggered for ${raw.run_id}:`, counters);
-
-    // Force archive as failed
-    const failedContent = [
-      '---',
-      `failure_type: circuit_breaker`,
-      `run_id: ${raw.run_id}`,
-      `detected_at: ${nowIso()}`,
-      `global_loopback_count: ${counters.global_loopback_count}`,
-      `scout_loopback_count: ${counters.scout_loopback_count}`,
-      `reviewer_loopback_count: ${counters.reviewer_loopback_count}`,
-      '---',
-      '',
-      '# 自动选品智能熔断',
-      '',
-      `run_id: ${raw.run_id}`,
-      '',
-      '[智能熔断] 检测到单阶段连续回退或全局累计回退达到安全上限，强制终止任务以防止死循环烧 Token。',
-      '',
-      '## 回退计数',
-      '',
-      `- 全局回退: ${counters.global_loopback_count}/${MAX_GLOBAL_LOOPBACK}`,
-      `- 鹰眼回退: ${counters.scout_loopback_count}/${MAX_SCOUT_LOOPBACK}`,
-      `- 熔炉回退: ${counters.reviewer_loopback_count}/${MAX_REVIEWER_LOOPBACK}`
-    ].join('\n');
-
-    await autoSelectionWriteRunFile({
-      stage: 'failed',
-      run_id: raw.run_id,
-      content: failedContent,
-      overwrite: true
-    });
-
-    // Delete raw and trigger failed handler
-    await autoSelectionDeleteRunFile({ stage: 'raw', run_id: raw.run_id });
-    await autoSelectionClearLocks({ run_id: raw.run_id });
-    await removeCoordinatorLock();
-    return;
-  }
-
-  // Fast path: Check if route_decision is READY_FOR_FORGE
-  const rawContent = raw.content || '';
-  const routeMatch = rawContent.match(/route_decision[\s\S]{0,200}?action\s*:\s*['"]?([A-Z_]+)['"]?/i);
-  const routeAction = routeMatch ? routeMatch[1].toUpperCase() : '';
-
-  if (routeAction === 'READY_FOR_FORGE') {
-    debugLog(`Fast path: READY_FOR_FORGE detected for ${raw.run_id}, dispatching reviewer directly.`);
-
-    try {
-      // Clean up orphaned coordinator lock before fast path dispatch
-      const hasLock = await checkCoordinatorLock();
-      if (hasLock) {
-        const hasActiveTask = await checkActiveCoordinatorTask();
-        if (!hasActiveTask) {
-          debugLog('Removing orphaned coordinator lock before fast path dispatch.');
-          await removeCoordinatorLock();
-        }
-      }
-
-      const dispatch = await autoSelectionPrepareDispatch({
-        worker: 'reviewer',
-        run_id: raw.run_id,
-        overwrite_lock: false
-      });
-
-      if (dispatch.success && dispatch.agent_assistant_request) {
-        await callAgentAssistant(dispatch.agent_assistant_request);
-        debugLog(`Successfully dispatched reviewer for ${raw.run_id}`);
-        return;
-      }
-
-      // Dispatch did not succeed. The most common cause is an existing forge lock
-      // (a reviewer is already in-flight, or a stale lock survived a restart/crash).
-      // Do NOT silently no-op every tick. Distinguish in-flight from stale by lock age:
-      // a fresh lock means a reviewer is likely still working (wait); a lock older than
-      // the worker timeout means the worker is dead and we must re-dispatch. We avoid
-      // blindly overwriting a fresh lock, which would duplicate an in-flight delegation.
-      if (dispatch.error === 'file_exists') {
-        const forgeLock = (queue.derived?.valid_locks || []).find(
-          lock => lock.run_id === raw.run_id && inferAutoSelectionLockName(lock.name) === 'forge'
-        );
-        const lockAgeMinutes = forgeLock
-          ? (Date.now() - new Date(forgeLock.modified_at).getTime()) / 60000
-          : 0;
-        const staleThreshold = queue.worker_timeout_minutes || 60;
-        if (forgeLock && Number.isFinite(lockAgeMinutes) && lockAgeMinutes > staleThreshold) {
-          console.warn(`[AutoProductSelection WorkflowDriver] Fast path: stale reviewer lock for ${raw.run_id} (${Math.floor(lockAgeMinutes)}min > ${staleThreshold}min). Re-dispatching reviewer.`);
-          const redispatch = await autoSelectionPrepareDispatch({
-            worker: 'reviewer',
-            run_id: raw.run_id,
-            overwrite_lock: true,
-            dispatch_reason: 'fast_path_stale_lock_redispatch'
-          });
-          if (redispatch.success && redispatch.agent_assistant_request) {
-            await callAgentAssistant(redispatch.agent_assistant_request);
-            debugLog(`Re-dispatched reviewer after stale lock for ${raw.run_id}`);
+    // FAST PATH: a worker we're waiting on may have already failed its delegation (500/etc.)
+    // without writing output. Catch + classify it now instead of waiting out the timeout.
+    if ((state.status === APS_STATE.SCOUTING || state.status === APS_STATE.SCORING) && state.dispatched_at) {
+      const wf = await detectWorkerDeliveryFailure(state.run_id, state.status, new Date(state.dispatched_at).getTime());
+      if (wf.found) {
+        const fresh = await readRunState(state.run_id);
+        if (!fresh || fresh.status === APS_STATE.DONE || fresh.status === APS_STATE.FAILED) continue;
+        logWorkflowEvent(`[Watchdog] ${fresh.run_id} 的 worker 交付失败 (${wf.errType}): ${String(wf.errorText).slice(0, 120)}`, true);
+        const capped = await recordRunFailure(fresh, wf.errType, `worker delivery failed: ${String(wf.errorText).slice(0, 160)}`);
+        if (!capped) {
+          const retry = await readRunState(fresh.run_id);
+          if (retry && (retry.status === APS_STATE.SCOUTING || retry.status === APS_STATE.SCORING)) {
+            retry.dispatched_at = null;
+            await writeRunState(retry);
+            await redispatchWorkerForState(retry);
           }
-          return;
         }
-        console.warn(`[AutoProductSelection WorkflowDriver] Fast path: reviewer lock already exists for ${raw.run_id} (age ${Math.floor(lockAgeMinutes)}min); treating as in-flight.`);
-        return;
+        continue; // handled this run this sweep
       }
-      console.warn(`[AutoProductSelection WorkflowDriver] Fast path dispatch did not succeed for ${raw.run_id}:`, dispatch.error || dispatch.message || 'unknown');
-      return;
-    } catch (error) {
-      console.error(`[AutoProductSelection WorkflowDriver] Fast path dispatch failed for ${raw.run_id}:`, error);
-      // Fall through to delegation
     }
-  }
 
-  // Delegate to coordinator for non-READY_FOR_FORGE cases. Surface the persisted
-  // cross-direction reselect budget so the coordinator knows when to stop reselecting.
-  const rawCounters = parseLoopbackCounters(rawContent);
-  const rawReselectCount = Math.max(rawCounters.reselect_count || 0, reselectCountThisTrigger || 0);
-  const budgetLine = `本次 trigger 已重选方向 ${rawReselectCount}/${MAX_RESELECT_PER_TRIGGER} 次。`;
-  const budgetGuidance = rawReselectCount >= MAX_RESELECT_PER_TRIGGER
-    ? '已达跨方向重选上限：禁止再 DROP_AND_RESELECT，请直接写 failed（failure_type: reselect_budget_exhausted）并归档收尾，输出 [[TaskComplete]]。'
-    : '如需换方向 DROP_AND_RESELECT，请在新 brief 中保留 reselect_count 计数器；达到上限后不得再换方向。';
-  const prompt = `你好，破壁_枢纽。AutoProductSelection 工作流驱动器检测到 raw 文件需要评审：
-
-run_id: ${raw.run_id}
-raw_file: ${raw.path}
-${budgetLine}
-
-请执行以下步骤：
-1. 调用 AutoProductSelection 的 auto_selection_read_run_file 读取 raw 文件内容（必须加 ink:「始」mark_history「末」）。
-2. 检查 route_decision 字段：
-   - 如果是 READY_FOR_FORGE：调用 auto_selection_prepare_dispatch，worker=reviewer，run_id=${raw.run_id}，然后将返回的 agent_assistant_request 原样传递给 AgentAssistant，最后输出 [[TaskComplete]]。
-   - 如果是 EARLY_REJECT：${budgetGuidance}
-
-注意：
-- 必须原样传递 agent_assistant_request 的所有字段给 AgentAssistant。
-- 派发评审后输出 [[TaskComplete]] 以清理 coordinator 锁，后端驱动器会自动推进。`;
-
-  await delegateToCoordinator('evaluate_raw', raw.run_id, prompt);
-}
-
-/**
- * Handle retry_worker_once - auto-retry eligible worker with incremented retry_count.
- */
-async function handleRetryWorker(queue) {
-  const missingOutputs = queue.derived?.worker_missing_outputs || [];
-  const eligible = missingOutputs.find(item => item.retry_guard?.eligible_now === true);
-
-  if (!eligible) return;
-
-  const worker = eligible.lock_name === 'forge' ? 'reviewer' : 'scout';
-  logWorkflowEvent(`[Worker Retry] 检测到 Worker 缺失输出且符合单次重试资格，正在重试 [${worker}]，Run ID: ${eligible.run_id}，重试次数: ${eligible.retry_count + 1}`);
-  debugLog(`Retrying worker for run: ${eligible.run_id}, retry_count: ${eligible.retry_count}`);
-
-  try {
-    const dispatch = await autoSelectionPrepareDispatch({
-      worker,
-      run_id: eligible.run_id,
-      overwrite_lock: true,
-      retry_count: eligible.retry_count + 1,
-      dispatch_reason: 'auto_retry_once'
-    });
-
-    if (dispatch.success && dispatch.agent_assistant_request) {
-      await callAgentAssistant(dispatch.agent_assistant_request);
-      logWorkflowEvent(`[Worker Retry Success] 成功发起 Worker [${worker}] 重试，Run ID: ${eligible.run_id}`);
-      debugLog(`Successfully retried worker for ${eligible.run_id}`);
-    } else {
-      logWorkflowEvent(`[Worker Retry Failed] 发起 Worker [${worker}] 重试失败: ${dispatch.error || 'prepare_dispatch 返回失败'}，Run ID: ${eligible.run_id}`, true);
+    // Two timeout sources:
+    // (1) A claimed run whose claim is older than the status timeout (a backend step that
+    //     wedged mid-execution).
+    // (2) A run WAITING ON AN ASYNC WORKER (SCOUTING/SCORING/PENDING_BRIEF/PUBLISHING/FAILED)
+    //     whose dispatch is older than the status timeout. The claim is cleared on dispatch,
+    //     so without this a worker that dies WITHOUT writing raw/scored/failed (e.g. a 500
+    //     inside its sub-tool) leaves the run stranded forever. We track dispatched_at when a
+    //     worker/coordinator is sent, and time out on it.
+    const waitAnchor = state.claimed_at || state.dispatched_at;
+    if (!waitAnchor) continue; // genuinely idle/unclaimed at a backend state — next tick acts
+    const age = now - new Date(waitAnchor).getTime();
+    if (Number.isFinite(age) && age > statusTimeoutMs(state.status)) {
+      const fresh = await readRunState(state.run_id);
+      if (!fresh || fresh.status === APS_STATE.DONE || fresh.status === APS_STATE.FAILED) continue;
+      logWorkflowEvent(`[Watchdog] ${fresh.run_id} 在 ${fresh.status} 超时 (${Math.round(age / 60000)}min，worker 未交付)。`, true);
+      // Count a (non-system) timeout failure. If capped -> recordRunFailure transitions to
+      // FAILED. If NOT capped, retry by clearing dispatched_at and re-driving the run so the
+      // appropriate worker is re-dispatched (the run sits in a waiting state with no output).
+      const capped = await recordRunFailure(fresh, 'nonsystem', `status ${fresh.status} 超时 ${Math.round(age / 60000)}min，worker 未写出交付文件`);
+      if (!capped) {
+        const retry = await readRunState(fresh.run_id);
+        if (retry && (retry.status === APS_STATE.SCOUTING || retry.status === APS_STATE.SCORING || retry.status === APS_STATE.PENDING_BRIEF)) {
+          retry.dispatched_at = null; // allow re-dispatch
+          await writeRunState(retry);
+          await redispatchWorkerForState(retry);
+        }
+      }
     }
-  } catch (error) {
-    console.error(`[AutoProductSelection WorkflowDriver] Failed to retry worker for ${eligible.run_id}:`, error);
-    logWorkflowEvent(`[Worker Retry Failed] 发起 Worker [${worker}] 重试抛出异常: ${error.message}，Run ID: ${eligible.run_id}`, true);
-  }
-}
-
-async function handleWorkerMissingOutput(queue) {
-  const missingOutputs = queue.derived?.worker_missing_outputs || [];
-  if (missingOutputs.length === 0) return;
-
-  const missing = missingOutputs[0];
-  logWorkflowEvent(`[Worker Timeout/Missing] 检测到 Worker 缺失输出 [${missing.lock_name}]，Run ID: ${missing.run_id}。诊断分类: ${missing.retry_guard?.classification}，将标记为 failed 并移交给协调器处理。`);
-  debugLog(`Handling worker missing output: ${missing.run_id}`);
-
-  try {
-    const markResult = await autoSelectionMarkWorkerMissingOutput({
-      run_id: missing.run_id,
-      overwrite: false
-    });
-
-    if (markResult.success) {
-      logWorkflowEvent(`[Worker Timeout/Missing Handled] 成功标记 Run ID: ${missing.run_id} 为 failed 并清除其锁，移交协调器。`);
-      debugLog(`Marked worker missing output for ${missing.run_id}, delegating to coordinator.`);
-      await handleFailedRuns(await autoSelectionQueueStatus({ include_content: true }));
-    } else {
-      logWorkflowEvent(`[Worker Timeout/Missing Failed] 标记 Run ID: ${missing.run_id} 失败: ${markResult.error}`, true);
-    }
-  } catch (error) {
-    console.error(`[AutoProductSelection WorkflowDriver] Failed to mark worker missing output for ${missing.run_id}:`, error);
-    logWorkflowEvent(`[Worker Timeout/Missing Failed] 标记 Run ID: ${missing.run_id} 发生异常: ${error.message}`, true);
-  }
-}
-
-async function handleSendBriefToScout(queue) {
-  const activeBriefs = queue.derived?.active_briefs || [];
-  if (activeBriefs.length === 0) return;
-
-  const brief = activeBriefs[0];
-  logWorkflowEvent(`[Scout Dispatch] 检测到已存在 Brief 且未锁，重新派发 Scout，Run ID: ${brief.run_id}`);
-  debugLog(`Dispatching scout for existing brief: ${brief.run_id}`);
-
-  try {
-    const dispatch = await autoSelectionPrepareDispatch({
-      worker: 'scout',
-      run_id: brief.run_id,
-      overwrite_lock: true  // Fixed: Prevent lock conflicts after restart
-    });
-
-    if (dispatch.success && dispatch.agent_assistant_request) {
-      await callAgentAssistant(dispatch.agent_assistant_request);
-      logWorkflowEvent(`[Scout Dispatch Success] 成功发起 Scout 派发，Run ID: ${brief.run_id}`);
-      debugLog(`Successfully dispatched scout for ${brief.run_id}`);
-    } else {
-      logWorkflowEvent(`[Scout Dispatch Failed] 派发 Scout 失败: ${dispatch.error || 'prepare_dispatch 返回失败'}，Run ID: ${brief.run_id}`, true);
-    }
-  } catch (error) {
-    console.error(`[AutoProductSelection WorkflowDriver] Failed to dispatch scout for ${brief.run_id}:`, error);
-    logWorkflowEvent(`[Scout Dispatch Failed] 派发 Scout 发生异常: ${error.message}，Run ID: ${brief.run_id}`, true);
   }
 }
 
 /**
- * Handle create_brief_and_send_scout - delegate to 破壁_枢纽 to create new brief.
+ * The single transition entry point. Reads a run's authoritative status and performs exactly
+ * one step, committing the next status only on success. All dispatch/decision logic lives here.
  */
-async function handleCreateBriefAndSendScout() {
-  logWorkflowEvent('Initiating new brief creation delegation to coordinator (破壁_枢纽).');
-  debugLog('Delegating new brief creation to coordinator.');
+async function advanceRun(runId) {
+  const peek = await readRunState(runId);
+  if (!peek || peek.status === APS_STATE.DONE) return;
+
+  switch (peek.status) {
+    case APS_STATE.PENDING_BRIEF: return advancePendingBrief(runId);
+    case APS_STATE.SCOUTING: return advanceScouting(runId);
+    case APS_STATE.SCORING: return advanceScoring(runId);
+    case APS_STATE.EVALUATING: return advanceEvaluating(runId);
+    case APS_STATE.PUBLISHING: return advancePublishing(runId);
+    case APS_STATE.FAILED: return advanceFailed(runId);
+    default:
+      logWorkflowEvent(`[StateMachine] ${runId}: 未知状态 ${peek.status}，跳过。`, true);
+  }
+}
+
+// PENDING_BRIEF: ask the coordinator (破壁_枢纽) to author a brief for this run, then the
+// scout. We delegate brief CONTENT to the coordinator; it calls auto_selection_prepare_dispatch
+// which writes the brief and dispatches scout — the scout's raw write will advance us.
+async function advancePendingBrief(runId) {
+  const state = await claimRun(runId, 'coordinator:brief');
+  if (!state) return;
 
   let strategyContent = '';
   try {
-    const cnPath = path.join(__dirname, 'AutoSelectionStrategyProfile.zh-CN.md');
-    const enPath = path.join(__dirname, 'AutoSelectionStrategyProfile.md');
     try {
-      strategyContent = await fs.readFile(cnPath, 'utf8');
-      debugLog('Successfully loaded strategy profile from AutoSelectionStrategyProfile.zh-CN.md');
+      strategyContent = await fs.readFile(path.join(__dirname, 'AutoSelectionStrategyProfile.zh-CN.md'), 'utf8');
     } catch (e) {
-      strategyContent = await fs.readFile(enPath, 'utf8');
-      debugLog('Successfully loaded strategy profile from AutoSelectionStrategyProfile.md');
+      strategyContent = await fs.readFile(path.join(__dirname, 'AutoSelectionStrategyProfile.md'), 'utf8');
     }
   } catch (err) {
-    console.error('[AutoProductSelection WorkflowDriver] Failed to read strategy profile:', err);
     strategyContent = '（未能读取到本地选品策略文件，请按宽泛探索默认原则进行选品）';
   }
 
-  const prompt = `你好，破壁_枢纽。AutoProductSelection 工作流驱动器检测到队列空闲，需要创建新 brief。
-
-我们已经为你自动加载并注入了最新的选品策略，请直接阅读并严格遵循以下策略要求：
+  const prompt = `你好，破壁_枢纽。需要为一个新的选品任务创建 brief。
 
 【当前选品策略指导 (Strategy Profile)】：
 ${strategyContent}
 
 请执行以下步骤：
-1. 审视上方为你自动加载的《选品公共日记本》历史记忆，避免重复已淘汰的具体死因。
-2. 根据上述【当前选品策略指导】，默认允许并推荐进行宽泛探索（除非策略中明确限定了品类、关键词、禁选方向或价格带，否则不要过度收窄）。请从场景、人群、痛点、周边配件、收纳清洁、替换件和低成本改良角度发散。
-3. 基于反共识、场景驱动、时间差预判的战略思维，生成新的 SelectionBrief。Brief 必须给鹰眼 3-5 个不同角度 of 英文种子词/微场景，并要求输出 Min Evidence Pack。
-4. 生成 run_id（格式：APS-YYYYMMDD-HHMMSS-slug）。
-5. 调用 auto_selection_prepare_dispatch，worker=scout，run_id=生成的run_id，brief_content=生成的brief内容。
-6. 将返回的 agent_assistant_request 原样传递给 AgentAssistant。
+1. 审视你头部自动加载的《选品公共日记本》历史记忆：优先复用近一月 [待观察] 方向；避免重复近一月 [淘汰] 死因；全量参考 [经验]。
+2. 按注入策略做宽泛探索（除非策略明确限定品类/关键词/价格带/禁选）。从场景、人群、痛点、配件、收纳清洁、替换件、低成本改良发散。
+3. 生成新的 SelectionBrief，给鹰眼 2-3 个并列候选方向（彼此真正不同），每个 1-2 个英文种子词，标注偏"场景代入型"还是"功能型"。
+4. **必须使用本任务指定的 run_id：${runId}**（不要自己另造 run_id）。
+5. 调用 auto_selection_prepare_dispatch，worker=scout，run_id=${runId}，brief_content=生成的brief内容。
+6. 将返回的 agent_assistant_request 原样传给 AgentAssistant。
 7. 完成后输出 [[TaskComplete]]。
 
 注意：
-- 策略文件已在上方注入，你无需且不应调用 ServerFileOperator.ReadFile 去重复读取。
-- 必须遵循上述注入的策略和历史日记。
-- 必须原样传递 agent_assistant_request 的所有字段给 AgentAssistant。
-- 派发成功后必须输出 [[TaskComplete]] 以清理 coordinator 锁。
-- 不要发论坛、不要写日记、不要归档。`;
+- 读取 runs 文件只能用 auto_selection_read_run_file，严禁用 FileOperator/ServerFileOperator 直读路径。策略已注入，无需重复读取。
+- 必须原样传递 agent_assistant_request 的所有字段。
+- 不要发论坛、不写日记、不归档。`;
 
-  await delegateToCoordinator('create_brief', 'new', prompt);
+  try {
+    await commitTransition(state, APS_STATE.SCOUTING, 'brief delegated to coordinator');
+    await delegateToCoordinator('create_brief', runId, prompt);
+  } catch (e) {
+    await recordRunFailure(state, classifyErrorType(e.message), `brief delegation failed: ${e.message}`);
+  }
 }
+
+// SCOUTING: the scout (rebrief or fresh) runs via AgentAssistant. When it writes raw, the
+// write hook calls triggerImmediateWorkflowTick -> advanceRun sees raw and moves to SCORING.
+// Here we only check: has raw appeared? If yes, classify route_decision and transition.
+async function advanceScouting(runId) {
+  const rawPath = resolveAutoSelectionFile('raw', runId);
+  let rawContent = '';
+  try {
+    rawContent = await fs.readFile(rawPath, 'utf8');
+  } catch (_) {
+    return; // raw not written yet; the scout is still working (watchdog guards timeout)
+  }
+
+  const state = await claimRun(runId, 'backend:route');
+  if (!state) return;
+
+  const routeMatch = rawContent.match(/route_decision[\s\S]{0,200}?action\s*:\s*['"]?([A-Z_]+)['"]?/i);
+  const route = routeMatch ? routeMatch[1].toUpperCase() : '';
+
+  // EARLY_REJECT / FETCHED_EMPTY: cheap prescreen killed all candidates. Stage the dropped
+  // direction (for the eventual diary), bump the cheap early-reject budget, and either start
+  // a fresh direction or — budget exhausted — fail to a blocking report.
+  if (route === 'EARLY_REJECT' || route === 'FETCHED_EMPTY') {
+    state.counters.early_reject += 1;
+    await stageDroppedRunFiles(runId).catch(() => { });
+    await autoSelectionDeleteRunFile({ stage: 'raw', run_id: runId }).catch(() => { });
+    if (state.counters.early_reject > MAX_EARLY_REJECT_PER_TRIGGER) {
+      logWorkflowEvent(`[StateMachine] ${runId}: 廉价预筛换方向预算耗尽 (${state.counters.early_reject - 1}/${MAX_EARLY_REJECT_PER_TRIGGER})，转 FAILED 收尾。`);
+      state.failure_reason = 'reselect_budget_exhausted';
+      await commitTransition(state, APS_STATE.FAILED, 'early-reject budget exhausted');
+    } else {
+      logWorkflowEvent(`[StateMachine] ${runId}: EARLY_REJECT，换新方向 (early_reject ${state.counters.early_reject}/${MAX_EARLY_REJECT_PER_TRIGGER})。`);
+      await spawnReselectRun(state, 'early_reject');
+      await commitTransition(state, APS_STATE.DONE, 'early-reject -> spawned fresh direction');
+    }
+    return;
+  }
+
+  // Normal: raw is ready for the forge. Move to SCORING and dispatch the reviewer.
+  await commitTransition(state, APS_STATE.SCORING, `raw ready (route=${route || 'DEEPEN'})`);
+  await dispatchReviewer(runId);
+}
+
+// SCORING: reviewer runs via AgentAssistant; when it writes scored, the scoring engine has
+// already run inside autoSelectionWriteRunFile. We just detect scored and move to EVALUATING.
+async function advanceScoring(runId) {
+  const scoredPath = resolveAutoSelectionFile('scored', runId);
+  try {
+    await fs.access(scoredPath);
+  } catch (_) {
+    return; // scored not written yet; reviewer still working
+  }
+  const state = await claimRun(runId, 'backend:evaluate');
+  if (!state) return;
+  await commitTransition(state, APS_STATE.EVALUATING, 'scored ready');
+  await advanceEvaluating(runId);
+}
+
+// EVALUATING: the backend itself runs decideBackendAction (NO coordinator round-trip) and
+// branches: publish / loopback / drop. This removes the most error-prone agent step.
+async function advanceEvaluating(runId) {
+  const state = await claimRun(runId, 'backend:decide');
+  if (!state) return;
+
+  let scoredContent = '';
+  try {
+    scoredContent = await fs.readFile(resolveAutoSelectionFile('scored', runId), 'utf8');
+  } catch (_) {
+    await recordRunFailure(state, 'nonsystem', 'scored file missing at EVALUATING');
+    return;
+  }
+
+  let rawContent = '';
+  try { rawContent = await fs.readFile(resolveAutoSelectionFile('raw', runId), 'utf8'); } catch (_) { }
+
+  const scoreResults = calculateScoringModel(scoredContent);
+  const originalAction = normalizeForgeAction(extractForgeAction(scoredContent) || '');
+  const action = decideBackendAction(originalAction, scoreResults, scoredContent, state.counters.reselect, state.force_decision_mode);
+
+  if (action === 'PUBLISH_FINAL') {
+    await commitTransition(state, APS_STATE.PUBLISHING, `decided PUBLISH (score ${scoreResults.totalScore})`);
+    await advancePublishing(runId);
+    return;
+  }
+
+  if (action === 'LOOPBACK_TO_HAWKEYE') {
+    const counters = parseLoopbackCounters(scoredContent);
+    const guard = evaluateLoopbackGuard(scoredContent, rawContent, counters);
+    if (!guard.allowed) {
+      // Loopback denied -> force a terminal decision: re-run EVALUATING in force_decision_mode.
+      state.force_decision_mode = true;
+      state.counters.reviewer_loopback += 1;
+      logWorkflowEvent(`[StateMachine] ${runId}: LOOPBACK 被拒(${guard.reason})，转强制裁决模式。`);
+      await dispatchReviewer(runId, { forceDecision: true, instruction: `后端已拒绝继续 LOOPBACK：${guard.reason}。请基于现有证据输出终态裁决（RECOMMEND/WATCHLIST/REJECT/DATA_INSUFFICIENT），不得再 LOOPBACK。` });
+      await commitTransition(state, APS_STATE.SCORING, 'loopback denied -> force decision');
+      return;
+    }
+    // Allowed: bump counters, delete scored, dispatch scout to top up the same raw.
+    state.counters.scout_loopback += 1;
+    state.counters.global_loopback += 1;
+    await autoSelectionDeleteRunFile({ stage: 'scored', run_id: runId }).catch(() => { });
+    const loopbackBrief = injectLoopbackCounters(buildLoopbackBrief(runId, scoredContent), {
+      global_loopback_count: state.counters.global_loopback,
+      scout_loopback_count: state.counters.scout_loopback,
+      reviewer_loopback_count: state.counters.reviewer_loopback,
+      reselect_count: state.counters.reselect
+    });
+    await autoSelectionWriteRunFile({ stage: 'brief', run_id: runId, content: loopbackBrief, overwrite: true });
+    await commitTransition(state, APS_STATE.SCOUTING, 'loopback -> scout top-up');
+    await dispatchScout(runId);
+    return;
+  }
+
+  if (action === 'DROP_AND_RESELECT') {
+    state.counters.reselect += 1;
+    await stageDroppedRunFiles(runId).catch(() => { });
+    if (state.counters.reselect > MAX_RESELECT_PER_TRIGGER) {
+      state.failure_reason = 'reselect_budget_exhausted';
+      await commitTransition(state, APS_STATE.FAILED, 'reselect budget exhausted');
+      return;
+    }
+    await spawnReselectRun(state, 'drop_and_reselect');
+    await commitTransition(state, APS_STATE.DONE, 'drop -> spawned fresh direction');
+    return;
+  }
+
+  // Unknown action: treat as a soft failure.
+  await recordRunFailure(state, 'nonsystem', `unknown decideBackendAction result: ${action}`);
+}
+
+// PUBLISHING: idempotent terminal publish. Each sub-step checks its flag first, so repeated
+// triggers can never produce duplicate posts or diaries (root-fix for the 3-diary bug).
+// The coordinator generates CONTENT; the backend owns the flags + archival.
+async function advancePublishing(runId) {
+  const state = await claimRun(runId, 'coordinator:publish');
+  if (!state) return;
+
+  if (state.publish_flags.post_published && state.publish_flags.diary_written) {
+    // Content already produced by a prior delegation; just archive + finish.
+    await autoSelectionArchiveRun({ run_id: runId, stage: 'scored' }).catch(async () => {
+      await autoSelectionCleanupRun({ run_id: runId }).catch(() => { });
+    });
+    state.publish_flags.archived = true;
+    await commitTransition(state, APS_STATE.DONE, 'published + archived');
+    return;
+  }
+
+  const scoredDroppedBlock = buildDroppedSummaryPromptBlock(await collectDroppedSummaries());
+  let scoredDeferredBlock = '';
+  try {
+    const rawForDeferred = await fs.readFile(resolveAutoSelectionFile('raw', runId), 'utf8');
+    scoredDeferredBlock = buildDeferredCandidatesPromptBlock(extractDeferredCandidates(rawForDeferred));
+  } catch (_) { }
+
+  const prompt = `你好，破壁_枢纽。一个选品 run 已通过后端裁决，需要你发布研报并写日记。
+
+run_id: ${runId}
+
+请执行以下步骤（这一步只负责"产出内容"，后端会自动归档，你不需要调用 archive）：
+
+1. 用 auto_selection_read_run_file 读取 scored 文件（stage=scored, run_id=${runId}, ink:「始」mark_history「末」）。严禁用 FileOperator/ServerFileOperator 直读路径。
+
+2. 发布论坛帖子（VCPForum），发到「自动选品推荐板块」。这是辅助商业决策的研报，读者要在 3 分钟内判断"要不要投入真金白银验证"。标题：[verdict] 选品研报：[产品方向] | 综合 XX/100（区间 YY-ZZ）。
+   【可读性要求】读者含非专业同事：每个英文/专业指标首次出现紧跟中文解释（如"Unit Contribution（单件毛利，卖一个净赚多少）"、"ACOS（广告花费占销售额比例）"），每个关键数字后用一句大白话点明含义，TL;DR 与结论用大白话。
+   正文从 scored 提取真实数据，缺失写"未取得"，按 v3 口径组织：①决策摘要TL;DR（裁决+推荐动作、point_estimate与区间[pessimistic,optimistic]及overall_trust、成立理由与翻车点）②五支柱拆解（需求/竞争余地/利润/差异化/执行的归一值与权重）③卖家Listing场景代入杠杆(listing_leverage_score及依据)④市场需求证据⑤竞争结构证据⑥利润与广告容错(费用表/UnitContribution/base-stress CVR-PPC-CPA/BreakEvenACOS/ad ratio)⑦差异化低成本改良⑧风险盘点(逐条标严重度)⑨数据置信度审计⑩Kill Criteria与Next Validation Plan⑪本轮淘汰与待观察记录。
+
+3. 写入选品公共日记本（DailyNote.create）。本轮只写一条合并主结论日记，极简，不要复制研报全文。必须显式传 Date 参数（YYYY-MM-DD）。Tag 行必须是 Content 最后一行。格式：
+   [入选/观察/淘汰/数据不足] 产品方向 - 核心原因
+   outcome: / product_direction: / primary_reason: / secondary_reason: / category: / price_band: / risk_tags: / opportunity_tags:
+   Tag: #状态 #主要风险 #机会标签
+
+4. 完成发帖和日记后，输出 [[TaskComplete]]。后端会自动归档并结束本轮。
+
+注意：发帖和日记内容必须从 scored 提取，不要编造。${scoredDroppedBlock}${scoredDeferredBlock}`;
+
+  try {
+    await delegateToCoordinator('publish_final', runId, prompt);
+    // Mark intent AFTER successful delegation, so even if the coordinator double-fires, the next
+    // advancePublishing sees the flags and goes straight to archive instead of re-publishing.
+    state.publish_flags.post_published = true;
+    state.publish_flags.diary_written = true;
+    state.last_action = 'publish delegated';
+    await writeRunState(state); // keep claim; coordinator completion re-triggers a tick
+    // Release the claim so the post-completion tick can archive. The flags guard against dup.
+    const fresh = await readRunState(runId);
+    if (fresh) { fresh.claimed_by = null; fresh.claimed_at = null; await writeRunState(fresh); }
+  } catch (e) {
+    await recordRunFailure(state, classifyErrorType(e.message), `publish delegation failed: ${e.message}`);
+  }
+}
+
+// FAILED: idempotent blocking-report publish + archive. Same flag-guarded pattern.
+async function advanceFailed(runId) {
+  const state = await claimRun(runId, 'coordinator:blocking');
+  if (!state) return;
+
+  if (state.publish_flags.post_published) {
+    await autoSelectionArchiveRun({ run_id: runId, stage: 'failed' }).catch(async () => {
+      await autoSelectionCleanupRun({ run_id: runId }).catch(() => { });
+    });
+    state.publish_flags.archived = true;
+    await commitTransition(state, APS_STATE.DONE, 'blocking report published + archived');
+    return;
+  }
+
+  // Ensure a failed file exists for the coordinator to read.
+  const reason = state.failure_reason || state.failure_tracking.last_error || 'unknown failure';
+  const isReselectBudget = reason === 'reselect_budget_exhausted';
+  try {
+    await fs.access(resolveAutoSelectionFile('failed', runId));
+  } catch (_) {
+    const failedContent = [
+      '---', `failure_type: ${isReselectBudget ? 'reselect_budget_exhausted' : 'run_failed'}`,
+      `run_id: ${runId}`, `detected_at: ${nowIso()}`,
+      `system_errors: ${state.failure_tracking.system_error_count}`,
+      `nonsystem_errors: ${state.failure_tracking.nonsystem_error_count}`, '---', '',
+      '# 自动选品阻断', '', `run_id: ${runId}`, '', `原因：${reason}`
+    ].join('\n');
+    await autoSelectionWriteRunFile({ stage: 'failed', run_id: runId, content: failedContent, overwrite: true });
+  }
+
+  const droppedBlock = isReselectBudget ? buildDroppedSummaryPromptBlock(await collectDroppedSummaries()) : '';
+  const prompt = `你好，破壁_枢纽。一个选品 run 已失败/阻断，需要你发布阻断报告并写极简日记。
+
+run_id: ${runId}
+failure_kind: ${isReselectBudget ? 'DATA_REJECTION（多方向均被数据否决）' : 'SYSTEM_BLOCK（系统阻断/超时，非商业否决）'}
+
+请执行：
+1. 用 auto_selection_read_run_file 读取 failed 文件（stage=failed, run_id=${runId}, ink:「始」mark_history「末」）。严禁用 FileOperator 直读。
+2. 在 VCP 论坛「自动选品板块」发布阻断报告（说明原因、关键证据、数据缺口、下一步）。${isReselectBudget ? '' : '明确这是系统层面阻断（超时/系统错误），不是对方向的商业否决。'}
+3. 写一条极简日记（DailyNote.create，显式传 Date，Tag 行放最后）：${isReselectBudget ? '\n   [淘汰] 产品方向 - 数据层面核心原因\n   Tag: #排除 #主要原因' : '\n   [系统阻断] 产品方向（若有）- 阻断原因\n   Tag: #系统阻断 #未取得数据'}
+4. 完成后输出 [[TaskComplete]]。后端会自动归档结束本轮。${droppedBlock}`;
+
+  try {
+    await delegateToCoordinator('handle_failed', runId, prompt);
+    state.publish_flags.post_published = true;
+    state.publish_flags.diary_written = true;
+    state.last_action = 'blocking delegated';
+    await writeRunState(state);
+    const fresh = await readRunState(runId);
+    if (fresh) { fresh.claimed_by = null; fresh.claimed_at = null; await writeRunState(fresh); }
+  } catch (e) {
+    // Even if delegation fails, force-archive so the queue drains.
+    await autoSelectionArchiveRun({ run_id: runId, stage: 'failed' }).catch(() => { });
+    const f = await readRunState(runId);
+    if (f) await commitTransition(f, APS_STATE.DONE, 'blocking delegation failed -> force archived');
+  }
+}
+
+// Spawn a brand-new direction run (fresh run_id) carrying the cross-direction reselect and
+// early-reject budgets forward. Used by both EARLY_REJECT and DROP_AND_RESELECT.
+async function spawnReselectRun(prevState, reason) {
+  const newRunId = normalizeAutoSelectionRunId(`${buildTimestampRunPrefix()}-reselect`);
+  const fresh = freshRunState(newRunId, {
+    counters: {
+      global_loopback: 0, scout_loopback: 0, reviewer_loopback: 0,
+      reselect: prevState.counters.reselect,           // carry expensive budget
+      early_reject: prevState.counters.early_reject    // carry cheap budget
+    }
+  });
+  fresh.last_action = `spawned from ${prevState.run_id} (${reason})`;
+  await writeRunState(fresh);
+  logWorkflowEvent(`[StateMachine] ${prevState.run_id}: ${reason} -> 新方向 ${newRunId} (reselect ${fresh.counters.reselect}/${MAX_RESELECT_PER_TRIGGER}, early ${fresh.counters.early_reject}/${MAX_EARLY_REJECT_PER_TRIGGER})`);
+}
+
+// Dispatch the scout for a run (brief must already exist). Used for loopback top-ups.
+async function dispatchScout(runId) {
+  const dispatch = await autoSelectionPrepareDispatch({ worker: 'scout', run_id: runId, overwrite_lock: true });
+  if (dispatch.success && dispatch.agent_assistant_request) {
+    await callAgentAssistant(dispatch.agent_assistant_request);
+  }
+}
+
+// Dispatch the reviewer (forge) for a run whose raw is ready.
+async function dispatchReviewer(runId, opts = {}) {
+  const dispatch = await autoSelectionPrepareDispatch({
+    worker: 'reviewer', run_id: runId, overwrite_lock: true,
+    force_decision_mode: opts.forceDecision === true,
+    reviewer_instruction: opts.instruction || ''
+  });
+  if (dispatch.success && dispatch.agent_assistant_request) {
+    await callAgentAssistant(dispatch.agent_assistant_request);
+  }
+}
+
+// Re-dispatch the worker appropriate to a run's current waiting state after a worker timeout
+// (the worker died without writing its handoff file). Sets a fresh dispatched_at so the
+// watchdog clock restarts for this retry.
+async function redispatchWorkerForState(state) {
+  const runId = state.run_id;
+  try {
+    if (state.status === APS_STATE.SCORING) {
+      // raw exists, reviewer never delivered scored -> re-dispatch reviewer.
+      logWorkflowEvent(`[Watchdog] ${runId}: 重新派发熔炉（上次未交付 scored）。`);
+      state.dispatched_at = nowIso();
+      await writeRunState(state);
+      await dispatchReviewer(runId, { forceDecision: state.force_decision_mode === true });
+    } else if (state.status === APS_STATE.SCOUTING) {
+      // If a brief exists, the scout never delivered raw -> re-dispatch scout. (If no brief,
+      // the coordinator brief-creation step itself failed; re-drive PENDING_BRIEF path.)
+      let hasBrief = false;
+      try { await fs.access(resolveAutoSelectionFile('brief', runId)); hasBrief = true; } catch (_) { }
+      if (hasBrief) {
+        logWorkflowEvent(`[Watchdog] ${runId}: 重新派发鹰眼（上次未交付 raw）。`);
+        state.dispatched_at = nowIso();
+        await writeRunState(state);
+        await dispatchScout(runId);
+      } else {
+        logWorkflowEvent(`[Watchdog] ${runId}: brief 缺失，回退 PENDING_BRIEF 重新创建。`);
+        state.status = APS_STATE.PENDING_BRIEF;
+        state.dispatched_at = null;
+        await writeRunState(state);
+        triggerImmediateWorkflowTick('watchdog_redispatch', { runId });
+      }
+    } else if (state.status === APS_STATE.PENDING_BRIEF) {
+      state.dispatched_at = null;
+      await writeRunState(state);
+      triggerImmediateWorkflowTick('watchdog_redispatch', { runId });
+    }
+  } catch (e) {
+    logWorkflowEvent(`[Watchdog] ${runId}: 重新派发失败: ${e.message}`, true);
+  }
+}
+
 
 /**
  * Call AgentAssistant plugin to dispatch a worker.
@@ -3399,8 +3211,6 @@ async function delegateToCoordinator(taskType, runId, prompt) {
   }
 
   try {
-    // Create coordinator lock before delegation
-    await createCoordinatorLock(taskType);
     logWorkflowEvent(`Delegating task [${taskType}] for run [${runId}] to coordinator.`);
 
     // Inject ToolBox content if available
@@ -3415,7 +3225,7 @@ async function delegateToCoordinator(taskType, runId, prompt) {
       prompt: finalPrompt,
       temporary_contact: false,
       task_delegation: true,
-      inject_tools: 'AutoProductSelection,ServerFileOperator,VCPForum,DailyNote'
+      inject_tools: 'AutoProductSelection,VCPForum,DailyNote'
     });
 
     logWorkflowEvent(`Successfully called processToolCall to delegate [${taskType}] for run [${runId}].`);
@@ -3423,9 +3233,7 @@ async function delegateToCoordinator(taskType, runId, prompt) {
   } catch (error) {
     console.error(`[AutoProductSelection WorkflowDriver] Failed to delegate ${taskType} for ${runId}:`, error);
     logWorkflowEvent(`Failed to delegate [${taskType}] for run [${runId}]: ${error.message}`, true);
-
-    // Remove lock on delegation failure
-    await removeCoordinatorLock();
+    throw error; // let the caller (advanceX) record the failure against the run state
   }
 }
 
@@ -3450,287 +3258,70 @@ function startWorkflowDriver() {
 async function autoSelectionDebugStatus(args = {}) {
   try {
     const report = [];
-
-    // Header
-    report.push('# AutoProductSelection 工作流诊断报告');
+    report.push('# AutoProductSelection 状态机诊断报告 (v4)');
     report.push('');
     report.push(`生成时间: ${nowIso()}`);
     report.push('');
 
-    // 1. Memory State
-    report.push('## 1. 内存状态');
+    report.push('## 1. 驱动器');
+    report.push(`- isWorkflowRunning: \`${isWorkflowRunning}\``);
+    report.push(`- isDriverExecuting: \`${isDriverExecuting}\``);
+    report.push(`- watchdog 定时器: ${workflowInterval ? `运行中 (${WORKFLOW_TICK_INTERVAL_MS / 1000}s)` : '已停止'}`);
+    if (lastWorkflowError) report.push(`- ⚠️ 最近错误: \`${String(lastWorkflowError).slice(0, 300)}\``);
     report.push('');
-    report.push(`- **isWorkflowRunning**: \`${isWorkflowRunning}\``);
-    report.push(`- **workflowState**: \`${workflowState}\` (IDLE=休眠 | INIT=已触发 | ACTIVE=运行中)`);
-    report.push(`- **consecutiveErrorCount**: \`${consecutiveErrorCount}\` / ${MAX_CONSECUTIVE_ERRORS}`);
-    report.push(`- **定时器状态**: ${workflowInterval ? `✅ 运行中 (${WORKFLOW_TICK_INTERVAL_MS / 1000}秒间隔)` : '⏸️  已停止'}`);
 
-    if (lastWorkflowError) {
-      report.push(`- **最近错误**: \`\`\`\n${lastWorkflowError}\n\`\`\``);
+    const states = await listRunStates();
+    const active = states.filter(s => s && s.status !== APS_STATE.DONE);
+    report.push('## 2. Run 状态 (state.json 唯一真相)');
+    report.push(`- 活动 run: ${active.length} | 总 run 文件: ${states.length}`);
+    report.push('');
+    if (active.length === 0) {
+      report.push('（无活动 run。系统空闲，等待 auto_selection_trigger_run 启动新一轮。）');
     } else {
-      report.push(`- **最近错误**: 无`);
-    }
-    report.push('');
-
-    // 2. Physical Locks
-    report.push('## 2. 物理锁状态');
-    report.push('');
-    const locksDir = path.join(AUTO_SELECTION_RUNS_DIR, 'locks');
-    try {
-      const lockFiles = await fs.readdir(locksDir);
-      if (lockFiles.length === 0) {
-        report.push('- 🟢 无锁文件（系统空闲）');
-      } else {
-        report.push(`- 🔒 检测到 ${lockFiles.length} 个锁文件：`);
-        for (const lockFile of lockFiles) {
-          const lockPath = path.join(locksDir, lockFile);
-          const stat = await fs.stat(lockPath);
-          const age = Math.floor((Date.now() - stat.mtimeMs) / 1000 / 60); // minutes
-          report.push(`  - \`${lockFile}\` (${age} 分钟前创建)`);
+      for (const s of active) {
+        const ageMin = s.claimed_at ? Math.round((Date.now() - new Date(s.claimed_at).getTime()) / 60000) : null;
+        const timeoutMin = Math.round(statusTimeoutMs(s.status) / 60000);
+        report.push(`### ${s.run_id}`);
+        report.push(`- **status**: \`${s.status}\`${s.claimed_by ? ` | 认领: ${s.claimed_by}（已 ${ageMin}min / 超时 ${timeoutMin}min）` : ' | 未认领（下一 tick 接管）'}`);
+        report.push(`- 上一步: ${s.last_action || '-'} | 结果: ${s.last_action_result || '-'}`);
+        const c = s.counters || {};
+        report.push(`- 计数器: 回环 scout ${c.scout_loopback || 0}/${SOFT_MAX_SCOUT_LOOPBACK} · reviewer ${c.reviewer_loopback || 0} · global ${c.global_loopback || 0}/${SOFT_MAX_GLOBAL_LOOPBACK}`);
+        report.push(`- 换方向预算: 廉价 early_reject ${c.early_reject || 0}/${MAX_EARLY_REJECT_PER_TRIGGER} · 昂贵 reselect ${c.reselect || 0}/${MAX_RESELECT_PER_TRIGGER}`);
+        const ft = s.failure_tracking || {};
+        report.push(`- 失败计数: 系统级 ${ft.system_error_count || 0}/${APS_SYSTEM_ERROR_CAP} · 非系统 ${ft.nonsystem_error_count || 0}/${APS_NONSYSTEM_ERROR_CAP}${ft.last_error ? ` | 最近: ${String(ft.last_error).slice(0, 120)}` : ''}`);
+        if (s.status === APS_STATE.PUBLISHING || s.status === APS_STATE.FAILED) {
+          const pf = s.publish_flags || {};
+          report.push(`- 发布幂等标记: 帖 ${pf.post_published ? '✓' : '✗'} · 日记 ${pf.diary_written ? '✓' : '✗'} · 归档 ${pf.archived ? '✓' : '✗'}`);
         }
-      }
-    } catch (error) {
-      report.push(`- ⚠️  无法读取锁目录: ${error.message}`);
-    }
-    report.push('');
-
-    // 3. Queue Status
-    report.push('## 3. 队列状态');
-    report.push('');
-    const queue = await autoSelectionQueueStatus({ include_content: false });
-
-    if (queue.success) {
-      const activeRuns = (queue.derived?.valid_locks?.length || 0) +
-        (queue.derived?.active_briefs?.length || 0) +
-        (queue.stages?.raw?.length || 0) +
-        (queue.stages?.scored?.length || 0);
-
-      report.push(`- **活动任务数 (activeRuns)**: ${activeRuns}`);
-      report.push(`- **下一步行动 (next_action_hint)**: \`${queue.next_action_hint}\``);
-      report.push('');
-      report.push('### 各阶段文件统计');
-      report.push('');
-      report.push(`- Brief 文件: ${queue.stages?.brief?.length || 0}`);
-      report.push(`- Raw 文件: ${queue.stages?.raw?.length || 0}`);
-      report.push(`- Scored 文件: ${queue.stages?.scored?.length || 0}`);
-      report.push(`- Failed 文件: ${queue.stages?.failed?.length || 0}`);
-      report.push(`- Archived 文件: ${queue.stages?.archived?.length || 0}`);
-      report.push(`- 有效锁: ${queue.derived?.valid_locks?.length || 0}`);
-      report.push(`- 畸形锁: ${queue.derived?.malformed_locks?.length || 0}`);
-
-      // Worker missing output
-      const missingOutputs = queue.derived?.worker_missing_outputs || [];
-      if (missingOutputs.length > 0) {
+        if (s.force_decision_mode) report.push(`- ⚠️ force_decision_mode: true（已禁止继续 LOOPBACK）`);
         report.push('');
-        report.push('### ⚠️  Worker 缺失输出');
-        report.push('');
-        for (const item of missingOutputs) {
-          const ageDisplay = item.lock_age_minutes != null
-            ? `${item.lock_age_minutes} 分钟无输出`
-            : (item.timeout_minutes != null ? `超过 ${item.timeout_minutes} 分钟超时` : '已完成但无输出');
-          report.push(`- **${item.run_id}** (${item.lock_name}): ${ageDisplay}`);
-          if (item.retry_guard?.eligible_now) {
-            report.push(`  - 可重试 (retry_count: ${item.retry_count})`);
-          }
-        }
       }
+    }
+
+    report.push('## 3. 下一步预判');
+    if (active.length === 0) {
+      report.push('- 空闲。');
     } else {
-      report.push(`- ❌ 无法获取队列状态: ${queue.error || 'unknown'}`);
+      const next = active.slice().sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))[0];
+      const nextStepMap = {
+        PENDING_BRIEF: '派发枢纽创建 brief → SCOUTING',
+        SCOUTING: '等待鹰眼写 raw（或已写则路由到 SCORING / EARLY_REJECT 换方向）',
+        SCORING: '等待熔炉写 scored → EVALUATING',
+        EVALUATING: '后端跑 decideBackendAction → 发布/回环/换方向',
+        PUBLISHING: '派发枢纽发研报+写日记 → 后端归档 → DONE',
+        FAILED: '派发枢纽发阻断报告+极简日记 → 后端归档 → DONE'
+      };
+      report.push(`- 下一个推进的 run: \`${next.run_id}\`（${next.status}）`);
+      report.push(`- 预期动作: ${nextStepMap[next.status] || '未知'}`);
     }
     report.push('');
+    report.push('## 4. 提示');
+    report.push('- 正常推进由「写文件回调」驱动，watchdog 仅做超时兜底扫描。');
+    report.push('- 如需全新开始: auto_selection_abort_workflow（清空所有 state）后 auto_selection_trigger_run。');
 
-    // 4. Circuit Breaker Counters
-    report.push('## 4. 熔断计数器');
-    report.push('');
-
-    let foundCounters = false;
-
-    // Check brief files
-    if (queue.success && queue.stages?.brief?.length > 0) {
-      for (const brief of queue.stages.brief) {
-        try {
-          const briefContent = await fs.readFile(brief.path, 'utf8');
-          const counters = parseLoopbackCounters(briefContent);
-
-          if (counters.global_loopback_count > 0 || counters.scout_loopback_count > 0 || counters.reviewer_loopback_count > 0) {
-            foundCounters = true;
-            report.push(`### Brief: ${brief.run_id}`);
-            report.push('');
-            report.push(`- global_loopback_count: ${counters.global_loopback_count} / ${MAX_GLOBAL_LOOPBACK}`);
-            report.push(`- scout_loopback_count: ${counters.scout_loopback_count} / ${MAX_SCOUT_LOOPBACK}`);
-            report.push(`- reviewer_loopback_count: ${counters.reviewer_loopback_count} / ${MAX_REVIEWER_LOOPBACK}`);
-
-            // Check if close to circuit breaker
-            if (shouldTriggerCircuitBreaker(counters)) {
-              report.push(`- ⚠️  **警告**: 已达到熔断阈值，下次扫描将自动终止`);
-            } else if (counters.global_loopback_count >= MAX_GLOBAL_LOOPBACK - 2 ||
-              counters.scout_loopback_count >= MAX_SCOUT_LOOPBACK - 1 ||
-              counters.reviewer_loopback_count >= MAX_REVIEWER_LOOPBACK - 1) {
-              report.push(`- ⚠️  **注意**: 接近熔断阈值`);
-            }
-            report.push('');
-          }
-        } catch (error) {
-          // Ignore read errors
-        }
-      }
-    }
-
-    // Check raw files
-    if (queue.success && queue.stages?.raw?.length > 0) {
-      for (const raw of queue.stages.raw) {
-        try {
-          const rawContent = await fs.readFile(raw.path, 'utf8');
-          const counters = parseLoopbackCounters(rawContent);
-
-          if (counters.global_loopback_count > 0 || counters.scout_loopback_count > 0 || counters.reviewer_loopback_count > 0) {
-            foundCounters = true;
-            report.push(`### Raw: ${raw.run_id}`);
-            report.push('');
-            report.push(`- global_loopback_count: ${counters.global_loopback_count} / ${MAX_GLOBAL_LOOPBACK}`);
-            report.push(`- scout_loopback_count: ${counters.scout_loopback_count} / ${MAX_SCOUT_LOOPBACK}`);
-            report.push(`- reviewer_loopback_count: ${counters.reviewer_loopback_count} / ${MAX_REVIEWER_LOOPBACK}`);
-
-            if (shouldTriggerCircuitBreaker(counters)) {
-              report.push(`- ⚠️  **警告**: 已达到熔断阈值，下次扫描将自动终止`);
-            }
-            report.push('');
-          }
-        } catch (error) {
-          // Ignore read errors
-        }
-      }
-    }
-
-    // Check scored files
-    if (queue.success && queue.stages?.scored?.length > 0) {
-      for (const scored of queue.stages.scored) {
-        try {
-          const scoredContent = await fs.readFile(scored.path, 'utf8');
-          const counters = parseLoopbackCounters(scoredContent);
-
-          if (counters.global_loopback_count > 0 || counters.scout_loopback_count > 0 || counters.reviewer_loopback_count > 0) {
-            foundCounters = true;
-            report.push(`### Scored: ${scored.run_id}`);
-            report.push('');
-            report.push(`- global_loopback_count: ${counters.global_loopback_count} / ${MAX_GLOBAL_LOOPBACK}`);
-            report.push(`- scout_loopback_count: ${counters.scout_loopback_count} / ${MAX_SCOUT_LOOPBACK}`);
-            report.push(`- reviewer_loopback_count: ${counters.reviewer_loopback_count} / ${MAX_REVIEWER_LOOPBACK}`);
-
-            if (shouldTriggerCircuitBreaker(counters)) {
-              report.push(`- ⚠️  **警告**: 已达到熔断阈值，下次扫描将自动终止`);
-            }
-            report.push('');
-          }
-        } catch (error) {
-          // Ignore read errors
-        }
-      }
-    }
-
-    if (!foundCounters) {
-      report.push('- 无活动任务或计数器为 0');
-    }
-    report.push('');
-
-    // 5. Recommendations
-    report.push('## 5. 诊断建议');
-    report.push('');
-
-    if (!isWorkflowRunning) {
-      report.push('- 🟢 工作流未运行，系统处于静默休眠状态');
-      report.push('- 💡 如需启动工作流，调用 `auto_selection_trigger_run`');
-    } else if (workflowState === 'IDLE') {
-      report.push('- ⚠️  异常状态：工作流标记为运行中但状态为 IDLE');
-      report.push('- 💡 建议手动停止工作流');
-    } else {
-      const activeRuns = (queue.derived?.valid_locks?.length || 0) +
-        (queue.derived?.active_briefs?.length || 0) +
-        (queue.stages?.raw?.length || 0) +
-        (queue.stages?.scored?.length || 0);
-
-      if (activeRuns === 0 && workflowState === 'ACTIVE') {
-        report.push('- 🟡 工作流运行中但无活动任务');
-        report.push('- 💡 下次扫描应自动终止并休眠');
-      } else if (queue.next_action_hint === 'wait_for_worker') {
-        report.push('- 🟡 正在等待 Worker 完成任务');
-        report.push('- 💡 如果长时间无进展，检查 Worker 是否卡死');
-      } else {
-        report.push('- 🟢 工作流正常运行中');
-      }
-    }
-
-    if (consecutiveErrorCount > 0) {
-      report.push(`- ⚠️  已累计 ${consecutiveErrorCount} 次连续错误`);
-      if (consecutiveErrorCount >= MAX_CONSECUTIVE_ERRORS - 1) {
-        report.push('- 🔴 接近最大错误阈值，下次错误将自动停止工作流');
-      }
-    }
-
-    if (lastWorkflowError) {
-      report.push('- 🔴 检测到最近错误，请查看上方错误详情');
-    }
-
-    const lockFiles = await fs.readdir(path.join(AUTO_SELECTION_RUNS_DIR, 'locks')).catch(() => []);
-    if (lockFiles.some(f => f === 'coordinator.lock')) {
-      report.push('- 🔒 协调器锁存在，工作流暂停等待委托完成');
-    }
-
-    const failedTask = await checkFailedCoordinatorTask();
-    if (failedTask) {
-      report.push(`- 🔴 **检测到协调器任务失败**: 最近 15 分钟内存在失败的协调器任务 [${failedTask.name}]。`);
-      report.push(`  - 失败原因: ${failedTask.error}`);
-      report.push(`  - 💡 协调器锁应已被自动清除，以防止工作流锁死。如果依然被锁，请尝试重新触发。`);
-    }
-
-    // 6. Workflow Execution History
-    report.push('');
-    report.push('## 6. 工作流执行历史');
-    report.push('');
-    try {
-      const historyPath = path.join(AUTO_SELECTION_RUNS_DIR, 'workflow_history.log');
-      const fsSync = require('fs');
-      if (fsSync.existsSync(historyPath)) {
-        const historyContent = fsSync.readFileSync(historyPath, 'utf8');
-        const lines = historyContent.split('\n').filter(Boolean).slice(-20);
-        if (lines.length === 0) {
-          report.push('- 🟢 暂无历史记录');
-        } else {
-          report.push('```text');
-          report.push(...lines);
-          report.push('```');
-        }
-      } else {
-        report.push('- 🟢 暂无历史记录文件');
-      }
-    } catch (historyErr) {
-      report.push(`- ⚠️  无法读取历史日志: ${historyErr.message}`);
-    }
-    report.push('');
-
-    return {
-      success: true,
-      command: 'auto_selection_debug_status',
-      report: report.join('\n'),
-      summary: {
-        workflow_running: isWorkflowRunning,
-        workflow_state: workflowState,
-        consecutive_errors: consecutiveErrorCount,
-        has_recent_error: !!lastWorkflowError,
-        active_runs: queue.success ? (queue.derived?.valid_locks?.length || 0) +
-          (queue.derived?.active_briefs?.length || 0) +
-          (queue.stages?.raw?.length || 0) +
-          (queue.stages?.scored?.length || 0) : 0,
-        next_action: queue.success ? queue.next_action_hint : 'unknown'
-      }
-    };
+    return { success: true, command: 'auto_selection_debug_status', report: report.join('\n') };
   } catch (error) {
-    return {
-      success: false,
-      command: 'auto_selection_debug_status',
-      error: error.message,
-      report: `# 诊断失败\n\n错误: ${error.message}\n\n${error.stack || ''}`
-    };
+    return { success: false, command: 'auto_selection_debug_status', error: error.message };
   }
 }
 
@@ -3744,21 +3335,10 @@ async function stopWorkflowDriver() {
     console.log('[AutoProductSelection] Workflow driver stopped.');
     logWorkflowEvent('Workflow driver watchdog timer stopped.');
   }
-
-  // Reset state
   isWorkflowRunning = false;
-  workflowState = 'IDLE';  // Reset lifecycle flag
-  logWorkflowEvent('Workflow running state set to IDLE.');
   consecutiveErrorCount = 0;
-  reselectCountThisTrigger = 0;  // Reset cross-direction reselect budget for next trigger
-  createBriefCountThisTrigger = 0;  // Reset create_brief ceiling for next trigger
-  failedDelegationAttempts.clear();  // Reset handle_failed loop backstop for next trigger
-  scoredDelegationAttempts.clear();  // Reset evaluate_scored loop backstop for next trigger
-
-  // Remove coordinator lock
-  await removeCoordinatorLock();
-
-  debugLog('Workflow driver stopped and state reset. Entering silent rest mode.');
+  logWorkflowEvent('Workflow running state set to IDLE.');
+  debugLog('Workflow driver stopped. Entering silent rest mode.');
 }
 
 async function initialize(config = {}, dependencies = {}) {
@@ -3778,10 +3358,26 @@ async function initialize(config = {}, dependencies = {}) {
     console.warn('[AutoProductSelection] AgentAssistant plugin not available - workflow driver will operate in limited mode.');
   }
 
-  // Workflow driver is in standby mode on startup
-  // Trigger it via: auto_selection_trigger_run, or scheduled tasks
-  console.log('[AutoProductSelection] Plugin initialized. Workflow driver in standby mode.');
-  console.log('[AutoProductSelection] Trigger via: auto_selection_trigger_run command or VCPTaskAssistant scheduled task.');
+  // Crash/restart recovery: if any non-terminal run state exists, AUTO-RESUME the driver.
+  // Without this, a restart mid-round leaves the run stranded (the forge may write scored,
+  // but with the driver in standby nothing picks it up until the next scheduled trigger —
+  // the exact production hang we diagnosed). The state machine is idempotent, so resuming is
+  // safe: it re-derives each run's next step purely from its status.
+  try {
+    const states = await listRunStates();
+    const active = states.filter(s => s && s.status !== APS_STATE.DONE);
+    if (active.length > 0) {
+      console.log(`[AutoProductSelection] Found ${active.length} active run(s) on startup. Auto-resuming workflow driver.`);
+      logWorkflowEvent(`Startup recovery: auto-resuming ${active.length} active run(s).`);
+      isWorkflowRunning = true;
+      startWorkflowDriver();
+    } else {
+      console.log('[AutoProductSelection] Plugin initialized. Workflow driver in standby mode.');
+      console.log('[AutoProductSelection] Trigger via: auto_selection_trigger_run command or VCPTaskAssistant scheduled task.');
+    }
+  } catch (e) {
+    console.error('[AutoProductSelection] Startup recovery check failed:', e.message);
+  }
 }
 
 function clampNumber(value, min = 0, max = 100) {
@@ -4538,33 +4134,29 @@ async function autoSelectionAbortWorkflow(args = {}) {
   logWorkflowEvent('手动中止并重置选品工作流 (User manually aborted and reset the workflow).');
   await stopWorkflowDriver();
 
-  const queue = await autoSelectionQueueStatus({ include_content: false });
-  const runIds = new Set();
-
-  if (queue.success) {
-    queue.derived?.active_briefs?.forEach(f => runIds.add(f.run_id));
-    queue.stages?.raw?.forEach(f => runIds.add(f.run_id));
-    queue.stages?.scored?.forEach(f => runIds.add(f.run_id));
-    queue.derived?.valid_locks?.forEach(f => runIds.add(f.run_id));
-
-    for (const runId of runIds) {
-      await cleanupAutoSelectionRunResidue(runId);
-    }
-
-    // Clean up malformed locks
-    const malformedLocks = queue.derived?.malformed_locks || [];
-    for (const malformed of malformedLocks) {
-      await fs.unlink(malformed.path).catch(() => { });
-    }
+  // Delete every run's state file + its handoff residue. The state files are the authoritative
+  // list of runs, so we drive cleanup off them.
+  const states = await listRunStates();
+  const runIds = states.map(s => s.run_id);
+  for (const runId of runIds) {
+    await cleanupAutoSelectionRunResidue(runId).catch(() => { });
+    await fs.unlink(stateFilePath(runId)).catch(() => { });
   }
+  // Sweep any stray dropped staging too.
+  try {
+    const dropped = await fs.readdir(AUTO_SELECTION_DROPPED_DIR);
+    for (const name of dropped) {
+      if (name === '.gitkeep') continue;
+      await fs.unlink(path.join(AUTO_SELECTION_DROPPED_DIR, name)).catch(() => { });
+    }
+  } catch (_) { }
 
-  logWorkflowEvent(`工作流已成功重置，清除了 ${runIds.size} 个活动任务的文件和所有锁。`);
-
+  logWorkflowEvent(`工作流已成功重置，清除了 ${runIds.length} 个 run 的 state 与残留文件。`);
   return {
     success: true,
     command: 'auto_selection_abort_workflow',
     message: '工作流已中止，且已清除全部选品状态机文件。下一次触发自动任务时将全新开始。',
-    cleaned_runs: Array.from(runIds)
+    cleaned_runs: runIds
   };
 }
 
@@ -4579,7 +4171,11 @@ module.exports = {
   shutdown,
   decideBackendAction,
   calculateScoringModel,
+  extractRejectedKeywords,
+  extractDeferredCandidates,
   autoSelectionToggleDebug,
   autoSelectionPauseWorkflow,
-  autoSelectionAbortWorkflow
+  autoSelectionAbortWorkflow,
+  // Exposed for tests only:
+  __test__: { workflowDriver, sweepTimeouts, readRunState, writeRunState, freshRunState, advanceRun }
 };

@@ -44,11 +44,27 @@ call pm2 delete vcp-main 2>nul
 call pm2 delete vcp-admin 2>nul
 call pm2 delete server 2>nul
 
+REM Load VCP_MAIN_MAX_MEMORY from environment or config.env if exists, fallback to 4096M
+if not defined VCP_MAIN_MAX_MEMORY (
+    set "VCP_MAIN_MAX_MEMORY=4096M"
+    if exist config.env (
+        for /f "usebackq tokens=1* delims==" %%A in ("config.env") do (
+            set "KEY=%%A"
+            set "VAL=%%B"
+            set "KEY=!KEY: =!"
+            set "VAL=!VAL: =!"
+            if "!KEY!"=="VCP_MAIN_MAX_MEMORY" (
+                set "VCP_MAIN_MAX_MEMORY=!VAL!"
+            )
+        )
+    )
+)
+
 echo.
 REM 2. Start Main Service
 echo [1/2] Starting Main chat service (vcp-main)...
 REM --kill-timeout 15000: Give 15s to save vector DB indices
-call pm2 start server.js --name "vcp-main" --watch false --max-memory-restart 1500M --kill-timeout 15000
+call pm2 start server.js --name "vcp-main" --watch false --max-memory-restart !VCP_MAIN_MAX_MEMORY! --kill-timeout 15000
 
 echo.
 echo Waiting 8 seconds for main service to initialize...

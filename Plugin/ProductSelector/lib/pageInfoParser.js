@@ -297,7 +297,7 @@ function normalizeKeywordTableData(tableData, options = {}) {
   const indexes = {
     rank: findHeaderIndex(headers, [/^#$/], 1),
     keyword: findHeaderIndex(headers, [/keyword/i, /\u5173\u952e\u8bcd/], 2, 'any'),
-    monthlySearches: findHeaderIndex(headers, [/\u6708\u641c\u7d22\u91cf/], 5),
+    monthlySearches: findHeaderIndex(headers, [/搜索量/, /^(?!.*(?:趋势|trend))/i], 5),
     purchase: findHeaderIndex(headers, [/\u6708\u8d2d\u4e70\u91cf/, /\u8d2d\u4e70\u7387/], 6),
     impressions: findHeaderIndex(headers, [/\u5c55\u793a\u91cf/, /\u70b9\u51fb\u91cf/], 7),
     growth: findHeaderIndex(headers, [/\u589e\u957f\u7387/], 8),
@@ -391,7 +391,7 @@ function normalizeKeywordReverseTableData(tableData, options = {}) {
     organic_rank: findHeaderIndex(headers, [/自然排名/], 6),
     ad_rank: findHeaderIndex(headers, [/广告排名/], 7),
     aba_week_rank: findHeaderIndex(headers, [/ABA周排名|ABA排名/], 9),
-    monthly_searches: findHeaderIndex(headers, [/月搜索量/], 10),
+    monthly_searches: findHeaderIndex(headers, [/搜索量/, /^(?!.*(?:趋势|trend))/i], 10),
     daily_searches: findHeaderIndex(headers, [/日均搜索量|日搜索量/], -1),
     spr: findHeaderIndex(headers, [/^SPR$/i], 11),
     title_density: findHeaderIndex(headers, [/标题密度|标题/], 12),
@@ -452,6 +452,11 @@ function normalizeKeywordReverseTableData(tableData, options = {}) {
     } else {
       traffic_count = parseInteger(trafficTokens[1]);
     }
+
+    const categories = ['主要流量词', '精准流量词', '精准长尾词'];
+    const conversionEffects = ['转化优质词', '转化平稳词', '转化流失词', '无效曝光词'];
+    const traffic_class = categories.find(cat => traffic_share_col.includes(cat)) || null;
+    const conversion_effect = conversionEffects.find(eff => traffic_share_col.includes(eff)) || null;
 
     // 2. Traffic Distribution (Organic & Ad Share)
     const distrib_col = getVal(indexes.traffic_distribution);
@@ -559,8 +564,20 @@ function normalizeKeywordReverseTableData(tableData, options = {}) {
       ppc_high_val = ppcTokens[2];
     }
 
-    const organicRankTokens = extractMetricTokens(getVal(indexes.organic_rank));
-    const adRankTokens = extractMetricTokens(getVal(indexes.ad_rank));
+    const organic_rank_col = getVal(indexes.organic_rank) || '';
+    const organicPageMatch = organic_rank_col.match(/第\d+页,\s*\d+\s*\/\s*\d+/);
+    const organic_page_info = organicPageMatch ? organicPageMatch[0].replace(/\s+/g, '') : null;
+    const organicTimeMatch = organic_rank_col.match(/(今日|\d+天前)?\s*\d+:\d+(?:\s*排名)?/);
+    const organic_rank_time = organicTimeMatch ? organicTimeMatch[0].trim() : null;
+
+    const ad_rank_col = getVal(indexes.ad_rank) || '';
+    const adPageMatch = ad_rank_col.match(/第\d+页,\s*\d+\s*\/\s*\d+/);
+    const ad_page_info = adPageMatch ? adPageMatch[0].replace(/\s+/g, '') : null;
+    const adTimeMatch = ad_rank_col.match(/(今日|\d+天前)?\s*\d+:\d+(?:\s*排名)?/);
+    const ad_rank_time = adTimeMatch ? adTimeMatch[0].trim() : null;
+
+    const organicRankTokens = extractMetricTokens(organic_rank_col);
+    const adRankTokens = extractMetricTokens(ad_rank_col);
     const abaWeekTokens = extractMetricTokens(getVal(indexes.aba_week_rank));
 
     const rank = parseInteger(getVal(indexes.rank)) || (index + 1);
@@ -599,7 +616,13 @@ function normalizeKeywordReverseTableData(tableData, options = {}) {
       ad_competitors,
       aba_click_share,
       aba_conversion_share,
-      ppc_bid: { low: ppc_low, mid: ppc_mid, high: ppc_high }
+      ppc_bid: { low: ppc_low, mid: ppc_mid, high: ppc_high },
+      traffic_class,
+      conversion_effect,
+      organic_page_info,
+      organic_rank_time,
+      ad_page_info,
+      ad_rank_time
     };
 
     // Sanitize the raw values array so that ordered_table doesn't confuse the Agent with mixed ABA text
@@ -609,6 +632,14 @@ function normalizeKeywordReverseTableData(tableData, options = {}) {
       } else {
         values[indexes.traffic_share] = `${parsedRow.traffic_share || '-'}`;
       }
+    }
+
+    if (indexes.organic_rank !== -1 && values[indexes.organic_rank]) {
+      values[indexes.organic_rank] = parsedRow.organic_rank !== null ? String(parsedRow.organic_rank) : '-';
+    }
+
+    if (indexes.ad_rank !== -1 && values[indexes.ad_rank]) {
+      values[indexes.ad_rank] = parsedRow.ad_rank !== null ? String(parsedRow.ad_rank) : '-';
     }
 
     if (indexes.aba_share !== -1 && values[indexes.aba_share]) {
@@ -693,7 +724,7 @@ function normalizeKeywordConversionRateTableData(tableData, options = {}) {
   const indexes = {
     rank: findHeaderIndex(headers, [/^#$/], 0),
     keyword: findHeaderIndex(headers, [/关键词/], 1),
-    searches: findHeaderIndex(headers, [/搜索量/], 2),
+    searches: findHeaderIndex(headers, [/搜索量/, /^(?!.*(?:趋势|trend))/i], 2),
     clicks: findHeaderIndex(headers, [/点击量/], 3),
     purchases: findHeaderIndex(headers, [/购买量/], 4),
     searchConvRate: findHeaderIndex(headers, [/搜索转化率/], 5),
@@ -761,6 +792,24 @@ function normalizeKeywordConversionRateTableData(tableData, options = {}) {
       },
       top_clicked_asins: buildTopClickedAsins(topAsinCell, rowData)
     };
+
+    if (indexes.ppc !== -1 && values[indexes.ppc]) {
+      values[indexes.ppc] = [parsedRow.ppc_bid?.low, parsedRow.ppc_bid?.mid, parsedRow.ppc_bid?.high].map(v => v !== null ? `$${v}` : '-').join('/');
+    }
+    if (indexes.cpa !== -1 && values[indexes.cpa]) {
+      values[indexes.cpa] = [parsedRow.cpa?.low, parsedRow.cpa?.mid, parsedRow.cpa?.high].map(v => v !== null ? `$${v}` : '-').join('/');
+    }
+    if (indexes.productPrice !== -1 && values[indexes.productPrice]) {
+      values[indexes.productPrice] = [parsedRow.product_price?.low, parsedRow.product_price?.avg, parsedRow.product_price?.high].map(v => v !== null ? `$${v}` : '-').join('/');
+    }
+    if (indexes.acos !== -1 && values[indexes.acos]) {
+      values[indexes.acos] = [parsedRow.acos?.max, parsedRow.acos?.avg, parsedRow.acos?.min].map(v => v !== null ? v : '-').join('/');
+    }
+    if (indexes.aba !== -1 && values[indexes.aba]) {
+      values[indexes.aba] = [parsedRow.aba_concentration?.click_share, parsedRow.aba_concentration?.conversion_share].map(v => v !== null ? v : '-').join('/');
+    }
+
+    return parsedRow;
   }).filter(Boolean);
 }
 

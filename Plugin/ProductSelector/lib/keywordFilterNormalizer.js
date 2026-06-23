@@ -511,7 +511,8 @@ function normalizeKeywordReverseArgs(args = {}) {
       const matches = String(value || '').match(/\b[A-Z0-9]{10}\b/gi) || [];
       for (const match of matches) {
         const asin = match.toUpperCase();
-        if (!seenAsins.has(asin)) {
+        const isValid = (/^B[A-Z0-9]{9}$/.test(asin) && /[0-9]/.test(asin)) || /^[0-9]{9}[0-9X]$/.test(asin);
+        if (isValid && !seenAsins.has(asin)) {
           seenAsins.add(asin);
           asinMatches.push(asin);
         }

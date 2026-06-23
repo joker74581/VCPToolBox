@@ -123,7 +123,45 @@ keywords:「始」mushroom lamp「末」
 - `productTags` (String): 标签过滤，如 `Best Seller`、`Amazon's Choice`、`New Release`。
 
 ### 默认 `summary_markdown` 合并表核心列
-默认结果会把候选商品合并为一张 ASIN 表，核心列包括：`asin`、`category_bsr` (大类BSR)、`parent_sales` (父体月销量)、`parent_sales_growth_rate` (月销量增长率)、`revenue` (月销售额)、`child_sales`、`child_revenue`、`variations` (变体数)、`price` (价格)、`qa_count` (Q&A数)、`review_count` (总留评数)、`monthly_new_reviews`、`rating` (评分值)、`review_rate`、`fba_fee` (FBA费用)、`profit_margin` (毛利率)、`putaway_date` (上架日期)、`seller_count` (卖家数)、`category_top/category_path`。
+默认结果会把候选商品合并为一张 ASIN 表，Agent 应优先读取 `summary_markdown`。核心列包括：
+1. **商品信息**:
+   - 包含产品标题、子 ASIN、父 ASIN、品牌名（从上往下排列）。
+   - 图片周围的特殊资质/特权标签：
+     - `[A+]` (有富文本A+图文介绍)
+     - `[V]` (有视频介绍 Video)
+     - `[BS]` (类目 Best Seller 标)
+     - `[AC]` (Amazon's Choice 标)
+     - `[NR]` (New Release 新品榜)
+2. **大类BSR**:
+   - 第一行：大类 BSR 排名。若为最近 30 天口径，则显示最近 1 天在 Amazon 列表页的 Best Sellers Rank 排名；若为历史月份则显示该月月末那一天的排名。
+   - 第二行 (增)：近 7 天 BSR 排名增长数（7天前的 BSR - 当天 BSR）。正数代表排名上升，负数代表排名下降。
+   - 第三行 (率)：近 7 天 BSR 排名增长率（(7天前BSR - 当天BSR) / 7天前BSR * 100%）。
+3. **父销量 / 增长率**:
+   - *父销量*: 基于该父体 Listing 下所有变体及跟卖在近 30 天（或特定自然月）预估总销量。
+   - *增长率*: 父体销量环比增长率。
+4. **销售额**: 父体近 30 天（或特定自然月）的总预估销售额（`销量 * 当前子体售价/均价`）。
+5. **子销量 / 销售额**:
+   - *子销量*: 子体 ASIN 在近 30 天或某自然月预估销量。来源于亚马逊搜索页（如 '4K+ bought in past month'）。显示为 `-` 表示搜索页未开放此数据。
+   - *销售额*: 子体 ASIN 对应的销售额（`子体销量 * 平均售价`）。
+6. **变体数**: 该 ASIN 所在 Listing 的变体总数量。
+7. **价格 / Q&A**:
+   - *价格*: 该子体 ASIN 的当前最新售价。
+   - *Q&A*: 该 Listing 累积的历史 Q&A 问答数。
+8. **评分数 / 新增**:
+   - *评分数*: Listing 的最新总评分数 (Ratings)。
+   - *新增*: 近 30 天或对应自然月内的新增评分数（月底评分数 - 月初评分数）。
+9. **评分 / 留评率**:
+   - *评分*: Listing 的最新评分值（星级）。
+   - *留评率*: 近 30 天（或该自然月）评分数增长值 / 近 30 天（或该自然月）销量。
+10. **FBA费 / 利润率**: 预估的单件亚马逊物流配送费用及扣除首程、采购和广告费前的预估毛利率。
+11. **上架 / 卖家数**:
+    - *上架时间*: 取自 Keepa 系统初次抓取到该商品价格或 BSR 的时间。
+    - *卖家数*: Listing 下当前所有跟卖的卖家数量。
+12. **卖家 / 属性**:
+    - *BB (BuyBox 卖家)*: 当前获得 BuyBox 黄金购物车的卖家名称及所属国家/地区。
+    - *LQS*: Listing 质量得分（LQS，满分 10 分）。
+    - *属性 / 包装*: 商品实际入库重量与尺寸大小分段，以及含包装的规格属性（决定 FBA 配送费的基准）。
+13. **类目**: 商品所属的顶层大类名或底层完整类目路径。
 
 完整 `candidates` JSON 默认不返回；如需字段级排障，传 `include_candidates=true` 或 `result_mode=debug/full`。
 
@@ -261,7 +299,33 @@ includeKeywords:「始」mushroom lamp「末」
 - `minBid` / `maxBid` (Number): PPC竞价区间。
 
 ### 默认 `summary_markdown` 合并表核心列
-默认结果会把关键词合并为一张表，Agent 应优先读取 `summary_markdown`。核心列包括：`keyword` (关键词)、`translation` (中文翻译)、`monthly_searches` (月搜索量)、`monthly_purchases` (月购买量)、`purchase_rate` (购买率)、`avg_price`、`avg_rating`、`spr`、`supply_demand_ratio` (需供比)、`products` (在线商品数)、`clicks`、`conversion_rate`。
+默认结果会把关键词合并为一张表，Agent 应优先读取 `summary_markdown`。核心列包括：
+1. **关键词 / 类目与周期**: 包含关键词原文，(中文翻译)；第二行包含所属类目及市场周期类型。
+2. **月搜 / 日搜**: 月搜索量 / 日均搜索量。月搜索量指一个自然月该词在亚马逊站内的搜索次数（月初更新上个月数据，须结合趋势看）。
+3. **月购买 / 购买率**: 月购买量 / 购买率。
+   - *月购买量*: 指一个自然月，在亚马逊站内搜索该关键词后产生购买的次数（例：某用户搜索 iphone charger，然后一次购买了1个充电器和2条关联推荐商品，则购买量=1。公式：月购买量 = 搜索量 * 购买率）。
+   - *购买率*: 在买家输入该搜索词并点击此细分市场中的任意商品后产生购买的比例。一般反映了该关键词的精准度，决策周期越短的产品，购买率越高。
+4. **展示 / 点击**: 指一个自然月，在该词搜索结果页中所有 ASIN 的总展示次数 / 被点击的总次数。非单个 ASIN 在关键词下的曝光量或点击量。
+5. **增长率**: 指本月搜索量相对于上月增长的百分比。如 `(本月 - 上月) / 上月`。增长快可能是因为季节性、节日性、事件性或潜力爆款。
+6. **同比 / 近3月增长**:
+   - *同比*: 月搜索量同比增长值及同比增长率。`同比搜索量增长值 = (今年)当月搜索量 - (去年)该月搜索量`。
+   - *近3月增长*: 最近3个月中每月的增长值/增长率的“最小值”（即以最小增长值/增长率作为近3个月搜索量增长指标，能迅速发现飙升较快的潜力词）。
+7. **ABA点击 / 转化**: 来源于亚马逊后台的 ABA 数据报告。
+   - *点击总占比*: 指该关键词下点击排名前三 ASIN 的点击总占比之和。点击总占比越高，垄断程度越高。
+   - *转化总占比*: 指该关键词下点击排名前三 ASIN 的销量占整个词销量的比例之和。
+8. **ABA排名**: 关键词的月度 ABA 排名（搜索频率排名 SFR），每月月初更新上个月数据。
+9. **货流值**: 反映关键词的引流成本。计算规则：`货流值 = 历史最高 PPC 竞价(短语匹配) / 点击排名前 3 的 ASIN 的商品价格中位数 * 100%`。货流值越小，引流成本越低，竞争越小；也可能意味着该词延伸的细分市场还处于蓝海。
+10. **PPC低 / 均 / 高**: 精准/词组/广泛匹配模式下的建议出价及范围。出价高低直接反映了竞争激烈度与营销费用。
+11. **需供比 / 商品数**:
+    - *需供比*: `搜索量(需求) / 商品数(供应)`，值越高代表需求越强劲、竞争越小。
+    - *商品数*: 指搜索该关键词后出现了多少相关产品 (All Departments 类目)。
+12. **均价 / 均评 / 评分**: 点击排名前 3 ASIN 的价格/评分数/评分值“中位数”。
+    - *价格分布*: 可判断差异化定价的机会及竞争激烈的区间。
+    - *评分数分布*: 侧面说明新品打造的门槛，中低评分数占比大说明新品壁垒低。
+    - *评分值分布*: 说明市场成熟度，4.5以上多说明市场极为成熟、建立差异化壁垒难；3.5分多则有改进空间。
+13. **SPR / 标题密度**:
+    - *SPR*: 排至搜索首页第一页所需的销售量指标。
+    - *标题密度*: 搜索前页商品中包含完整关键词的商品比例。
 
 完整 `candidates` JSON 默认不返回；只有 `result_mode=debug/full` 时才用于排障。
 
@@ -325,8 +389,27 @@ reverseType:「始」W「末」
 - `minConversionRate` / `maxConversionRate`: 转化占比区间。
 - `minPhraseCount` / `maxPhraseCount`: 词组个数区间。
 
-### 默认 `summary_markdown` 合并表核心列
-默认结果会把关键词合并为一张表。核心列包括：`keyword`、`period_searches`、`period_clicks`、`period_purchases`、`search_conversion_rate`、`click_conversion_rate`、`ppc_bid low/mid/high`、`cpa low/mid/high`、`product_price low/avg/high`、`acos max/avg/min`、`ad_budget`、`aba_concentration click/conversion`、`top_clicked_asins`。
+### 默认 `summary_markdown` 合并表核心列与口径定义
+默认结果会把关键词合并为一张高密度表。核心列与口径定义如下：
+1. **关键词** (keyword): 包含搜索词中任意一个词根的相关关键词及其中文释义 (translation)。
+2. **搜索 / 点击 / 购买** (period_searches / period_clicks / period_purchases):
+   - *搜索量* (period_searches): 在指定的时间段内，买家在亚马逊上输入该词的总搜索次数（数据来源于商机探测器）。
+   - *点击量* (period_clicks): 买家搜索该词后点击商品的总次数（数据来源于商机探测器）。
+   - *购买量* (period_purchases): 买家搜索该词后，点击商品并完成购买的总次数（数据来源于商机探测器）。
+3. **搜索转化 / 点击转化** (search_conversion_rate / click_conversion_rate):
+   - *搜索转化率* (search_conversion_rate): 购买量 / 搜索量。
+   - *点击转化率* (click_conversion_rate): 购买量 / 点击量。
+4. **PPC / CPA (低/中/高)** (ppc_bid / cpa):
+   - *PPC 竞价* (ppc_bid): 广告建议最低竞价 (low)、推荐平均价 (mid)、推荐最高价 (high)（精准匹配模式，反映市场成熟与营销费用）。
+   - *CPA* (cpa): 平均每笔广告订单的推广成本（CPA ≈ PPC竞价 / 点击转化率，分别用最小、中位、最大PPC竞价换算得出）。
+5. **均价 / ACOS (低/中/高)** (product_price / acos):
+   - *均价* (product_price): 关键词下自然排名前 48 名商品的售价最低价 (low)、均值 (avg) 和最高价 (high)。
+   - *ACOS* (acos): 广告投入产出比（ACOS ≈ CPA / 产品均价，分别用CPA中位值除以产品最低、中位、最高价，映射为 max / avg / min 换算得出）。
+6. **预算 / ABA集中度** (ad_budget / aba_concentration):
+   - *广告预算* (ad_budget): 获取首个广告订单的建议预估广告预算。默认展示 80% 出单概率下的首单广告预算（公式：`预算 = 点击次数 * PPC`）。
+   - *ABA集中度* (aba_concentration): 点击总占比 (click_share，即前3ASIN点击总占比之和) 与转化总占比 (conversion_share，即前3ASIN销量占整个词销量的比例之和)。
+7. **Top3点击ASIN份额** (top_clicked_asins):
+   - *Top3点击ASIN*: 周期内点击量最高的三个 ASIN 的点击份额 (click_share) 与转化份额 (conversion_share)（格式：`第一位 ASIN 的点击份额 / 转化份额；第二位...`）。
 
 `metric_notes` 会解释 CPA、PPC匹配、产品均价、ACOS、ABA集中度等字段，Agent 应优先结合这些注释解读结果。
 
@@ -396,8 +479,38 @@ badges:「始」自然搜索词「末」
   - `ac`/`ac推荐`/`ac推荐词` -> `AMAZON_CHOICE`
   系统会自动规范、平铺展开并去重合并。
 
-### 默认 `summary_markdown` 合并表核心列
-默认结果会把反查关键词合并为一张表，并附带总词数、自然排名、Top 搜索量等摘要。Agent 应优先读取 `summary_markdown`，核心列包括：`keyword` (关键词)、`translation` (中文释义)、`monthly_searches` (月搜索量)、`organic_rank` (自然排名)、`ad_rank` (广告排名)、`traffic_share` (流量占比)、`monthly_purchases` (月购买量)、`purchase_rate` (购买率/转化率)、`supply_demand_ratio` (需供比)、`aba_click_share`、`aba_conversion_share`、`spr`、`products`。
+### 默认 `summary_markdown` 合并表核心列与口径定义
+默认结果会把反查关键词合并为一张高密度表，并附带总词数、自然排名、Top 搜索量等摘要。Agent 应优先读取 `summary_markdown`。
+合并表核心列与口径定义如下：
+1. **关键词 / 流量类型** (keyword / traffic_type):
+   - *关键词* (keyword): 目标 ASIN 近 30 天（或特定月份）进入过亚马逊前3页的搜索流量词及其中文释义 (translation)。
+   - *流量类型* (traffic_type): 该 ASIN 在对应关键词下的具体曝光位置，主要包括自然搜索词、AC推荐词、ER推荐词、4星推荐词以及SP广告词、视频广告词、品牌广告词、HR推荐词。
+2. **流量占比 / 周曝光 / 类别** (traffic_share / traffic_count / traffic_class & conversion_effect):
+   - *流量占比* (traffic_share): ASIN 通过该流量词获得的曝光量占比（第一行）。
+   - *周曝光* (traffic_count): 该关键词本周内给该 ASIN 带来的预估曝光量，非该词在亚马逊的总搜索量（第二行）。
+   - *类别* (traffic_class / conversion_effect): 关键词流量类别与转化效果分类（第三行）：
+     - 流量类别 (traffic_class): 主要流量词、精准流量词、精准长尾词。例如美国站：主要流量词指曝光占比≥5%且自然排名在第一页前8位，或占比≥10%的词；精准流量词指周曝光量≥2000且自然排名在第一页前8位。
+     - 转化效果 (conversion_effect): 转化优质词、转化平稳词、转化流失词、无效曝光词。例如美国站：转化优质词指转化共享≥5%且周曝光量≥2000，或转化共享≥10%且周曝光量≥1000。
+3. **自然 / 广告排名** (organic_rank / ad_rank):
+   - *自然排名* (organic_rank): 该 ASIN 在该词下的绝对自然搜索排名、展现位置 (organic_page_info，如 `第1页, 55/72`) 以及获取排名的最近时间 (organic_rank_time，如 `今日15:58排名`)。
+   - *广告排名* (ad_rank): 该 ASIN 的广告位在该词下的绝对广告排名、展现位置 (ad_page_info，如 `第2页, 6/55`) 及获取排名的最近时间 (ad_rank_time)。
+4. **月搜 / 日搜 / ABA周** (monthly_searches / daily_searches / aba_week_rank):
+   - *月搜索量* (monthly_searches): 关键词最近一个自然月的总搜索次数（月初更新）。
+   - *日均搜索量* (daily_searches): 月搜索量 / 30 天。
+   - *ABA周排名* (aba_week_rank): 亚马逊 ABA 数据的最新一周搜索频率排名（Search Frequency Rank，SFR）。值越小表示搜索频率越高。
+5. **月购买 / 购买率** (monthly_purchases / purchase_rate):
+   - *月购买量* (monthly_purchases): 一个自然月内在亚马逊站内搜索该词后产生购买的次数。`月购买量 = 月搜索量 * 购买率`。
+   - *购买率* (purchase_rate): 点击细分市场中商品后的购买次数占搜索次数比例。反映词的精准度和用户决策周期。
+6. **展示 / 点击** (impressions / clicks): 整个关键词细分市场下所有 ASIN 的月度总展示量及总点击量，非单个商品的值。
+7. **需供比 / 商品数** (supply_demand_ratio / products):
+   - *需供比* (supply_demand_ratio): 搜索量(需求) / 在线商品数(供应)。比值越高代表需求越强劲。
+   - *商品数* (products): 该关键词在 All Departments 类目下的搜索结果商品数。
+8. **ABA点击 / 转化** (aba_click_share / aba_conversion_share): 该关键词下点击排名前三 ASIN 的点击总占比之和与转化总占比之和。值越高，说明词的垄断程度越高。
+9. **PPC低 / 均 / 高** (ppc_bid): 精准匹配下的广告建议竞价范围（对应 ppc_bid.low / ppc_bid.mid / ppc_bid.high）。
+10. **SPR / 密度 / 广告竞品** (spr / title_density / ad_competitors):
+    - *SPR* (spr): 将产品维持在第一页前 8 位所需的 8 天预估出单量。数值越大说明竞争越激烈。
+    - *标题密度* (title_density): 搜索结果第一页产品标题包含该关键词的商品数量。
+    - *广告竞品数* (ad_competitors): 近 7 天内进入过该词搜索结果前 3 页的广告商品总数。
 
 完整 `candidates` JSON 默认不返回；只有 `result_mode=debug/full` 时才用于排障。不要读取原始 DOM 表或页面文本做常规分析。
 

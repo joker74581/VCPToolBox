@@ -34,6 +34,12 @@ ADMIN_PORT=$((MAIN_PORT + 1))
 PM2_MAIN_NAME="vcp-main"
 PM2_ADMIN_NAME="vcp-admin"
 
+# 优先从环境变量获取，其次从 config.env 获取，最后默认使用 7168M (7G)
+if [ -z "$VCP_MAIN_MAX_MEMORY" ]; then
+    VCP_MAIN_MAX_MEMORY="$(grep -E '^VCP_MAIN_MAX_MEMORY=' "$APP_DIR/config.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '[:space:]')"
+fi
+VCP_MAIN_MAX_MEMORY="${VCP_MAIN_MAX_MEMORY:-7168M}"
+
 echo "============================================"
 echo "   VCPToolBox - Starting Services via PM2 (Linux)"
 echo "============================================"
@@ -79,7 +85,7 @@ echo ""
 # 2. 启动主服务进程
 echo "[1/2] 正在启动主聊天服务 (${PM2_MAIN_NAME})..."
 # --kill-timeout 15000: 给主程序 15 秒的时间来安全保存向量数据库索引
-pm2 start server.js --name "${PM2_MAIN_NAME}" --cwd "$APP_DIR" --max-memory-restart 4096M --kill-timeout 15000
+pm2 start server.js --name "${PM2_MAIN_NAME}" --cwd "$APP_DIR" --max-memory-restart "$VCP_MAIN_MAX_MEMORY" --kill-timeout 15000
 
 echo ""
 echo "等待 8 秒钟以让主服务完成知识库和向量模块的初始化..."

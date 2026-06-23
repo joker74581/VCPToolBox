@@ -5,18 +5,30 @@
 ## 核心纪律
 
 - **【身份纪律】** 调用任何工具时，必须在请求体中附带 `maid:「始」你的真实Agent名字「末」`（例如 破壁_枢纽、破壁_鹰眼、破壁_熔炉）。
-- **【落墨留痕】** 读取策略文件、brief、raw、scored、failed 等关键文件时，必须加入 `ink:「始」mark_history「末」` 参数。
+- **【落墨留痕】** 读取 brief、raw、scored、failed 等关键文件时，必须加入 `ink:「始」mark_history「末」` 参数。
 - **【调用节奏】** 每一轮回复最多只发送 1 个 TOOL_REQUEST，等待工具摘要返回后再决定下一步。
+- **【读文件纪律】** 读取任何 runs 状态机文件（brief/raw/scored/failed）只能用 `auto_selection_read_run_file`，**严禁用 FileOperator / ServerFileOperator 直接读路径**——那会被拒绝。
+
+## v4 架构总览（必读：你只需做被委托的一步）
+
+后端是一套**单一状态机**：每个 run 有唯一权威状态文件 `runs/state/<run_id>.state.json`，状态在
+`PENDING_BRIEF → SCOUTING → SCORING → EVALUATING → PUBLISHING → DONE`（或 `FAILED`）之间流转。
+
+**推进完全由后端自动完成**，你（agent）只负责被委托的单一动作，**不要主动控制流程**：
+- **破壁_枢纽**：被委托时只做三类事之一——①创建 brief 并 `auto_selection_prepare_dispatch(worker=scout)`；②发研报+写日记（PUBLISHING）；③发阻断报告+写极简日记（FAILED）。**裁决（发布/回环/换方向）由后端自动跑，枢纽不再调用 apply_reviewer_decision、不再自己判断 action、不再手动归档**（后端会自动归档）。
+- **破壁_鹰眼**：读 brief，抓数据，写 raw（或 failed）。写完输出 [[TaskComplete]]。
+- **破壁_熔炉**：读 raw，评审，写 scored（或 failed）。写完输出 [[TaskComplete]]。
+- 写入 raw/scored 后，后端会**自动**检测并推进到下一步，你无需调用 queue_status 或派发下一个 worker。
 
 [===vcp_fold:0.35::desc:AutoProductSelection 自动选品 新版协议 Min Evidence Pack 空数据容错 CVR保守修正 回环守卫 raw scored 数据结构===]
 
-## 新版选品协议总则
+## 选品协议总则
 
 - `ProductSelector` 不保证所有关键词都有数据。冷门长尾词、过窄词或卖家精灵未收录时可能返回空；空结果不是商业失败结论。
 - 鹰眼必须有限重试：同义词/父词最多补 1 次；同类数据连续 2 次为空后写入 `unfetchable_gaps`。
 - 熔炉不得因已写入 `unfetchable_gaps` 的字段继续回环，只能降低 `DataReliabilityScore` 并裁决。
-- 后端会对 scored 自动执行数学安全阀：CVR 保守修正、广告压力测试、Hard Gate、重复回环守卫。
-- 普通数据缺口达到软上限后，后端不会强行 failed，而会改派 reviewer 进入 `force_decision_mode` 输出终态裁决。
+- 后端会对 scored 自动执行数学安全阀：CVR 保守修正、广告压力测试、Hard Gate、区间决策、回环/换方向守卫。
+- 普通数据缺口达到软上限后，后端不会强行 failed，而会让熔炉进入 `force_decision_mode` 输出终态裁决。
 
 ## raw_data_pack 最小证据包要求
 
@@ -24,6 +36,7 @@
 
 - `route_decision.action`: `EARLY_REJECT | PIVOT | DEEPEN | READY_FOR_FORGE`
 - `prescreen_log`: 每个并列候选方向的关键指标、强/中/弱评级、胜出或落选理由（多方向廉价预筛产物）
+- `deferred_candidates`: 过线但本轮未深挖的方向（方向/种子词/预筛评级/为何值得后续重拾）。**这不是淘汰**，后端会据此让枢纽写 [待观察] 日记，留给后续 trigger 优先深挖
 - `data_audit_inputs.tools_called`: 每次工具调用的 tool/query/status/timestamp/summary
 - `sample_counts`: 关键词、ASIN、商品页、评论样本量
 - `unfetchable_gaps`: 字段、原因、尝试过的查询
@@ -55,14 +68,14 @@
 
 ## 0. 触发工作流 (auto_selection_trigger_run)
 
-**用途**: 启动或恢复自动选品工作流。工作流采用单轮闭环模式：触发启动 → 处理一个完整任务周期 → 自动销毁休眠。
+**用途**: 启动或恢复自动选品工作流（破壁_枢纽作为定时任务的"开关"调用它）。触发后后端状态机自动推进一整轮，无需你手动驱动。
 
 **参数**: 无
 
 **返回**:
-- `mode: "new"` - 创建新任务
-- `mode: "resume"` - 恢复未完成任务（系统重启后）
-- `active_runs` - 活动任务数
+- `mode: "new"` - 创建了一个新 run（返回 `run_id`）
+- `mode: "resume"` - 恢复了重启前未完成的 run（依据 state.json 续跑）
+- 若已在运行，返回 `workflow_already_running`，此时你直接输出 [[TaskComplete]] 即可
 
 **示例**：
 ```
@@ -73,22 +86,20 @@ command:「始」auto_selection_trigger_run「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-**注意**: 如果工作流已在运行，会返回错误。只有在工作流停止后才能重新触发。
+**注意**: 触发后请直接输出 [[TaskComplete]]。流转推进由后端状态机接管，你无需调用 queue_status 或派发 worker。
 
-[===vcp_fold:0.55::desc:AutoProductSelection 诊断状态 debug queue workflow lock loopback counters 队列 锁 熔断===]
+[===vcp_fold:0.55::desc:AutoProductSelection 诊断状态 debug state 状态机 counters 失败计数 队列===]
 
-## 0.1 诊断工作流状态 (auto_selection_debug_status)
+## 0.1 诊断状态 (auto_selection_debug_status)
 
-**用途**: 一键获取工作流的完整诊断报告，了解当前运行状态、卡在哪里、是否有错误。
+**用途**: 读取所有 run 的 state.json，输出当前状态机诊断报告（零推断，排障首选）。
 
 **参数**: 无
 
-**返回**: Markdown 格式的诊断报告，包含：
-1. **内存状态**: isWorkflowRunning, workflowState (IDLE/INIT/ACTIVE), consecutiveErrorCount, 定时器状态, 最近错误
-2. **物理锁状态**: runs/locks/ 目录下的锁文件列表及创建时间
-3. **队列状态**: 活动任务数, next_action_hint, 各阶段文件统计, Worker 缺失输出警告
-4. **熔断计数器**: 活动任务的 global/scout/reviewer loopback 计数器
-5. **诊断建议**: 智能分析当前状态并给出操作建议
+**返回**: Markdown 报告，包含：
+1. **驱动器**: isWorkflowRunning、isDriverExecuting、watchdog 定时器、最近错误
+2. **每个活动 run**: status、是否被认领及已认领多久/超时阈值、上一步动作与结果、回环计数、廉价/昂贵换方向预算、系统级/非系统失败计数、（终态时）发布幂等标记
+3. **下一步预判**: 下一个推进的 run 及其预期动作
 
 **示例**：
 ```
@@ -99,13 +110,7 @@ command:「始」auto_selection_debug_status「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-**使用场景**:
-- 工作流长时间无进展，想知道卡在哪里
-- 工作流意外停止，想知道原因
-- 怀疑死循环，想查看熔断计数器
-- 协调器锁卡死，想确认锁状态
-
-**重要**: 这个命令可以在工作流运行中随时调用，也可以在工作流停止后作为 debug 工具使用。**不会影响工作流的正常运行**。
+**使用场景**: 想知道某个 run 卡在哪个 status、卡多久、失败计数到几、下一步该做什么。可在运行中随时调用，不影响流程。
 
 ## 0.2 切换调试模式 (auto_selection_toggle_debug)
 
@@ -126,7 +131,7 @@ enable:「始」true「末」
 
 ## 0.3 暂停工作流 (auto_selection_pause_workflow)
 
-**用途**: 手动暂停整个选品流程（注销定时器和清锁），但保留所有正在运行的任务状态机文件（Brief, Raw, Scored）。可通过再次调用 `auto_selection_trigger_run` 继续当前的选品流程。
+**用途**: 停止 watchdog 定时器，但保留所有 run 的 state.json 与产出文件。再次 `auto_selection_trigger_run` 会依据 state 续跑。
 
 **参数**: 无
 
@@ -141,7 +146,7 @@ command:「始」auto_selection_pause_workflow「末」
 
 ## 0.4 中止并重置工作流 (auto_selection_abort_workflow)
 
-**用途**: 彻底中止当前这轮选品，销毁定时器，清除所有正在运行的临时状态机文件和文件锁（包括 Brief, Raw, Scored 以及 hawkeye/forge 锁）。下一次唤醒时将全新重新开始。
+**用途**: 彻底中止本轮，停止定时器，**删除所有 run 的 state.json 及其 brief/raw/scored/failed 残留与 dropped 暂存**。下一次触发将全新开始。
 
 **参数**: 无
 
@@ -220,37 +225,16 @@ stage:「始」scored「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-[===vcp_fold:0.65::desc:AutoProductSelection 派发 worker scout reviewer AgentAssistant apply_reviewer_decision loopback force_decision===]
+[===vcp_fold:0.65::desc:AutoProductSelection 派发 prepare_dispatch scout reviewer AgentAssistant 后端自动裁决===]
 
-## 4. 应用评审决策 (auto_selection_apply_reviewer_decision)
+## 4. 准备派发鹰眼 (auto_selection_prepare_dispatch)
 
-当需要将评审决定（如退回重试、放弃重选）应用到状态机时使用。
-
-**参数**：
-- `run_id`: 「始」当前运行ID「末」
-- `action`: 「始」可选，PUBLISH_FINAL | LOOPBACK_TO_SCOUT | DROP_AND_RESELECT「末」（可选，自动从 scored 文件提取）
-- `brief_content`: 「始」新 brief 内容「末」（LOOPBACK 或 DROP 时需要）
-- `new_run_id`: 「始」新运行ID「末」（DROP_AND_RESELECT 时可选）
-
-**示例**：
-```
-<<<[TOOL_REQUEST]>>>
-maid:「始」破壁_枢纽「末」,
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_apply_reviewer_decision「末」,
-run_id:「始」APS-20260617-112233-desk-organizer「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-## 5. 准备派发 Worker (auto_selection_prepare_dispatch)
-
-准备派发鹰眼（scout）或熔炉（reviewer）执行任务。
+**用途**: 枢纽创建 brief 后用它派发鹰眼（scout）。它写入 brief 并返回 `agent_assistant_request`，你必须把该对象原样传给 AgentAssistant。
 
 **参数**：
-- `worker`: 「始」scout | reviewer「末」（或旧名称 hawkeye | forge）
-- `run_id`: 「始」当前运行ID「末」
-- `brief_content`: 「始」brief 内容「末」（scout 新建时需要）
-- `overwrite_lock`: 「始」true | false「末」（可选，系统重启后建议 true）
+- `worker`: 「始」scout「末」（枢纽通常只用 scout；reviewer 由后端在 raw 就绪后自动派发，无需你调用）
+- `run_id`: 「始」当前运行ID「末」（**必须用任务 prompt 指定的 run_id**）
+- `brief_content`: 「始」brief 内容「末」（创建新 brief 时传入）
 
 **示例**：
 ```
@@ -266,44 +250,29 @@ brief_content:「始」# SelectionBrief
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-返回 `agent_assistant_request` 对象后，必须原样传递给 AgentAssistant。
+返回 `agent_assistant_request` 后，必须原样传递给 AgentAssistant，然后输出 [[TaskComplete]]。
 
-## 6. 队列状态查询 (auto_selection_queue_status)
+## 5. 评审裁决与队列查询（后端自动，通常无需调用）
 
-查询当前队列状态和下一步行动提示。
-
-**参数**：
-- `include_content`: 「始」true | false「末」（可选，是否包含文件内容，默认 false）
-
-**示例**：
-```
-<<<[TOOL_REQUEST]>>>
-maid:「始」破壁_枢纽「末」,
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_queue_status「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-返回 `next_action_hint` 指示下一步操作。
-
-**注意**: 这个命令主要用于后端工作流驱动器，Agent 通常不需要直接调用。
+- **裁决（发布/回环/换方向）由后端状态机在 EVALUATING 阶段自动执行**——熔炉只需把 `post_forge_action.action` 与四分写进 scored，后端会读取并裁决。枢纽**不再**调用 `auto_selection_apply_reviewer_decision`、不再自己判断 action。该命令仅作 legacy/手动兼容保留。
+- `auto_selection_queue_status` 为旧版兼容查询，日常诊断请改用 `auto_selection_debug_status`（读 state.json，更准确）。
+- 归档由后端在发帖+写日记完成后**自动执行**，枢纽不需要手动调用 `auto_selection_archive_run`。
 
 [===vcp_fold:0.80::desc:AutoProductSelection 最终发布 策略文件 VCPForum DailyNote TaskComplete 发帖 写日记 归档===]
 
 ## 重要提醒
 
-1. **策略文件自动注入**：选品策略（`AutoSelectionStrategyProfile.zh-CN.md` 或 `AutoSelectionStrategyProfile.md`）由后端工作流自动读取并作为提示词一部分注入给破壁_枢纽，**枢纽无需且禁止**使用 `ServerFileOperator.ReadFile` 工具重复读取策略文件。
-
+1. **策略文件自动注入**：选品策略由后端自动读取并注入给破壁_枢纽的任务 prompt，**枢纽无需且禁止**用 `ServerFileOperator.ReadFile` 重复读取策略文件。
 
 2. **完成标记**：所有任务完成后必须输出 `[[TaskComplete]]`，不要以工具请求作为最后内容。
 
-3. **心跳标记**：不要输出 `[[NextHeartbeat::120]]`，后端驱动器会自动处理。所有任务完成后必须输出 `[[TaskComplete]]` 以清理 coordinator 锁。
+3. **心跳标记**：不要输出 `[[NextHeartbeat::...]]`，后端会自动处理。
 
 4. **不要复制占位符**：AgentAssistant 返回的 `{{VCP_ASYNC_RESULT::...}}` 占位符不要复制到回复中。
 
-5. **工作流控制**：不要试图通过调用工具来控制工作流流程，后端驱动器会自动推进。你只需专注执行被委托的单一任务。
+5. **不要试图控制流程**：后端状态机自动推进，你只需完成被委托的单一动作并输出 [[TaskComplete]]。
 
-6. **最终发布顺序**：`ready_for_final_publication` 后必须先发论坛帖，再写 `选品公共日记本`，再调用 `auto_selection_archive_run`。论坛板块定义：成功选品发布至 `自动选品推荐板块`，失败/阻断归档发布至 `自动选品板块`。
+6. **发布动作（PUBLISHING/FAILED 任务）**：枢纽收到发研报/阻断报告的任务时，只需**发论坛帖 + 写选品公共日记本**，然后输出 [[TaskComplete]]——**后端会自动归档**，无需调用 archive。论坛板块：成功选品发 `自动选品推荐板块`，失败/阻断发 `自动选品板块`。
 
 成功发帖示例：
 

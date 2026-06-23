@@ -2,7 +2,7 @@
 // Calls calculateScoringModel + decideBackendAction directly (no file IO, no plugin
 // init) so it is a pure, fast math regression. Run: node test_v3_scoring.js
 const plugin = require('./AutoProductSelection.js');
-const { calculateScoringModel, decideBackendAction } = plugin;
+const { calculateScoringModel, decideBackendAction, extractRejectedKeywords, extractDeferredCandidates } = plugin;
 
 let passed = 0;
 let failed = 0;
@@ -132,6 +132,41 @@ console.log('\nScenario 7: percent-aware CVR parsing (1% != 100%)');
   check('"0.5%" -> 0.005', Math.abs(rate('0.5%').rawCvr - 0.005) < 1e-6, `got ${rate('0.5%').rawCvr}`);
   check('"55%" -> 0.55 still flagged', rate('55%').dataDistortionSuspected === true, `distort=${rate('55%').dataDistortionSuspected}`);
   check('bare "0.08" unchanged', Math.abs(rate('0.08').rawCvr - 0.08) < 1e-6, `got ${rate('0.08').rawCvr}`);
+}
+
+// Scenario 8: rejected-keyword capture from EARLY_REJECT raw (feeds the diary so future
+// rounds skip already-probed dead-end keywords).
+console.log('\nScenario 8: rejected keyword extraction for diary sedimentation');
+{
+  const raw = [
+    'route_decision:', '  action: EARLY_REJECT',
+    'prescreen_log:',
+    '  - direction: espresso tamping station', '    keywords: espresso tamping station, tamper mat', '    rating: 弱',
+    '  - direction: coffee scale', '    keyword: coffee scale with timer', '    rating: 弱',
+    'elimination_log:', '  - target_keywords: pour over stand, drip tray'
+  ].join('\n');
+  const kws = extractRejectedKeywords(raw);
+  check('captures phrase-match keywords', kws.includes('espresso tamping station') && kws.includes('tamper mat'), JSON.stringify(kws));
+  check('captures singular keyword field', kws.includes('coffee scale with timer'), JSON.stringify(kws));
+  check('captures elimination_log target_keywords', kws.includes('pour over stand') && kws.includes('drip tray'), JSON.stringify(kws));
+}
+
+// Scenario 9: deferred_candidates extraction (prescreen-passing directions not deep-dived
+// this round become [待观察] priorities for a future trigger — not eliminations).
+console.log('\nScenario 9: deferred candidate extraction for [待观察] sedimentation');
+{
+  const raw = [
+    'route_decision:', '  action: READY_FOR_FORGE',
+    'deferred_candidates:',
+    '  - direction: magnetic spice rack', '    seed_keywords: magnetic spice jars, fridge spice rack', '    rating: 强',
+    '  - direction: under-shelf basket', '    keywords: under shelf storage basket', '    rating: 中',
+    'keyword_market_summary:', '  demand: ok'
+  ].join('\n');
+  const d = extractDeferredCandidates(raw);
+  check('captures both deferred directions', d.length === 2, `len=${d.length}`);
+  check('first direction + keywords parsed', d[0].direction === 'magnetic spice rack' && d[0].keywords.includes('magnetic spice jars'), JSON.stringify(d[0]));
+  check('second direction stops before next field', d[1] && d[1].direction === 'under-shelf basket', JSON.stringify(d[1]));
+  check('no deferred block -> empty', extractDeferredCandidates('route_decision:\n  action: EARLY_REJECT').length === 0, 'expected []');
 }
 
 console.log(`\n=== ${passed} passed, ${failed} failed ===`);

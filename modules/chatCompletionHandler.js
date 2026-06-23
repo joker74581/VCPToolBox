@@ -354,7 +354,7 @@ function applyModelFallbackForAttempt(options, candidates, attemptIndex, debugMo
 async function fetchWithRetry(
   url,
   options,
-  { retries = 3, delay = 1000, debugMode = false, onRetry = null, connectionTimeout = 120000, modelFallbackCandidates = null } = {},
+  { retries = 3, delay = 1000, debugMode = false, onRetry = null, connectionTimeout = 300000, modelFallbackCandidates = null } = {},
 ) {
   const { default: fetch } = await import('node-fetch');
   const maxAttempts = Math.max(

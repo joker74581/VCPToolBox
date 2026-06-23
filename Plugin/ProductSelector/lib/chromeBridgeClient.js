@@ -470,7 +470,8 @@ class ChromeBridgeClient {
         const matches = String(text || '').match(/\\b[A-Z0-9]{10}\\b/gi) || [];
         matches.forEach(match => {
           const asin = match.toUpperCase();
-          if (/^[A-Z0-9]{10}$/.test(asin) && !seen.has(asin)) {
+          const isValid = (/^B[A-Z0-9]{9}$/.test(asin) && /[0-9]/.test(asin)) || /^[0-9]{9}[0-9X]$/.test(asin);
+          if (isValid && !seen.has(asin)) {
             seen.add(asin);
             result.push(asin);
           }
@@ -563,6 +564,39 @@ class ChromeBridgeClient {
         if (asins.length > 0) {
           data.asins = asins;
           data.asin = asins[0];
+        }
+
+        // Extract title, brand, parent_asin, and badges for product info
+        const amazonLink = row.querySelector('a[href*="/dp/"], a[href*="/gp/product/"]');
+        if (amazonLink) {
+          data.title = cleanText(amazonLink.innerText || amazonLink.textContent);
+        }
+        const brandEl = row.querySelector('.brand, .brand-name, .brand-item, a[href*="/brand/"]');
+        if (brandEl) {
+          data.brand = cleanText(brandEl.innerText || brandEl.textContent);
+        }
+        if (asins.length > 1) {
+          data.parent_asin = asins[1];
+        }
+        const rowHtml = row.innerHTML || '';
+        const badges = [];
+        if (/class="[^"]*a-plus[^"]*"|A\+内容|class="[^"]*tag-a-plus[^"]*"/i.test(rowHtml) || row.querySelector('.a-plus, .tag-a-plus') || text.includes('A+')) {
+          badges.push('A+');
+        }
+        if (/class="[^"]*video[^"]*"|class="[^"]*icon-video[^"]*"|视频/i.test(rowHtml) || row.querySelector('.video, .icon-video') || text.includes('视频') || text.includes('Video')) {
+          badges.push('V');
+        }
+        if (/class="[^"]*best-seller[^"]*"|Best Seller|BS榜单|class="[^"]*icon-bs[^"]*"/i.test(rowHtml) || row.querySelector('.best-seller, .icon-bs, a[href*="/bestsellers/"]') || text.includes('Best Seller') || text.includes('BS榜单')) {
+          badges.push('BS');
+        }
+        if (/class="[^"]*amazons-choice[^"]*"|Amazon\'s Choice|class="[^"]*icon-ac[^"]*"/i.test(rowHtml) || row.querySelector('.amazons-choice, .icon-ac') || text.includes("Amazon's Choice") || text.includes('AC')) {
+          badges.push('AC');
+        }
+        if (/class="[^"]*new-release[^"]*"|New Release|新品榜|class="[^"]*icon-nr[^"]*"/i.test(rowHtml) || row.querySelector('.new-release, .icon-nr, a[href*="/new-releases/"]') || text.includes('New Release') || text.includes('新品榜')) {
+          badges.push('NR');
+        }
+        if (badges.length > 0) {
+          data.badges = badges;
         }
         row.querySelectorAll('[data-keyword], [data-asin], [data-clipboard]').forEach(element => {
           const keyword = element.getAttribute('data-keyword');
