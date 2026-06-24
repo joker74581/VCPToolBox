@@ -3,6 +3,9 @@
   "approveAll": false,
   "timeoutMinutes": 5,
   "fuzzyToolMatching": true,
+  "privacyProtection": {
+    "enabled": false
+  },
   "approvalList": [
     "PowerShellExecutor",
     "ServerPowerShellExecutor",

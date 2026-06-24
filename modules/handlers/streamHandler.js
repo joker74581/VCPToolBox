@@ -39,7 +39,11 @@ class StreamHandler {
       fetchWithRetry,
       vcpToolUseForbidden,
       semanticModelFallbackCandidates,
-      oneRingResponseMeta
+      oneRingResponseMeta,
+      shouldProcessMedia,
+      shouldProcessMediaPlus,
+      isTextOnlyForceTranslateModel,
+      requestPreprocessorConfig
     } = this.context;
 
     const shouldShowVCP = SHOW_VCP_OUTPUT || this.context.forceShowVCP;
@@ -52,6 +56,56 @@ class StreamHandler {
     let currentAIRawDataForDiary = '';
     let chatLogs = [];
     let oneRingAssistantTurnParts = [];
+
+    const containsImageUrlPart = (content) => Array.isArray(content) &&
+      content.some(part => part?.type === 'image_url' && part.image_url && typeof part.image_url.url === 'string');
+
+    const maybeTranslateToolPayloadMedia = async (content) => {
+      if (!containsImageUrlPart(content)) return content;
+
+      const shouldTranslateToolMedia = shouldProcessMedia || isTextOnlyForceTranslateModel;
+      if (!shouldTranslateToolMedia) return content;
+
+      const processorName = pluginManager.messagePreprocessors.has('MultiModalProcessor')
+        ? 'MultiModalProcessor'
+        : 'ImageProcessor';
+      if (!pluginManager.messagePreprocessors.has(processorName)) {
+        if (DEBUG_MODE) console.warn(`[VCP Stream Loop] Tool payload contains image_url, but ${processorName} is unavailable. Forwarding original payload.`);
+        return content;
+      }
+
+      const originalImageParts = content.filter(part => part?.type === 'image_url' && part.image_url && typeof part.image_url.url === 'string');
+      const payloadMessage = { role: 'user', content: JSON.parse(JSON.stringify(content)) };
+
+      if (DEBUG_MODE) {
+        console.log(`[VCP Stream Loop] Translating tool-returned image_url content via ${processorName}. textOnly=${!!isTextOnlyForceTranslateModel}, plus=${!!shouldProcessMediaPlus}`);
+      }
+
+      let translatedMessages;
+      try {
+        translatedMessages = await pluginManager.executeMessagePreprocessor(
+          processorName,
+          [payloadMessage],
+          requestPreprocessorConfig || {}
+        );
+      } catch (pluginError) {
+        console.error(`[VCP Stream Loop] Error translating tool-returned media via ${processorName}:`, pluginError);
+        return content;
+      }
+
+      const translatedContent = translatedMessages?.[0]?.content;
+      if (!Array.isArray(translatedContent)) return content;
+
+      if (shouldProcessMediaPlus && !isTextOnlyForceTranslateModel) {
+        const translatedWithoutImages = translatedContent.filter(part => part?.type !== 'image_url');
+        return [
+          ...translatedWithoutImages,
+          ...JSON.parse(JSON.stringify(originalImageParts))
+        ];
+      }
+
+      return translatedContent;
+    };
 
     const recordOneRingAIResponse = (aiText, phaseLabel) => {
       const oneRingModule = pluginManager?.messagePreprocessors?.get?.('OneRing');
@@ -306,6 +360,7 @@ class StreamHandler {
 
       const { normal: normalCalls, archery: archeryCalls } = ToolCallParser.separate(toolCalls);
       const archeryErrorContents = [];
+      const archeryStatusSummaryItems = [];
 
       // 执行 Archery 调用
       const archeryLogs = await Promise.all(archeryCalls.map(async toolCall => {
@@ -314,6 +369,7 @@ class StreamHandler {
           const isError = !result.success || (result.raw && this.context.isToolResultError(result.raw));
 
           if (isError) {
+            archeryStatusSummaryItems.push(`${toolCall.name} 调用失败`);
             archeryErrorContents.push({
               type: 'text',
               text: `[异步工具 "${toolCall.name}" 返回了错误，请注意]:\n${result.content[0].text}`
@@ -338,6 +394,27 @@ class StreamHandler {
 
         if (!res.writableEnded && !res.destroyed) {
           try {
+            if (archeryStatusSummaryItems.length > 0) {
+              if (enableRoleDivider) {
+                res.write(`data: ${JSON.stringify({
+                  id: `chatcmpl-vcp-start-${Date.now()}`,
+                  object: "chat.completion.chunk",
+                  choices: [{ index: 0, delta: { content: "\n<<<[ROLE_DIVIDE_USER]>>>\n" }, finish_reason: null }]
+                })}\n\n`);
+              }
+              res.write(`data: ${JSON.stringify({
+                id: `chatcmpl-vcp-summary-${Date.now()}`,
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { content: `\n[本轮工具调用摘要:]\n${archeryStatusSummaryItems.join('；')}。\n[本轮工具调用摘要结束]\n` }, finish_reason: null }]
+              })}\n\n`);
+              if (enableRoleDivider) {
+                res.write(`data: ${JSON.stringify({
+                  id: `chatcmpl-vcp-end-${Date.now()}`,
+                  object: "chat.completion.chunk",
+                  choices: [{ index: 0, delta: { content: "\n<<<[END_ROLE_DIVIDE_USER]>>>\n" }, finish_reason: null }]
+                })}\n\n`);
+              }
+            }
             res.write(`data: ${JSON.stringify({
               id: `chatcmpl-VCP-separator-${Date.now()}`,
               object: 'chat.completion.chunk',
@@ -414,7 +491,7 @@ class StreamHandler {
 
       // VCP 信息展示 - 批量包裹为单个 USER 角色
       let hasStartedUserBlock = false;
-      const toolStatusSummaryItems = [];
+      const toolStatusSummaryItems = [...archeryStatusSummaryItems];
       for (let i = 0; i < normalCalls.length; i++) {
         const toolCall = normalCalls[i];
         const result = toolResults[i];
@@ -496,8 +573,14 @@ class StreamHandler {
       }
 
       const hasImage = combinedToolResultsForAI.some(item => item.type === 'image_url');
+      const translatedToolResultsForAI = hasImage
+        ? await maybeTranslateToolPayloadMedia([
+          { type: 'text', text: `<!-- VCP_TOOL_PAYLOAD -->\nResults:` },
+          ...combinedToolResultsForAI
+        ])
+        : null;
       const finalToolPayloadForAI = hasImage
-        ? [{ type: 'text', text: `<!-- VCP_TOOL_PAYLOAD -->\nResults:` }, ...combinedToolResultsForAI]
+        ? translatedToolResultsForAI
         : `<!-- VCP_TOOL_PAYLOAD -->\n${toolResultsTextForRAG}`;
 
       currentMessagesForLoop.push({ role: 'user', content: finalToolPayloadForAI });
