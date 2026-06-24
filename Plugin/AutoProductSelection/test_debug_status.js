@@ -1,5 +1,9 @@
 // Test script for auto_selection_debug_status command
+const fs = require('fs').promises;
 const path = require('path');
+
+const STATE_DIR = path.join(__dirname, 'runs', 'state');
+const ALLOW_ACTIVE_RUNS = process.env.ALLOW_APS_TEST_ON_ACTIVE_RUNS === '1';
 
 // Mock dependencies
 const mockPluginManager = {
@@ -16,12 +20,28 @@ const mockPluginManager = {
   }
 };
 
+async function assertNoActiveRunsBeforeTest() {
+  if (ALLOW_ACTIVE_RUNS) return;
+  let activeRuns = [];
+  try {
+    activeRuns = (await fs.readdir(STATE_DIR))
+      .filter(name => name.endsWith('.state.json'))
+      .map(name => name.replace(/\.state\.json$/, ''));
+  } catch (_) {
+    activeRuns = [];
+  }
+  if (activeRuns.length) {
+    throw new Error(`Refusing to run debug-status test while active AutoProductSelection state exists: ${activeRuns.join(', ')}. Set ALLOW_APS_TEST_ON_ACTIVE_RUNS=1 only in a disposable test workspace.`);
+  }
+}
+
 async function testDebugStatus() {
   console.log('╔═══════════════════════════════════════════════════════════╗');
   console.log('║      AutoProductSelection Debug Status Test             ║');
   console.log('╚═══════════════════════════════════════════════════════════╝\n');
 
   try {
+    await assertNoActiveRunsBeforeTest();
     const plugin = require('./AutoProductSelection.js');
     console.log('✓ Plugin module loaded\n');
 

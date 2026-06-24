@@ -1,4 +1,4 @@
-// Test AutoProductSelection v2 mathematical scoring and safety guards.
+// Test AutoProductSelection v3 mathematical scoring and safety guards.
 const path = require('path');
 const fs = require('fs').promises;
 
@@ -14,14 +14,14 @@ const mockPluginManager = {
   }
 };
 
-const RUN_ID = 'APS-TEST-MATH-999999-v2';
+const RUN_ID = 'APS-TEST-MATH-999999-v3';
 
 async function readScored() {
   return fs.readFile(path.join(__dirname, 'runs', 'scored', `${RUN_ID}-scored.md`), 'utf8');
 }
 
 async function runMathScoringTest() {
-  console.log('=== AutoProductSelection v2 Math Scoring Test ===\n');
+  console.log('=== AutoProductSelection v3 Math Scoring Test ===\n');
 
   const plugin = require('./AutoProductSelection.js');
   await plugin.initialize({ DebugMode: true }, { pluginManager: mockPluginManager });
@@ -50,7 +50,7 @@ raw_data_pack:
 `
     });
 
-    console.log('Scenario A: v2 recommend path keeps PUBLISH_FINAL and injects conservative CVR math.');
+    console.log('Scenario A: v3 recommend path keeps PUBLISH_FINAL and injects conservative CVR math.');
     const healthyScored = `---
 scored_candidate_pack:
   final_disposition:
@@ -286,7 +286,7 @@ data_confidence: 3
     if (resultC.action !== 'DROP_AND_RESELECT') throw new Error(`Expected DROP_AND_RESELECT, got ${resultC.action}`);
     console.log('✓ Scenario D passed');
 
-    console.log('\n=== ALL V2 MATH TESTS PASSED ===');
+    console.log('\n=== ALL V3 MATH TESTS PASSED ===');
   } finally {
     await cleanup();
     await plugin.shutdown();

@@ -761,17 +761,17 @@ async function processToolCall(args) {
         executeDelegation(delegationId, agentConfig, promptTextForStorage, delegationSenderName, temporaryToolsSystemPrompt).catch(async err => {
             console.error(`[AgentAssistant Service] Background delegation task ${delegationId} failed:`, err);
             const state = activeDelegations.get(delegationId);
-            const status = err.code === 'DELEGATION_CANCELLED' ? 'Cancelled' : 'Failed';
             if (state) {
+                const status = err.code === 'DELEGATION_CANCELLED' ? 'Cancelled' : 'Failed';
                 state.status = status === 'Cancelled' ? 'cancelled' : 'failed';
                 state.completionStatus = status;
                 state.finalReportPreview = truncateText(`任务执行过程中发生异常: ${err.message}`);
                 state.endTime = Date.now();
                 state.updatedAt = Date.now();
                 rememberCompletedDelegation(state);
+                await sendDelegationCallback(delegationId, status, `任务执行过程中发生异常: ${err.message}`, agent_name);
+                activeDelegations.delete(delegationId);
             }
-            await sendDelegationCallback(delegationId, status, `任务执行过程中发生异常: ${err.message}`, agent_name);
-            activeDelegations.delete(delegationId);
         });
 
         const successMessage = `委托任务 (ID: ${delegationId}) 已成功提交给 ${agent_name} 进行后台处理。\n您可以使用带有 \`query_delegation: "${delegationId}"\` 参数的工具调用来查询其进度。\n这是一个动态上下文占位符，当任务完全完成时，它会被自动替换为实际的最终报告。\n请在你的回复中包含以下占位符原文：{{VCP_ASYNC_RESULT::AgentAssistant::${delegationId}}}`;
@@ -1087,7 +1087,8 @@ async function executeDelegation(delegationId, agentConfig, taskPrompt, senderNa
             completionStatus = 'Cancelled';
             finalReport = `委托任务已取消。原因: ${err.message}`;
         } else {
-            throw err;
+            completionStatus = 'Failed';
+            finalReport = `任务执行过程中发生异常: ${err.message}`;
         }
     } finally {
         activeSessionLocks.delete(lockKey);

@@ -1,83 +1,27 @@
-# AutoProductSelection 自动选品工具箱 API 字典
+# AutoProductSelection 自动选品工具箱 API 字典 (v4 后端全托管版)
 
-当你被委托执行自动选品相关任务时，你可以使用以下工具来读写任务数据。请严格按照参数格式调用。
+## V4 零工具流转架构总览 (Zero-Tool-Call Workflow)
 
-## 核心纪律
+本系统使用**单一状态机后端全托管模式**推进自动选品工作流。每一个选品任务（由唯一的 `run_id` 标识）的状态变化均由后端驱动器在后台自动轮询推进：
+`PENDING_BRIEF → BRIEFING → SCOUTING → SCORING → EVALUATING → PUBLISHING → DONE` (或 `FAILED`)
 
-- **【身份纪律】** 调用任何工具时，必须在请求体中附带 `maid:「始」你的真实Agent名字「末」`（例如 破壁_枢纽、破壁_鹰眼、破壁_熔炉）。
-- **【落墨留痕】** 读取 brief、raw、scored、failed 等关键文件时，必须加入 `ink:「始」mark_history「末」` 参数。
-- **【调用节奏】** 每一轮回复最多只发送 1 个 TOOL_REQUEST，等待工具摘要返回后再决定下一步。
-- **【读文件纪律】** 读取任何 runs 状态机文件（brief/raw/scored/failed）只能用 `auto_selection_read_run_file`，**严禁用 FileOperator / ServerFileOperator 直接读路径**——那会被拒绝。
+在 V4 架构下，**所有状态文件的读取与写入、Agent 的派发与任务流转均由后端自动托管**，Agent 不再扮演流程的“主动控制者”：
+- **破壁_枢纽**：被委托创建 brief 时，直接在文字回复中以 Markdown 格式输出 `SelectionBrief` 内容，**无需调用**任何状态机命令（后端会自动捕获你的回复并写入 brief 盘文件，并自动为您派发鹰眼）。在 PUBLISHING 或 FAILED 阶段发帖/写日记时，数据会自动注入至你的 prompt 头部，你同样**无需调用**任何读文件命令。
+- **破壁_鹰眼**：取证输入 brief 已自动拼接在你的 prompt 头部（**无需工具读取**）。你唯一的工具调用是使用 `ProductSelector` 进行数据抓取。任务完成后，必须先输出 `[[TaskComplete]]` 标记，并在其下方输出 `raw_data_pack:` YAML 数据块（**无需调用状态机写入工具**，后端会自动提取写盘）。
+- **破壁_熔炉**：取证数据 raw 已自动注入在你的 prompt 头部。你**没有任何工具调用**，是一个纯粹的思考评估者。完成评估后必须先输出 `[[TaskComplete]]` 标记，并在其下方输出 `scored_candidate_pack:` YAML 数据块（**无需调用状态机写入工具**，后端会自动提取写盘）。
 
-## v4 架构总览（必读：你只需做被委托的一步）
+由于后端全自动提取和推进，原本的 **`auto_selection_read_run_file`、`auto_selection_write_run_file`、`auto_selection_prepare_dispatch`、`auto_selection_apply_reviewer_decision`、`auto_selection_archive_run` 等流转命令在 Agent 层面已被废弃/归为后端内置**。
 
-后端是一套**单一状态机**：每个 run 有唯一权威状态文件 `runs/state/<run_id>.state.json`，状态在
-`PENDING_BRIEF → SCOUTING → SCORING → EVALUATING → PUBLISHING → DONE`（或 `FAILED`）之间流转。
+---
 
-**推进完全由后端自动完成**，你（agent）只负责被委托的单一动作，**不要主动控制流程**：
-- **破壁_枢纽**：被委托时只做三类事之一——①创建 brief 并 `auto_selection_prepare_dispatch(worker=scout)`；②发研报+写日记（PUBLISHING）；③发阻断报告+写极简日记（FAILED）。**裁决（发布/回环/换方向）由后端自动跑，枢纽不再调用 apply_reviewer_decision、不再自己判断 action、不再手动归档**（后端会自动归档）。
-- **破壁_鹰眼**：读 brief，抓数据，写 raw（或 failed）。写完输出 [[TaskComplete]]。
-- **破壁_熔炉**：读 raw，评审，写 scored（或 failed）。写完输出 [[TaskComplete]]。
-- 写入 raw/scored 后，后端会**自动**检测并推进到下一步，你无需调用 queue_status 或派发下一个 worker。
+## 协调者/管理员工作流控制工具
 
-[===vcp_fold:0.35::desc:AutoProductSelection 自动选品 新版协议 Min Evidence Pack 空数据容错 CVR保守修正 回环守卫 raw scored 数据结构===]
+当你是**破壁_枢纽**（作为定时任务的触发器或宏观协调者）或系统管理员时，你可以使用以下 5 个指令来触发、监控、暂停或中止工作流。请严格按照参数格式调用。
 
-## 选品协议总则
-
-- `ProductSelector` 不保证所有关键词都有数据。冷门长尾词、过窄词或卖家精灵未收录时可能返回空；空结果不是商业失败结论。
-- 鹰眼必须有限重试：同义词/父词最多补 1 次；同类数据连续 2 次为空后写入 `unfetchable_gaps`。
-- 熔炉不得因已写入 `unfetchable_gaps` 的字段继续回环，只能降低 `DataReliabilityScore` 并裁决。
-- 后端会对 scored 自动执行数学安全阀：CVR 保守修正、广告压力测试、Hard Gate、区间决策、回环/换方向守卫。
-- 普通数据缺口达到软上限后，后端不会强行 failed，而会让熔炉进入 `force_decision_mode` 输出终态裁决。
-
-## raw_data_pack 最小证据包要求
-
-鹰眼写入 raw 时应输出聚合证据，不要塞入大量原始评论、完整商品页或超长关键词表。必须包含：
-
-- `route_decision.action`: `EARLY_REJECT | PIVOT | DEEPEN | READY_FOR_FORGE`
-- `prescreen_log`: 每个并列候选方向的关键指标、强/中/弱评级、胜出或落选理由（多方向廉价预筛产物）
-- `deferred_candidates`: 过线但本轮未深挖的方向（方向/种子词/预筛评级/为何值得后续重拾）。**这不是淘汰**，后端会据此让枢纽写 [待观察] 日记，留给后续 trigger 优先深挖
-- `data_audit_inputs.tools_called`: 每次工具调用的 tool/query/status/timestamp/summary
-- `sample_counts`: 关键词、ASIN、商品页、评论样本量
-- `unfetchable_gaps`: 字段、原因、尝试过的查询
-- `keyword_market_summary`: 需求、购买、CVR、PPC、ABA 集中度摘要
-- `competitor_summary`: Top ASIN、价格、销量、评论、FBA、优势/弱点
-- `profitability_raw_estimates`: 价格、FBA、PPC、CPA、ACOS 范围
-- `review_insight_summary`: 样本量、差评痛点、差异化线索、`scene_vs_function_signal`（评论偏"好看/送礼/氛围"还是"能用/结实/功能"，供熔炉判定 listing_leverage）
-- `source_map`、`evidence_matrix`、`elimination_log`
-- 兼容旧字段：`conversion_rate_matrix`、`candidate_products`、`asin_source_map`
-
-## scored_candidate_pack 评审要求
-
-熔炉写入 scored 时必须先 Hard Gates，再评分，并保留旧字段兼容：
-
-- `hard_gates.passed` 与 `triggered_gates`
-- `listing_leverage_score`: 0-1 场景代入弹性（摆件/玩具/礼品偏 1；锤子/扳手/替换件偏 0）。后端 v3 引擎用它放大差异化机会分，体现卖家 Listing 优势。
-- `scores.opportunity_score`
-- `scores.data_reliability_score`
-- `scores.execution_fit_score`
-- `scores.final_score`
-- `financial_factors`: UnitContribution、base/stress CVR、used/stress PPC、base/stress CPA、BreakEvenACOS、base/stress ad ratio
-- `data_reliability_audit`: 缺失字段、冲突信号、accepted_unfetchable_gaps、CVR 保守修正说明
-- `loopback_request`: 如需回环，必须指定 `missing_field`、`requested_tool`、`target_keywords` 或 `target_asins`，禁止笼统“继续调研”
-- 兼容旧字段：`demand_volume`、`differentiation_feasibility`、`competition_severity`、`compliance_risk`、`complexity_severity`、`data_confidence`
-
-后端写回 scored 时会自动追加 v3 数学块：`backend_math_validation_v2.v3_interval_decision`（point/optimistic/pessimistic/uncertainty_band/overall_trust/listing_leverage）与 `v3_pillars`（五支柱归一化值与权重）。熔炉无需手填这些，后端按区间决策复核动作。
-
-[===vcp_fold:0.50::desc:AutoProductSelection 基础命令 trigger debug status read write archive queue run_file 运行文件===]
-
-## 0. 触发工作流 (auto_selection_trigger_run)
-
-**用途**: 启动或恢复自动选品工作流（破壁_枢纽作为定时任务的"开关"调用它）。触发后后端状态机自动推进一整轮，无需你手动驱动。
-
-**参数**: 无
-
-**返回**:
-- `mode: "new"` - 创建了一个新 run（返回 `run_id`）
-- `mode: "resume"` - 恢复了重启前未完成的 run（依据 state.json 续跑）
-- 若已在运行，返回 `workflow_already_running`，此时你直接输出 [[TaskComplete]] 即可
-
-**示例**：
+### 1. 触发/恢复工作流 (auto_selection_trigger_run)
+- **用途**：启动或恢复自动选品工作流。若当前已有工作流在运行中，会安全返回已在运行提示。
+- **参数**：无
+- **示例**：
 ```
 <<<[TOOL_REQUEST]>>>
 maid:「始」破壁_枢纽「末」,
@@ -85,23 +29,16 @@ tool_name:「始」AutoProductSelection「末」,
 command:「始」auto_selection_trigger_run「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
+- **注意**：调用触发后请直接输出 `[[TaskComplete]]`。流转与派发已全自动托管，无需你手动调用其他流转命令。
 
-**注意**: 触发后请直接输出 [[TaskComplete]]。流转推进由后端状态机接管，你无需调用 queue_status 或派发 worker。
-
-[===vcp_fold:0.55::desc:AutoProductSelection 诊断状态 debug state 状态机 counters 失败计数 队列===]
-
-## 0.1 诊断状态 (auto_selection_debug_status)
-
-**用途**: 读取所有 run 的 state.json，输出当前状态机诊断报告（零推断，排障首选）。
-
-**参数**: 无
-
-**返回**: Markdown 报告，包含：
-1. **驱动器**: isWorkflowRunning、isDriverExecuting、watchdog 定时器、最近错误
-2. **每个活动 run**: status、是否被认领及已认领多久/超时阈值、上一步动作与结果、回环计数、廉价/昂贵换方向预算、系统级/非系统失败计数、（终态时）发布幂等标记
-3. **下一步预判**: 下一个推进的 run 及其预期动作
-
-**示例**：
+### 2. 诊断状态 (auto_selection_debug_status)
+- **用途**：一键式生成工作流的全面诊断报告（只读、无推断、排障首选）。
+- **参数**：无
+- **返回**：Markdown 格式的诊断报告，包含：
+  1. 状态机驱动器运行状态（isWorkflowRunning、最后异常、watchdog 等）
+  2. 物理锁文件信息及当前活动 run 的具体状态与计数器（回环计数、淘汰预算、失败次数等）
+  3. 下一步推进预判
+- **示例**：
 ```
 <<<[TOOL_REQUEST]>>>
 maid:「始」破壁_枢纽「末」,
@@ -110,16 +47,11 @@ command:「始」auto_selection_debug_status「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-**使用场景**: 想知道某个 run 卡在哪个 status、卡多久、失败计数到几、下一步该做什么。可在运行中随时调用，不影响流程。
-
-## 0.2 切换调试模式 (auto_selection_toggle_debug)
-
-**用途**: 动态打开或关闭 AutoProductSelection 的详细调试日志输出，该配置会自动持久化保存在 config.env 中。
-
-**参数**:
-- `enable`: 「始」true | false「末」（可选，不传则自动反转当前状态）
-
-**示例**：
+### 3. 切换调试模式 (auto_selection_toggle_debug)
+- **用途**：动态打开或关闭工作流的详细日志输出，该配置会自动持久化在 config.env 中。
+- **参数**：
+  - `enable`：「始」true | false「末」（可选，不传则自动反转当前状态）
+- **示例**：
 ```
 <<<[TOOL_REQUEST]>>>
 maid:「始」破壁_枢纽「末」,
@@ -129,13 +61,10 @@ enable:「始」true「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-## 0.3 暂停工作流 (auto_selection_pause_workflow)
-
-**用途**: 停止 watchdog 定时器，但保留所有 run 的 state.json 与产出文件。再次 `auto_selection_trigger_run` 会依据 state 续跑。
-
-**参数**: 无
-
-**示例**：
+### 4. 暂停工作流 (auto_selection_pause_workflow)
+- **用途**：暂停后台定时轮询，保留所有进行中的 run 的 brief/raw/scored 状态文件，以便后续重新触发时续跑。
+- **参数**：无
+- **示例**：
 ```
 <<<[TOOL_REQUEST]>>>
 maid:「始」破壁_枢纽「末」,
@@ -144,13 +73,10 @@ command:「始」auto_selection_pause_workflow「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-## 0.4 中止并重置工作流 (auto_selection_abort_workflow)
-
-**用途**: 彻底中止本轮，停止定时器，**删除所有 run 的 state.json 及其 brief/raw/scored/failed 残留与 dropped 暂存**。下一次触发将全新开始。
-
-**参数**: 无
-
-**示例**：
+### 5. 中止并重置工作流 (auto_selection_abort_workflow)
+- **用途**：彻底中止当前周期，清空所有正在进行的任务状态文件及锁残留。下一次启动时将全新开始。
+- **参数**：无
+- **示例**：
 ```
 <<<[TOOL_REQUEST]>>>
 maid:「始」破壁_枢纽「末」,
@@ -159,165 +85,9 @@ command:「始」auto_selection_abort_workflow「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-[===vcp_fold:0.50::desc:AutoProductSelection 运行文件 write read archive raw scored failed brief 读写归档===]
+---
 
-## 1. 写入运行文件 (auto_selection_write_run_file)
-
-用于写入当前阶段的产出数据。
-
-**参数**：
-- `run_id`: 「始」当前任务的运行ID「末」
-- `stage`: 「始」写入的阶段，可选值: 'brief' | 'raw' | 'scored' | 'failed'「末」
-- `content`: 「始」写入的具体内容（Markdown格式，必须包含要求的结构化YAML或JSON元数据）「末」
-- `overwrite`: 「始」是否覆盖已有文件，可选，默认 false「末」
-
-**示例**：
-```
-<<<[TOOL_REQUEST]>>>
-maid:「始」破壁_鹰眼「末」,
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_write_run_file「末」,
-stage:「始」raw「末」,
-run_id:「始」APS-20260617-112233-desk-organizer「末」,
-content:「始」# Raw Data Pack
-...
-「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-## 2. 读取运行文件 (auto_selection_read_run_file)
-
-用于读取指定阶段的数据文件。
-
-**参数**：
-- `run_id`: 「始」当前任务的运行ID「末」
-- `stage`: 「始」读取的阶段，可选值: 'brief' | 'raw' | 'scored' | 'failed'「末」
-- `ink`: 「始」mark_history「末」（必须，用于追踪关键决策节点）
-
-**示例**：
-```
-<<<[TOOL_REQUEST]>>>
-maid:「始」破壁_熔炉「末」,
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_read_run_file「末」,
-stage:「始」raw「末」,
-run_id:「始」APS-20260617-112233-desk-organizer「末」,
-ink:「始」mark_history「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-## 3. 归档运行任务 (auto_selection_archive_run)
-
-当任务成功完成或彻底失败时，用于将任务移入归档。
-
-**参数**：
-- `run_id`: 「始」当前运行ID「末」
-- `stage`: 「始」归档来源阶段，可选值: 'scored' | 'failed' | 'raw' | 'brief'「末」（可选，不传则自动检测）
-
-**示例**：
-```
-<<<[TOOL_REQUEST]>>>
-maid:「始」破壁_枢纽「末」,
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_archive_run「末」,
-run_id:「始」APS-20260617-112233-desk-organizer「末」,
-stage:「始」scored「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-[===vcp_fold:0.65::desc:AutoProductSelection 派发 prepare_dispatch scout reviewer AgentAssistant 后端自动裁决===]
-
-## 4. 准备派发鹰眼 (auto_selection_prepare_dispatch)
-
-**用途**: 枢纽创建 brief 后用它派发鹰眼（scout）。它写入 brief 并返回 `agent_assistant_request`，你必须把该对象原样传给 AgentAssistant。
-
-**参数**：
-- `worker`: 「始」scout「末」（枢纽通常只用 scout；reviewer 由后端在 raw 就绪后自动派发，无需你调用）
-- `run_id`: 「始」当前运行ID「末」（**必须用任务 prompt 指定的 run_id**）
-- `brief_content`: 「始」brief 内容「末」（创建新 brief 时传入）
-
-**示例**：
-```
-<<<[TOOL_REQUEST]>>>
-maid:「始」破壁_枢纽「末」,
-tool_name:「始」AutoProductSelection「末」,
-command:「始」auto_selection_prepare_dispatch「末」,
-worker:「始」scout「末」,
-run_id:「始」APS-20260617-112233-desk-organizer「末」,
-brief_content:「始」# SelectionBrief
-...
-「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-返回 `agent_assistant_request` 后，必须原样传递给 AgentAssistant，然后输出 [[TaskComplete]]。
-
-## 5. 评审裁决与队列查询（后端自动，通常无需调用）
-
-- **裁决（发布/回环/换方向）由后端状态机在 EVALUATING 阶段自动执行**——熔炉只需把 `post_forge_action.action` 与四分写进 scored，后端会读取并裁决。枢纽**不再**调用 `auto_selection_apply_reviewer_decision`、不再自己判断 action。该命令仅作 legacy/手动兼容保留。
-- `auto_selection_queue_status` 为旧版兼容查询，日常诊断请改用 `auto_selection_debug_status`（读 state.json，更准确）。
-- 归档由后端在发帖+写日记完成后**自动执行**，枢纽不需要手动调用 `auto_selection_archive_run`。
-
-[===vcp_fold:0.80::desc:AutoProductSelection 最终发布 策略文件 VCPForum DailyNote TaskComplete 发帖 写日记 归档===]
-
-## 重要提醒
-
-1. **策略文件自动注入**：选品策略由后端自动读取并注入给破壁_枢纽的任务 prompt，**枢纽无需且禁止**用 `ServerFileOperator.ReadFile` 重复读取策略文件。
-
-2. **完成标记**：所有任务完成后必须输出 `[[TaskComplete]]`，不要以工具请求作为最后内容。
-
-3. **心跳标记**：不要输出 `[[NextHeartbeat::...]]`，后端会自动处理。
-
-4. **不要复制占位符**：AgentAssistant 返回的 `{{VCP_ASYNC_RESULT::...}}` 占位符不要复制到回复中。
-
-5. **不要试图控制流程**：后端状态机自动推进，你只需完成被委托的单一动作并输出 [[TaskComplete]]。
-
-6. **发布动作（PUBLISHING/FAILED 任务）**：枢纽收到发研报/阻断报告的任务时，只需**发论坛帖 + 写选品公共日记本**，然后输出 [[TaskComplete]]——**后端会自动归档**，无需调用 archive。论坛板块：成功选品发 `自动选品推荐板块`，失败/阻断发 `自动选品板块`。
-
-成功发帖示例：
-
-```
-<<<[TOOL_REQUEST]>>>
-maid:「始」破壁_枢纽「末」,
-tool_name:「始」VCPForum「末」,
-command:「始」CreatePost「末」,
-board:「始」自动选品推荐板块「末」,
-title:「始」[RECOMMEND] 选品研报标题「末」,
-content:「始」研报正文内容「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-失败/阻断发帖示例：
-
-```
-<<<[TOOL_REQUEST]>>>
-maid:「始」破壁_枢纽「末」,
-tool_name:「始」VCPForum「末」,
-command:「始」CreatePost「末」,
-board:「始」自动选品板块「末」,
-title:「始」[REJECT] 自动选品阻断标题「末」,
-content:「始」阻断原因、关键证据、数据缺口与下一步处理「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-选品公共日记示例（一轮只写一条合并日记；注意：`Tag:` 行必须是 Content 的最后一行，否则 DailyNote 报 "Tag is missing"）：
-
-```
-<<<[TOOL_REQUEST]>>>
-maid:「始」破壁_枢纽「末」,
-tool_name:「始」DailyNote「末」,
-command:「始」create「末」,
-folder:「始」选品公共日记本「末」,
-Date:「始」YYYY-MM-DD「末」,
-Content:「始ESCAPE」[HH:MM] [入选/观察/淘汰/数据不足] 产品方向 - 核心原因
-outcome:
-product_direction:
-primary_reason:
-secondary_reason:
-category:
-price_band:
-risk_tags:
-opportunity_tags:
-Tag: #入选或#排除 #主要原因 #品类 #风险「末ESCAPE」
-<<<[END_TOOL_REQUEST]>>>
-```
+## 核心完成纪律
+1. **单轮单工具**：在一轮回复中只发送一个 `TOOL_REQUEST`，禁止并行调用。
+2. **落墨留痕**：所有的调试和诊断工具调用必须携带 `maid` 参数标明你的身份。
+3. **完成标记**：在工具返回或执行结束后，必须在最终回复末尾附加 `[[TaskComplete]]`。

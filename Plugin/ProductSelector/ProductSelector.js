@@ -45,6 +45,7 @@ const PRODUCT_TABLE_COLUMNS = [
 const PRODUCT_CANDIDATE_FIELDS = [
   'asin',
   'title',
+  'image_url',
   'brand',
   'parent_asin',
   'badges',
@@ -1082,6 +1083,12 @@ function extractAsinFromProductText(text, data = {}) {
 function normalizeProductTableData(tableData, maxCandidates) {
   const headers = Array.isArray(tableData?.headers) ? tableData.headers.map(normalizeCellText) : [];
   const rows = Array.isArray(tableData?.rows) ? tableData.rows : [];
+
+  let ratingIdx = findColumn(headers, [/评分|星级|rating/i, /留评率|rate/i]);
+  if (ratingIdx < 0) {
+    ratingIdx = findColumn(headers, [/评分|星级|rating/i]);
+  }
+
   const idx = {
     product: findColumn(headers, [/产品信息|product/i]),
     bsr: findColumn(headers, [/大类BSR|BSR/i]),
@@ -1091,14 +1098,19 @@ function normalizeProductTableData(tableData, maxCandidates) {
     variations: findColumn(headers, [/变体数|variation/i]),
     price: findColumn(headers, [/价格|price/i]),
     reviews: findColumn(headers, [/评分数|评论数|review/i]),
-    rating: findColumn(headers, [/评分|星级|rating/i, /留评率|rate/i]),
+    rating: ratingIdx,
     fba: findColumn(headers, [/FBA/i]),
     putaway: findColumn(headers, [/上架时间|putaway|date/i]),
     sellers: findColumn(headers, [/卖家数|seller/i]),
     buybox: findColumn(headers, [/BuyBox/i]),
     lqs: findColumn(headers, [/LQS/i]),
     weight: findColumn(headers, [/商品重量|重量/i]),
-    pkgWeight: findColumn(headers, [/包装重量|包装/i])
+    pkgWeight: findColumn(headers, [/包装重量|包装/i]),
+    // Fallbacks for separate columns
+    qa: findColumn(headers, [/Q&A|QA/i]),
+    newReviews: findColumn(headers, [/月新增|新增/i]),
+    reviewRate: findColumn(headers, [/留评率|rate/i]),
+    margin: findColumn(headers, [/毛利率|利润率|margin/i])
   };
 
   return applyOptionalLimit(rows, maxCandidates).map(row => {
@@ -1136,13 +1148,13 @@ function normalizeProductTableData(tableData, maxCandidates) {
       child_revenue: childSalesTokens[1] || null,
       variations: metricTokens(valueAt(values, idx.variations))[0] || null,
       price: priceTokens[0] || null,
-      qa_count: priceTokens[1] || null,
+      qa_count: priceTokens[1] || (idx.qa >= 0 && idx.qa !== idx.price ? metricTokens(valueAt(values, idx.qa))[0] : null) || null,
       review_count: reviewTokens[0] || null,
-      monthly_new_reviews: reviewTokens[1] || null,
+      monthly_new_reviews: reviewTokens[1] || (idx.newReviews >= 0 && idx.newReviews !== idx.reviews ? metricTokens(valueAt(values, idx.newReviews))[0] : null) || null,
       rating: ratingTokens[0] || null,
-      review_rate: ratingTokens[1] || null,
+      review_rate: ratingTokens[1] || (idx.reviewRate >= 0 && idx.reviewRate !== idx.rating ? metricTokens(valueAt(values, idx.reviewRate))[0] : null) || null,
       fba_fee: fbaTokens[0] || null,
-      profit_margin: fbaTokens[1] || null,
+      profit_margin: fbaTokens[1] || (idx.margin >= 0 && idx.margin !== idx.fba ? metricTokens(valueAt(values, idx.margin))[0] : null) || null,
       putaway_date: valueAt(values, idx.putaway) || null,
       seller_count: metricTokens(valueAt(values, idx.sellers))[0] || null,
       buybox_seller,
@@ -1157,6 +1169,7 @@ function normalizeProductTableData(tableData, maxCandidates) {
       if (row.data.brand) result.brand = row.data.brand;
       if (row.data.parent_asin) result.parent_asin = row.data.parent_asin;
       if (row.data.badges) result.badges = row.data.badges;
+      if (row.data.image_url) result.image_url = row.data.image_url;
     }
 
     if (row?.data?.category_top) result.category_top = row.data.category_top;
@@ -1636,7 +1649,7 @@ async function runSellerSpriteResearch(args = {}) {
           selector: String(args.table_selector || args.tableSelector || 'body'),
           tableMode: String(args.table_mode || args.tableMode || 'sellersprite_product'),
           maxRows: maxCandidates,
-          columns: args.table_columns || args.tableColumns || PRODUCT_TABLE_COLUMNS,
+          columns: args.table_columns || args.tableColumns,
           includeHtml: parseBoolean(args.include_table_html ?? args.includeTableHtml, false),
           includeDetails: parseBoolean(args.include_table_details ?? args.includeTableDetails, true),
           includeLinks: parseBoolean(args.include_table_links ?? args.includeTableLinks, false),
@@ -1937,7 +1950,7 @@ async function runSellerSpriteCompetitorLookup(args = {}) {
           selector: String(args.table_selector || args.tableSelector || 'body'),
           tableMode: String(args.table_mode || args.tableMode || 'sellersprite_product'),
           maxRows: maxCandidates,
-          columns: args.table_columns || args.tableColumns || PRODUCT_TABLE_COLUMNS,
+          columns: args.table_columns || args.tableColumns,
           includeHtml: parseBoolean(args.include_table_html ?? args.includeTableHtml, false),
           includeDetails: parseBoolean(args.include_table_details ?? args.includeTableDetails, true),
           includeLinks: parseBoolean(args.include_table_links ?? args.includeTableLinks, false),

@@ -503,10 +503,19 @@ class ChromeBridgeClient {
         const tables = document.querySelectorAll('table');
         let maxCells = 0;
         for (const table of tables) {
-          const cells = table.querySelectorAll('td, th').length;
+          const cells = table.querySelectorAll('td').length;
           if (cells > maxCells) {
             maxCells = cells;
             container = table;
+          }
+        }
+        if (!container && tables.length > 0) {
+          for (const table of tables) {
+            const cells = table.querySelectorAll('td, th').length;
+            if (cells > maxCells) {
+              maxCells = cells;
+              container = table;
+            }
           }
         }
         return container || document.body;
@@ -524,6 +533,17 @@ class ChromeBridgeClient {
           if (headerRow) {
             return getVisibleCells(headerRow).map((cell, index) => compactElementText(cell, 80) || 'column_' + (index + 1));
           }
+        }
+        const table = container?.querySelector('table');
+        if (table) {
+          const headerRow = Array.from(table.querySelectorAll('thead tr')).find(row => getVisibleCells(row).length > 0);
+          if (headerRow) {
+            return getVisibleCells(headerRow).map((cell, index) => compactElementText(cell, 80) || 'column_' + (index + 1));
+          }
+        }
+        const globalHeaderRow = Array.from(document.querySelectorAll('thead tr')).find(row => getVisibleCells(row).length > 0);
+        if (globalHeaderRow) {
+          return getVisibleCells(globalHeaderRow).map((cell, index) => compactElementText(cell, 80) || 'column_' + (index + 1));
         }
         const first = rows.find(row => Array.from(row.querySelectorAll('th')).length > 0);
         if (first) return getVisibleCells(first).map((cell, index) => compactElementText(cell, 80) || 'column_' + (index + 1));
@@ -578,6 +598,10 @@ class ChromeBridgeClient {
         if (asins.length > 1) {
           data.parent_asin = asins[1];
         }
+        const imgEl = row.querySelector('img[src*="media-amazon.com"], img[src*="amazon.com"]');
+        if (imgEl && imgEl.src) {
+          data.image_url = imgEl.src;
+        }
         const rowHtml = row.innerHTML || '';
         const badges = [];
         if (/class="[^"]*a-plus[^"]*"|A\+内容|class="[^"]*tag-a-plus[^"]*"/i.test(rowHtml) || row.querySelector('.a-plus, .tag-a-plus') || text.includes('A+')) {
@@ -625,13 +649,20 @@ class ChromeBridgeClient {
           if (productRows.length > 0) return productRows;
         }
         if (options.rowSelector) {
-          return Array.from(container.querySelectorAll(options.rowSelector)).filter(isVisible);
+          return Array.from(container.querySelectorAll(options.rowSelector)).filter(row => isVisible(row) && !row.closest('thead'));
         } else if (container.tagName === 'TABLE') {
-          return Array.from(container.querySelectorAll('tbody tr, tr')).filter(isVisible);
+          let rows = Array.from(container.querySelectorAll('tbody tr')).filter(isVisible);
+          if (rows.length === 0) {
+            rows = Array.from(container.querySelectorAll('tr')).filter(row => isVisible(row) && !row.closest('thead'));
+          }
+          return rows;
         }
-        const descendantRows = Array.from(container.querySelectorAll('table tbody tr, table tr')).filter(isVisible);
+        let descendantRows = Array.from(container.querySelectorAll('table tbody tr')).filter(isVisible);
+        if (descendantRows.length === 0) {
+          descendantRows = Array.from(container.querySelectorAll('table tr')).filter(row => isVisible(row) && !row.closest('thead'));
+        }
         if (descendantRows.length > 0) return descendantRows;
-        return Array.from(container.children || []).filter(isVisible);
+        return Array.from(container.children || []).filter(row => isVisible(row) && !row.closest('thead'));
       }
 
       function parseResultCount() {

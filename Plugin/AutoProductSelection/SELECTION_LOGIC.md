@@ -109,16 +109,7 @@ post_forge_action:
 
 `OpportunityScore` 回答：“这个市场本身有没有机会？”
 
-```text
-PotentialScore =
-0.30 * demand_score
-+ 0.20 * growth_score
-+ 0.25 * differentiation_score
-+ 0.25 * market_entry_score
-
-OpportunityScore =
-PotentialScore * M_profit * M_competition * M_compliance
-```
+熔炉输出的是业务评审分，不再把旧版多乘法链当作最终数学裁决。后端 v3 会从 scored 中重新抽取关键字段，用五支柱加权几何平均与区间决策生成最终安全阀结果。
 
 子项含义：
 
@@ -126,9 +117,19 @@ PotentialScore * M_profit * M_competition * M_compliance
 - `growth_score`：增长趋势、近期评论增长、季节窗口。
 - `differentiation_score`：差评痛点是否集中，低成本改良是否可做。
 - `market_entry_score`：Review 门槛、头部集中度、价格带、Listing 难度。
-- `M_profit`：利润和广告压力乘数。
-- `M_competition`：竞争严重度乘数。
-- `M_compliance`：合规/侵权/平台风险乘数。
+- `competition_severity`：竞争严重度，后端会反向映射为竞争余地支柱。
+- `compliance_risk`：合规/侵权/平台风险；高风险先走 Hard Gate，非硬门风险只做软降权。
+- `listing_leverage_score`：场景代入弹性，后端用来放大差异化支柱。
+
+后端 v3 支柱为：
+
+```text
+demand_pillar          = demand/growth/market_entry 复合
+competition_pillar     = 竞争余地
+profit_pillar          = 单件贡献利润 + 经压缩的广告经济性
+differentiation_pillar = differentiation_score + listing_leverage_score 杠杆
+execution_pillar       = execution_fit_score
+```
 
 ### 2. DataReliabilityScore：数据置信度分
 
@@ -146,14 +147,14 @@ DataReliabilityScore =
 
 字段已进入 `unfetchable_gaps` 时，熔炉不得继续要求同字段回环，只能接受缺口、降低置信度并裁决。
 
-置信度映射：
+置信度分层：
 
 ```text
->=85   High         M_confidence = 1.00
-70-84  Medium-High M_confidence = 0.90
-55-69  Medium      M_confidence = 0.75
-40-54  Low         M_confidence = 0.60
-<40    Very Low    M_confidence = 0.40
+>=85   High
+70-84  Medium-High
+55-69  Medium
+40-54  Low
+<40    Very Low
 ```
 
 `DataReliabilityScore < 40` 时输出 `DATA_INSUFFICIENT` 或 `REJECT`，原则上不做商业推荐。
@@ -172,33 +173,22 @@ ExecutionFitScore =
 + 0.15 * iteration_speed_score
 ```
 
-执行适配乘数：
-
-```text
->=85   M_execution_fit = 1.00
-70-84  M_execution_fit = 0.90
-55-69  M_execution_fit = 0.75
-40-54  M_execution_fit = 0.60
-<40    M_execution_fit = 0.40
-```
-
 `ExecutionFitScore < 45` 时不得 `RECOMMEND`。
 
 ### 4. FinalScore：最终排序分
 
-```text
-FinalScore = OpportunityScore * M_confidence * M_execution_fit
-```
+`FinalScore` 是熔炉的业务排序参考分；后端最终会写入 `backend_math_validation_v2.final_score`，并以 v3 区间决策控制动作。
 
 这意味着：
 
-- 机会高但数据弱，会被置信度折扣压低。
-- 数据可靠但机会弱，会低分拒绝。
-- 市场不错但小卖家做不动，会被执行适配折扣压低。
+- 机会高但数据弱，不能直接 `RECOMMEND`，通常进入 `WATCHLIST`、`RESEARCH_GAP` 或具体回环。
+- 数据可靠但机会弱，可以终态 `REJECT` 或观察发布。
+- 市场不错但小卖家做不动，不能 `RECOMMEND`。
+- 平庸但不确定的方向不应静默淘汰，后端 v3 会倾向发布为 WATCHLIST 供人工验证。
 
 ## 后端数学安全阀
 
-后端会在 scored 写入和应用决策时注入 `backend_math_validation_v2`。该安全阀不是替代熔炉，而是校准熔炉输出，防止乐观推荐。
+后端会在 scored 写入和应用决策时注入 `backend_math_validation_v2`。该安全阀不是替代熔炉，而是校准熔炉输出，保留 v3《棱镜》模型：五支柱加权几何平均、Listing 杠杆、广告数据低信任压缩、失真安全网与区间决策。
 
 ### 字段抽取与缺失默认
 
