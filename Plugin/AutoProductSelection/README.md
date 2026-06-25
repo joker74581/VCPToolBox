@@ -67,11 +67,11 @@ graph TD
 
 所以会出现几种合理结果：
 
-- 市场不错，但数据不够：`RESEARCH_GAP` 或 `WATCHLIST`，不能直接推荐。
+- 市场不错，但 ProductSelector 可抓关键证据缺失/冲突：`WATCHLIST` 或明确回环。
 - 数据很可靠，但市场不好：`REJECT`。
 - 市场不错，但小卖家打不动：`WATCHLIST` 或 `REJECT`。
-- 机会、数据、执行都过关，且悲观估计也越过推荐线：才稳健 `RECOMMEND`。
-- 中间地带会优先发布为 `WATCHLIST` 供人工验证，而不是被旧乘法链静默压死。
+- 机会、数据、执行都过关：熔炉可输出 `RECOMMEND`，含义是“推荐进入人工验证/立项验证”。
+- BOM 询价、专利排雷、真人打样、Seller Central 最终 FBA 实测未完成时，写入下一步验证，不单独把推荐降级为观察。
 
 ## 利润和广告压力怎么判断
 
@@ -152,12 +152,14 @@ runs/scored/{run_id}-scored.md
 
 ## 评分安全阀
 
-后端会在 scored 写入和应用评审决策时自动追加 `backend_math_validation_v2`：
+后端会在 scored 写入和应用评审决策时自动追加 `backend_math_validation` 与 `backend_math_scoring`：
 
 - 记录四分：机会分、数据置信度分、执行适配分、最终分。
-- 记录利润和广告压力测试：贡献利润、保守 CVR、PPC、CPA、ACOS、广告压力比例。
+- 记录 v3《棱镜》区间决策：`point_estimate`、`optimistic_score`、`pessimistic_score`、`overall_trust`、五支柱权重。
+- 记录利润和广告压力测试：贡献利润、保守 CVR、PPC、CPA、ACOS、广告压力比例；广告派生数据疑似失真时只降权/降置信，不单独硬淘汰。
+- 统一规范化 `score_inputs`：分数字段兼容 `0-100` 与历史 `0-1`，严重度字段兼容 `0-10`、历史 `0-1` 与旧百分制，并在 `backend_math_scoring.input_normalization` 里写入审计。
 - 记录缺失字段：不会乐观补齐，会写入 `missing_critical_fields` 并降低数据置信度。
-- 兜底阻止错误推荐：Hard Gate、负贡献利润、广告压力测试失败或低分 `RECOMMEND` 会被后端改成淘汰重选。
+- 兜底阻止错误推荐：Hard Gate、负贡献利润会被强制淘汰；普通中间区间会发布给人工判断，而不是静默淘汰。最终推荐/观察业务裁决以熔炉 scored 为准。
 
 ## 空数据容错
 

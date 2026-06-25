@@ -100,7 +100,7 @@ data_confidence: 3
       overwrite: true
     });
     let scoredContent = await readScored();
-    if (!scoredContent.includes('backend_math_validation_v2:')) throw new Error('Missing backend_math_validation_v2 block.');
+    if (!scoredContent.includes('backend_math_scoring:')) throw new Error('Missing backend_math_scoring block.');
     if (!scoredContent.includes('base_cvr: 0.0500')) throw new Error('CVR conservative base adjustment was not written.');
 
     const resultA = await plugin.processToolCall({

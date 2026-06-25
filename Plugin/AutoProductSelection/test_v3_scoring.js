@@ -134,9 +134,60 @@ console.log('\nScenario 7: percent-aware CVR parsing (1% != 100%)');
   check('bare "0.08" unchanged', Math.abs(rate('0.08').rawCvr - 0.08) < 1e-6, `got ${rate('0.08').rawCvr}`);
 }
 
-// Scenario 8: rejected-keyword capture from EARLY_REJECT raw (feeds the diary so future
+// Scenario 8: reviewer score_inputs may use 0-1 ratios; stale backend math annotations
+// must not be re-read as source evidence on a later evaluation pass.
+console.log('\nScenario 8: 0-1 score_inputs normalize and stale backend math is ignored');
+{
+  const content = `---
+action: PUBLISH_FINAL
+total_score: 23
+backend_math_scoring:
+  data_reliability_score: 0
+  execution_fit_score: 1
+  v3_pillars:
+    demand: 0.008 (w=0.25)
+---
+scored_candidate_pack:
+  final_disposition:
+    verdict: WATCHLIST
+  post_forge_action:
+    action: PUBLISH_FINAL
+  hard_gates:
+    passed: true
+  score_inputs:
+    demand_score: 0.80
+    growth_score: 0.68
+    differentiation_score: 0.78
+    market_entry_score: 0.78
+    competition_severity: 0.22
+    compliance_risk: 0.12
+    complexity_severity: 0.32
+    data_reliability_score: 0.72
+    execution_fit_score: 0.70
+    listing_leverage_score: 0.70
+  financial_factors:
+    selling_price: 30.59
+    bom_estimate_per_set_usd: 6.0
+    shipping_cost: 1.5
+    fba_fee_estimate_usd: 7.98
+    referral_fee_pct: 0.15
+    raw_click_conversion_rate: 5.12
+    ppc_bid: 0.45
+`;
+  const sr = calculateScoringModel(content);
+  const demand = sr.pillars.find(p => p.key === 'demand')?.value;
+  const execution = sr.pillars.find(p => p.key === 'execution')?.value;
+  check('demand ratio normalized to healthy pillar', demand > 0.7, `demand=${demand}`);
+  check('execution ratio normalized to 70/100', Math.abs(execution - 0.7) < 0.001, `execution=${execution}`);
+  check('data reliability ratio normalized to 72/100', sr.dataReliabilityScore === 72, `reliability=${sr.dataReliabilityScore}`);
+  check('canonical input records normalized demand score', sr.canonicalScoreInputs?.demand_score === 80, `canonical=${JSON.stringify(sr.canonicalScoreInputs)}`);
+  check('normalization audit is surfaced', (sr.inputNormalizationWarnings || []).some(w => w.includes('demand_score')), `warnings=${JSON.stringify(sr.inputNormalizationWarnings)}`);
+  check('stale backend block ignored', sr.pointEstimate > 50, `point=${sr.pointEstimate}`);
+}
+
+// Scenario 9: rejected-keyword capture from EARLY_REJECT raw (feeds the diary so future
 // rounds skip already-probed dead-end keywords).
-console.log('\nScenario 8: rejected keyword extraction for diary sedimentation');
+console.log('\nScenario 9: rejected keyword extraction for diary sedimentation');
 {
   const raw = [
     'route_decision:', '  action: EARLY_REJECT',
@@ -151,9 +202,9 @@ console.log('\nScenario 8: rejected keyword extraction for diary sedimentation')
   check('captures elimination_log target_keywords', kws.includes('pour over stand') && kws.includes('drip tray'), JSON.stringify(kws));
 }
 
-// Scenario 9: deferred_candidates extraction (prescreen-passing directions not deep-dived
+// Scenario 10: deferred_candidates extraction (prescreen-passing directions not deep-dived
 // this round become [待观察] priorities for a future trigger — not eliminations).
-console.log('\nScenario 9: deferred candidate extraction for [待观察] sedimentation');
+console.log('\nScenario 10: deferred candidate extraction for [待观察] sedimentation');
 {
   const raw = [
     'route_decision:', '  action: READY_FOR_FORGE',

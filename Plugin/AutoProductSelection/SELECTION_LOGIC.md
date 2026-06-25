@@ -15,7 +15,7 @@
 3. 后端执行数学安全阀：
    - Hard Gates
    - CVR 保守修正
-   - PPC 压力测试
+   - PPC/CPA 压力测试（软风险）
    - UnitContribution
    - 重复回环守卫
 4. 枢纽发布完整证据链、风险、缺口、Kill Criteria 和下一步验证计划。
@@ -63,12 +63,12 @@ Brief 应包含：
 当前评分是“两层制”：
 
 1. **熔炉做业务评审**：读取 raw，基于证据输出 `scored_candidate_pack`，包含 Hard Gates、四类分数、财务字段、数据置信审计、裁决和下一步动作。
-2. **后端做数学安全阀**：`AutoProductSelection.js` 在 scored 写入和应用决策时重新抽取关键字段，注入 `backend_math_validation_v2`，并在必要时覆盖错误动作。
+2. **后端做数学安全阀**：`AutoProductSelection.js` 在 scored 写入和应用决策时重新抽取关键字段，注入 `backend_math_validation` 与 `backend_math_scoring`，并在必要时覆盖错误动作。
 
 这样设计的目的：
 
 - 熔炉负责商业判断和解释。
-- 后端负责保守数学、广告压力、硬门槛和防误推荐。
+- 后端负责保守数学、广告压力软降权、硬门槛和防误推荐；业务裁决以熔炉 scored 为准，后端数学不替代熔炉。
 - 低置信或数据不足可以发布阻断/观察报告，但不能伪装成推荐。
 
 ## 熔炉评分输出
@@ -86,11 +86,20 @@ Brief 应包含：
 - 高认证门槛
 - 高售后/高退货
 - 负贡献利润
-- 广告压力测试明显倒挂
 - 小卖家资金不可承受
 - MOQ 或交期明显不可接受
-- 关键数据严重缺失且无法推演
+- ProductSelector 可获取的关键数据严重缺失且无法推演
 - 平台禁售或高封号风险
+
+以下不是插件层 Hard Gate，只能进入风险、Kill Criteria 和 Next Validation Plan：
+
+- BOM/1688 真实询价未完成
+- USPTO/Google Patents/专利排雷未完成
+- 真人打样、承重/耐用/装配测试未完成
+- Seller Central FBA Calculator 最终实测未完成，但已有 SellerSprite 竞品 FBA 样本或合理估算
+- SellerSprite 广告压力偏高或保守 CVR 压测倒挂，但单件贡献利润仍为正且无其它硬红线
+
+这些人工验证项也不应单独把 `RECOMMEND` 降级为 `WATCHLIST`。`RECOMMEND` 表示“当前工具链证据足够好，值得进入人工验证/立项验证”，不是“已经可以直接下单生产”。
 
 触发后：
 
@@ -131,6 +140,13 @@ differentiation_pillar = differentiation_score + listing_leverage_score 杠杆
 execution_pillar       = execution_fit_score
 ```
 
+量纲约定：
+
+- `demand_score`、`growth_score`、`differentiation_score`、`market_entry_score`、`DataReliabilityScore`、`ExecutionFitScore` 优先写 `0-100`。
+- `competition_severity`、`compliance_risk`、`complexity_severity` 优先写 `0-10`，越高越危险/越难。
+- `listing_leverage_score` 写 `0-1`。
+- 后端兼容历史输出：分数字段 `0-1` 会自动转成 `0-100`；严重度字段 `0-1` 会自动转成 `0-10`，大于 `10` 的旧百分制严重度会除以 `10`。
+
 ### 2. DataReliabilityScore：数据置信度分
 
 `DataReliabilityScore` 回答：“我们有多确定？”
@@ -145,20 +161,22 @@ DataReliabilityScore =
 + 0.10 * outlier_control_score
 ```
 
-字段已进入 `unfetchable_gaps` 时，熔炉不得继续要求同字段回环，只能接受缺口、降低置信度并裁决。
+字段已进入 `unfetchable_gaps` 时，熔炉不得继续要求同字段回环，只能接受缺口、降低置信度并裁决。`unfetchable_gaps` 只应记录 ProductSelector 尝试后仍不可得的字段；BOM、专利、真人打样、Seller Central 最终实测不应写成 ProductSelector 缺口。
 
 置信度分层：
 
 ```text
 >=85   High
 70-84  Medium-High
-55-69  Medium
+60-69  Medium，可谨慎推荐；若关键证据会改变结论则观察
+55-59  Medium-Low，通常观察或具体回环
 40-54  Low
 <40    Very Low
 ```
 
 `DataReliabilityScore < 40` 时输出 `DATA_INSUFFICIENT` 或 `REJECT`，原则上不做商业推荐。
-`DataReliabilityScore < 70` 时，即使机会分高，也只能 `WATCHLIST`、`RESEARCH_GAP` 或具体回环。
+`DataReliabilityScore 40-59` 且机会不错时，通常输出 `WATCHLIST` 或一次明确回环。
+`DataReliabilityScore >= 60` 且低分只来自 BOM/专利/打样/Seller Central 最终实测等人工验证项时，不得因此阻止 `RECOMMEND`；应把这些移出数据置信扣分，转为 Next Validation Steps 与 Kill Criteria。
 
 ### 3. ExecutionFitScore：小卖家执行适配分
 
@@ -173,31 +191,42 @@ ExecutionFitScore =
 + 0.15 * iteration_speed_score
 ```
 
-`ExecutionFitScore < 45` 时不得 `RECOMMEND`。
+`ExecutionFitScore < 45` 时不得 `RECOMMEND`。但不得仅因“尚未真人询价/排雷/打样”把执行分压到低位；只有 raw 已证明 MOQ、工艺、认证、尺寸重量、售后或资金模型确实不适配小卖家时，才应大幅扣执行分。
 
 ### 4. FinalScore：最终排序分
 
-`FinalScore` 是熔炉的业务排序参考分；后端最终会写入 `backend_math_validation_v2.final_score`，并以 v3 区间决策控制动作。
+`FinalScore` 是熔炉的业务排序参考分；后端最终会写入 `backend_math_validation.final_score` 与 `backend_math_scoring.final_score`，并以 v3 区间决策做安全阀审计。
 
 这意味着：
 
-- 机会高但数据弱，不能直接 `RECOMMEND`，通常进入 `WATCHLIST`、`RESEARCH_GAP` 或具体回环。
+- 机会高但 ProductSelector 可抓的关键证据仍然弱，不能直接 `RECOMMEND`，通常进入 `WATCHLIST` 或具体回环。
 - 数据可靠但机会弱，可以终态 `REJECT` 或观察发布。
 - 市场不错但小卖家做不动，不能 `RECOMMEND`。
-- 平庸但不确定的方向不应静默淘汰，后端 v3 会倾向发布为 WATCHLIST 供人工验证。
+- 平庸但不确定的方向不应静默淘汰，通常发布为 WATCHLIST 供人工验证。
 
 ## 后端数学安全阀
 
-后端会在 scored 写入和应用决策时注入 `backend_math_validation_v2`。该安全阀不是替代熔炉，而是校准熔炉输出，保留 v3《棱镜》模型：五支柱加权几何平均、Listing 杠杆、广告数据低信任压缩、失真安全网与区间决策。
+后端会在 scored 写入和应用决策时注入 `backend_math_validation` 与 `backend_math_scoring`。该安全阀不是替代熔炉，而是审计熔炉输出、兜住硬门和明显数学错误，保留 v3《棱镜》模型：五支柱加权几何平均、Listing 杠杆、广告数据低信任压缩、失真安全网与区间决策。
+
+后端计算前会剥离自己上一次写入的 `action`、`total_score`、`backend_math_*` 与 `warnings` 注解，再读取熔炉原始 `scored_candidate_pack`，避免二次计算读到旧数学块。
+
+所有评分输入会先通过 `buildCanonicalScoringInput()` 统一规范化，再进入 v3 支柱：
+
+- `0-100` 分数字段若历史输出为 `0-1`，会自动视为比例并换算到 `0-100`。
+- `0-10` 严重度字段若历史输出为 `0-1`，会换算到 `0-10`；若历史输出为旧百分制，如 `35`，会换算为 `3.5/10`。
+- `listing_leverage_score` 使用 `0-1`，兼容 `80` / `80%` 这类历史写法为 `0.8`。
+- 发生量纲修正时，后端会写入 `backend_math_scoring.input_normalization`，便于 debug 追踪。
+
+这层适配是兼容旧 scored 的安全网；新熔炉输出仍应严格按规范量纲写入，避免业务解释层出现“0.8 分还是 80 分”的歧义。
 
 ### 字段抽取与缺失默认
 
 后端会从 scored 文本里抽取：
 
 - `selling_price`
-- `bom_cost`
-- `shipping_cost`
-- `fba_fee`
+- `bom_cost` / `bom_estimate_per_set_usd`
+- `shipping_cost` / `head_freight_usd`
+- `fba_fee` / `fba_fee_estimate_usd` / `median_fba_fee`
 - `referral_fee`
 - `packaging_cost`
 - `return_reserve`
@@ -207,7 +236,8 @@ ExecutionFitScore =
 - `raw_ppc_bid` 或 `ppc_bid`
 - `demand_score`、`growth_score`、`differentiation_score`、`market_entry_score`
 - `competition_severity`、`compliance_risk`、`complexity_severity`
-- 数据置信子项或旧字段 `data_confidence`
+- `data_reliability_score`、`execution_fit_score`、数据置信子项或旧字段 `data_confidence`
+- `listing_leverage_score`
 
 缺失时使用保守压力测试，不制造高分：
 
@@ -223,7 +253,7 @@ ExecutionFitScore =
 - `click_conversion_rate` 缺失：按 `6%` 行业参考压测，并标记关键缺失。
 - `ppc_bid` 缺失：按 `$1.15/$1.35` 压测，并标记关键缺失。
 
-每个关键字段缺失会让 `DataReliabilityScore` 扣分；存在 `unfetchable_gaps` 也会继续扣分。
+每个关键字段缺失会让 `DataReliabilityScore` 扣分；存在 `unfetchable_gaps` 也会继续扣分。`bom_cost` 缺失会按售价 25% 保守估算并写 warning，但不作为 ProductSelector 关键缺失；`fba_fee` 完全缺失才按关键缺失处理。
 
 ### UnitContribution
 
@@ -282,19 +312,22 @@ PPC 使用规则：
 ```text
 base_cpa = used_ppc / base_cvr
 stress_cpa = stress_ppc / stress_cvr
-base_ad_ratio = base_cpa / UnitContribution
-stress_ad_ratio = stress_cpa / UnitContribution
+paid_traffic_ratio = 显式字段或默认 0.60
+blended_base_cpa = base_cpa * paid_traffic_ratio
+blended_stress_cpa = stress_cpa * paid_traffic_ratio
+base_ad_ratio = blended_base_cpa / UnitContribution
+stress_ad_ratio = blended_stress_cpa / UnitContribution
 estimated_acos = base_cpa / selling_price
 ```
 
 如果：
 
 ```text
-stress_ad_ratio > 1.5
-或 base_ad_ratio > 1.3
+stress_ad_ratio > 1.8
+或 base_ad_ratio > 1.5
 ```
 
-则标记 `ad_stress_test_failed=true`，不得 `RECOMMEND`。
+则标记 `ad_stress_test_failed=true`。这是软风险：后端写 warning、压低利润支柱并扩大不确定性，但不会单凭 SellerSprite 派生广告字段硬淘汰。熔炉可据此把边缘机会降为 `WATCHLIST`；只有单位贡献利润为负或其它 Hard Gate 成立时才硬淘汰。
 
 ### M_profit
 
@@ -303,17 +336,29 @@ stress_ad_ratio > 1.5
 ```text
 UnitContribution <= 0 => M_profit = 0.05
 base_ad_ratio <= 0.4 => M_profit = 1.20
-0.4 - 1.0            => 从 1.20 平滑降到 0.80
-1.0 - 1.5            => 从 0.80 平滑降到 0.30
-> 1.5                => M_profit = 0.05
+0.4 - 1.0            => 从 1.20 平滑降到 0.90
+1.0 - 1.8            => 从 0.90 平滑降到 0.55
+> 1.8                => M_profit = 0.45
 ```
 
 附加惩罚：
 
 ```text
-UnitContributionRate < 25% => M_profit *= 0.70
-UnitContribution < $6      => M_profit *= 0.70
+UnitContributionRate < 25% => M_profit *= 0.80
+UnitContribution < $6      => M_profit *= 0.80
 ```
+
+然后进入广告经济权重压缩：
+
+```text
+AD_ECONOMICS_WEIGHT = 0.35
+UnitContribution <= 0 => M_profit_effective = M_profit
+M_profit <= 1         => M_profit_effective = 1 - 0.35 * (1 - M_profit)
+M_profit > 1          => M_profit_effective = 1 + 0.35 * (M_profit - 1)
+profit_pillar         = clamp(M_profit_effective / 1.2)
+```
+
+因此广告压力会拖累机会分，但在贡献利润为正时不会把强市场直接打成 0 分。
 
 ### M_competition 与 M_compliance
 
@@ -332,20 +377,37 @@ complexity_severity: 0-10，用于补算 market_entry 和 execution_fit
 后端会把校准结果写回 scored front matter：
 
 ```yaml
-backend_math_validation_v2:
-  opportunity_score:
+action:
+total_score:
+backend_math_validation:
+  scoring_version: v3
+  total_score:
+  final_score:
+backend_math_scoring:
   data_reliability_score:
   execution_fit_score:
   final_score:
   confidence_level:
   hard_gate_triggered:
   ad_stress_test_failed:
-  multipliers:
-    profit:
+  data_distortion_suspected:
+  distortion_signals:
+  v3_interval_decision:
+    point_estimate:
+    optimistic_score:
+    pessimistic_score:
+    uncertainty_band:
+    overall_trust:
+    listing_leverage:
+  v3_pillars:
+    demand:
     competition:
-    compliance:
-    confidence:
-    execution_fit:
+    profit:
+    differentiation:
+    execution:
+  profit_multipliers:
+    profit:
+    profit_effective:
   financials:
     selling_price:
     bom_cost:
@@ -362,6 +424,9 @@ backend_math_validation_v2:
     stress_ppc:
     base_cpa:
     stress_cpa:
+    paid_traffic_ratio:
+    blended_base_cpa:
+    blended_stress_cpa:
     estimated_acos:
     break_even_acos:
     base_ad_ratio:
@@ -379,17 +444,18 @@ warnings:
 当 `post_forge_action.action = PUBLISH_FINAL` 时：
 
 - Hard Gate 触发：改成 `DROP_AND_RESELECT`。
-- `verdict=RECOMMEND` 且 `FinalScore < 75`：改成 `DROP_AND_RESELECT`。
-- `verdict=RECOMMEND` 且广告压力失败：改成 `DROP_AND_RESELECT`。
-- 没有明确 verdict 且 `FinalScore < 75`：改成 `DROP_AND_RESELECT`。
-- `FinalScore < 50` 且 verdict 不是 `WATCHLIST`、`RESEARCH_GAP`、`DATA_INSUFFICIENT`：改成 `DROP_AND_RESELECT`。
+- `data_distortion_suspected=true` 且 `verdict=RECOMMEND`：优先 `LOOPBACK_TO_HAWKEYE` 补一次干净数据；若重选预算耗尽则终态发布谨慎报告。
+- `optimistic_score < APS_SCORE_DROP_CEILING`（默认 42）：连乐观估计都不及格，才允许 `DROP_AND_RESELECT`；若熔炉已选择 `WATCHLIST` / `RESEARCH_GAP` / `DATA_INSUFFICIENT` 这类终态谨慎裁决，则维持发布。
+- `pessimistic_score >= APS_SCORE_RECOMMEND_FLOOR`（默认 62）：悲观估计也过线，熔炉的 `RECOMMEND` 可以成立。
+- 其余中间区间：`PUBLISH_FINAL`，作为观察/人工验证报告浮现，不静默淘汰。
 
 因此：
 
 - `WATCHLIST` 可以发布观察报告。
 - `RESEARCH_GAP` 可以发布数据缺口报告。
 - `DATA_INSUFFICIENT` 可以发布阻断报告。
-- 但低分、广告倒挂或硬红线不能发布为 `RECOMMEND`。
+- 硬红线和证实负贡献利润不能发布为 `RECOMMEND`。
+- 广告压力偏高但贡献利润为正时是软风险，通常把裁决拉向 `WATCHLIST` 或扩大区间不确定性，而不是直接 DROP。
 
 ## 回环守卫
 

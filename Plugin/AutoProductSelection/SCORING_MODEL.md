@@ -33,6 +33,9 @@ Layer 4  区间决策        → 点估计 P ± 不确定带 U，按 [P-U, P+U] 
 四个对外兼容分数（`OpportunityScore / DataReliabilityScore / ExecutionFitScore / FinalScore`）
 仍然写入 scored，供论坛报告与旧读取器使用；FinalScore 即区间点估计 `point_estimate`。
 
+> **口径清理（2026-06）**：后端**不再输出** v2 全乘法链机会分（旧 `backend_math_validation_v2.opportunity_score = potentialScore × M_profit × M_competition × M_compliance`）。后端机会判断的**唯一口径**是 v3 几何平均 `point_estimate`（写在 `backend_math_scoring.v3_interval_decision`）。scored 里同时保留熔炉 `scored_candidate_pack` 的业务四分（另一角度，多一层业务判断），两套分数分口径并列、各自标注，互不覆盖。已废弃的 v2 乘数（competition/compliance/confidence/execution）不再写入 scored，仅保留 v3 profit 支柱实际消费的 `profit` / `profit_effective`。
+> **解析防御（2026-06）**：后端计算前会剥离自己上一次写入的 `action` / `total_score` / `backend_math_*` / `warnings` 注解，避免二次计算读到旧数学块。所有评分字段先进入 `buildCanonicalScoringInput()` 规范化适配层，再进入 v3 支柱计算。熔炉 `score_inputs` 支持两种历史量纲：分数字段 `0-100` 或 `0-1`（如 `0.80` 自动视作 `80`）；严重度字段 `competition_severity` / `compliance_risk` / `complexity_severity` 支持 `0-10`、`0-1` 与旧百分制样式（如 `35` 自动视作 `3.5/10`）。发生量纲修正时，后端会在 `backend_math_scoring.input_normalization` 中写入审计说明。
+
 ---
 
 ## 2. Layer 1 — 五支柱与信任权重
@@ -50,7 +53,7 @@ Layer 4  区间决策        → 点估计 P ± 不确定带 U，按 [P-U, P+U] 
 支柱构造：
 
 ```
-demand_pillar        = 0.45*demand + 0.30*growth + 0.25*market_entry      （各 /100 归一）
+demand_pillar        = 0.45*demand + 0.30*growth + 0.25*market_entry      （各先归一到 /100）
 competition_pillar   = 1 - (competition_severity/10) * 0.85
 profit_pillar        = unit_contribution<=0 ? floor : clamp(M_profit_effective / 1.2)
 differentiation_pillar = applyListingLeverage(differentiation/100, listing_leverage)
@@ -70,6 +73,18 @@ unit_contribution = selling_price - referral_fee - bom_cost - shipping_cost
                     - fba_fee - packaging_cost - return_reserve - coupon_cost - storage_reserve
 ```
 缺失字段按保守默认补齐（如 bom 25%、fba max(18%, $3)），并写入 `missing_critical_fields`。
+
+字段性质分层：
+- `selling_price` / `fba_fee` / `click_conversion_rate` / `ppc_bid` 属于插件链路可抓或应交付的关键字段，缺失会进入关键缺失与数据置信扣分。
+- `bom_cost` 若无真实询价，可由鹰眼/熔炉按材料、套装、重量、工艺给 `bom_estimate_per_set_usd` 区间或中位估算；它是人工验证项，不是 ProductSelector 抓取失败。
+- USPTO/专利排雷、真人打样、Seller Central 最终 FBA 实测属于人工验证项，只能进入风险、Kill Criteria 与下一步验证，不应作为插件层硬门或单独把执行支柱打死。
+
+`score_inputs` 的规范量纲：
+- `demand_score`、`growth_score`、`differentiation_score`、`market_entry_score`、`data_reliability_score`、`execution_fit_score`：`0-100`。
+- `competition_severity`、`compliance_risk`、`complexity_severity`：`0-10`，越高越危险/越难。
+- `listing_leverage_score`：`0-1`。
+
+后端兼容历史输出，但新 scored 应优先按上面量纲写入，避免让“0.8 是 0.8 分还是 80 分”这类歧义进入业务解释层。
 
 ### 3.2 CVR 保守修正
 ```
@@ -169,8 +184,10 @@ pessimistic     = clamp(point - U)
    其余                                    → PUBLISH_FINAL，作为 WATCHLIST 浮现给人工验证（绝不淘汰）
    ```
 
-> **这就是机制核心**：淘汰需要"连乐观估计都失败"，推荐需要"连悲观估计都达标"，中间的不确定地带
-> 一律浮现为可供人工初步决策的 WATCHLIST——正是本系统的目标产物。
+> **这就是机制核心**：后端数学负责防误杀与硬门审计，不替代熔炉业务裁决。
+> 淘汰需要"连乐观估计都失败"或触发硬门；推荐/待观察的业务结论以熔炉 `verdict` 为准。
+> `RECOMMEND` 表示“值得进入人工验证/立项验证”，不是“已经完成 BOM/专利/打样/FBA 实测”。
+> 注意：后端只返回动作 `PUBLISH_FINAL`，不会重写熔炉 YAML 里的 `verdict` 文本；最终发帖阶段应尊重熔炉 verdict，并把人工验证项写为下一步计划，而不是推荐降级理由。
 
 ---
 
@@ -199,8 +216,8 @@ pessimistic     = clamp(point - U)
 
 - **枢纽（coordinator）**：一个 brief 给 2-3 个并列候选方向，供鹰眼横向预筛；按时间窗读记忆（[淘汰] 近一月，[经验] 永久）。
 - **鹰眼（scout）**：先廉价横向体检写 `prescreen_log`，只深挖最优方向；输出 `scene_vs_function_signal` 供熔炉判定杠杆；失真数据写 `unfetchable_gaps`/记号，绝不脑补。
-- **熔炉（reviewer）**：先 Hard Gates 再评分，输出 `listing_leverage_score`；裁决偏向"浮现给人工"，仅硬红线/证实负利润/FETCHED_EMPTY 才 DROP。
-- **后端（本引擎）**：在 scored 写入时与 `apply_reviewer_decision` 时各跑一次，以区间决策与预算守卫覆盖/校正 Agent 动作。
+- **熔炉（reviewer）**：先 Hard Gates 再评分，输出 `listing_leverage_score`；负责最终业务裁决，把机会分成 RECOMMEND（推荐进入人工验证/立项验证）、WATCHLIST（待观察补关键证据）和少量阻断。BOM 询价、USPTO/专利排雷、真人打样、Seller Central 最终实测未完成时，写入验证计划和升级/淘汰条件，不作为插件层推荐硬阻断。
+- **后端（本引擎）**：在 scored 写入时与 `apply_reviewer_decision` 时各跑一次，以区间决策与预算守卫做数学审计、防误杀和硬门兜底，不替代熔炉业务裁决。
 
 ---
 
@@ -228,5 +245,5 @@ pessimistic     = clamp(point - U)
 
 ## 11. 验证
 
-- `test_v3_scoring.js`：纯数学回归，6 场景 12 断言（平庸→浮现不淘汰、感性杠杆抬分、强势→推荐成立、硬门→淘汰、失真→回环不误杀、负利润→硬门）。
+- `test_v3_scoring.js`：纯数学回归，覆盖平庸→浮现不淘汰、感性杠杆抬分、强势→推荐成立、硬门→淘汰、失真→回环不误杀、负利润→硬门、百分号 CVR 解析、0-1 `score_inputs` 兼容、旧 backend 数学块剥离、淘汰/待观察关键词提取。
 - `test_math_scoring.js`：文件状态机链路回归（写 raw/scored、apply_reviewer_decision、回环守卫、硬门覆盖）。

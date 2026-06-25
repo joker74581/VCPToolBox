@@ -272,6 +272,34 @@ function resolveAutoSelectionFile(stage, runId, lockName = '') {
   return path.join(AUTO_SELECTION_RUNS_DIR, normalizedStage, filename);
 }
 
+async function statAutoSelectionFile(stage, runId, lockName = '') {
+  const filePath = resolveAutoSelectionFile(stage, runId, lockName);
+  try {
+    const stat = await fs.stat(filePath);
+    return { exists: true, path: filePath, stat, modifiedMs: stat.mtimeMs };
+  } catch (err) {
+    if (err.code === 'ENOENT') return { exists: false, path: filePath };
+    throw err;
+  }
+}
+
+function isHandoffFresh(fileInfo = {}, sinceIso = '') {
+  if (!fileInfo.exists) return false;
+  const sinceMs = sinceIso ? new Date(sinceIso).getTime() : 0;
+  if (!Number.isFinite(sinceMs) || sinceMs <= 0) return true;
+  // Give the filesystem a little timestamp slack, but never let a handoff from a
+  // previous dispatch attempt decide the current attempt.
+  return (fileInfo.modifiedMs || 0) + 1000 >= sinceMs;
+}
+
+async function discardStaleFailedHandoff(runId, sinceIso = '', reason = '') {
+  const failedInfo = await statAutoSelectionFile('failed', runId);
+  if (!failedInfo.exists || isHandoffFresh(failedInfo, sinceIso)) return false;
+  await fs.rm(failedInfo.path, { force: true });
+  logWorkflowEvent(`[StateMachine] ${runId}: 已清理旧 failed 交接文件${reason ? ` (${reason})` : ''}。`);
+  return true;
+}
+
 function inferAutoSelectionRunIdFromFilename(stage, filename) {
   const normalizedStage = normalizeAutoSelectionStage(stage);
   const name = String(filename || '').trim();
@@ -1023,6 +1051,7 @@ async function buildAutoSelectionWorkerPrompt(worker, runId, options = {}) {
     }
 
     return `你是破壁_鹰眼（ProductSelectionScout），数据侦察专家。请执行一次自动选品取证任务。
+请务必严格遵守你的系统提示词（如多方向廉价预筛、数据采集原则、避坑红线与交付格式要求）。
 
 run_id: ${safeRunId}
 brief_stage: brief
@@ -1045,54 +1074,7 @@ ${existingRawContent}
 ==================================================
 ` : ''}
 
-## 多方向廉价预筛（核心工作法）
-brief 通常给你 2-3 个并列候选方向。你必须**先用最便宜的工具横向体检所有方向，本轮只深挖最有潜力的方向**，避免在弱方向上浪费昂贵抓取，也避免一轮塞太多数据稀释注意力。
-1. **横向 Level 1 体检（便宜，先做）**：对每个候选方向，只用 run_sellersprite_keyword_research / run_sellersprite_competitor_lookup（必要时 keyword_conversion_rate）快速取需求、购买、价格带、需供比、评论门槛、FBA/price、头部集中度。给每个方向粗评级（强/中/弱）并写入 prescreen_log（方向、关键指标、评级、理由）。
-2. **本轮只深挖最优方向（贵，后做）**：本轮最多深挖 ${MAX_DEEP_DIVE_PER_RUN} 个方向——选预筛评级最高的那个做 Level 2（关键词反查、fetch_amazon_product_info、fetch_amazon_reviews），把它的证据一次铺厚。一轮能深挖出一个"好产品/好关键词"就已经很好。
-3. **深挖必拿字段（最优方向）**：必须通过 run_sellersprite_research 或 run_sellersprite_competitor_lookup 获取竞品 FBA 样本，至少输出 Top5-10 的 price / fba_fee / profit_margin / 包装或重量尺寸字段（缺失则逐 ASIN 标注）。ProductSelector 能拿到的是竞品 FBA 估算/样本，不是 Seller Central 对目标 SKU 的最终实测。
-4. **BOM 口径**：BOM/落地采购成本不是 ProductSelector 可抓字段，不要把它写成工具未取得。请按材料、套装数量、重量、工艺复杂度给一个保守区间（如 bom_estimate_per_set_usd），并明确需要 1688/供应商询价验证。
-5. **其它过线但未选中的方向不要淘汰**：把它们写入 raw 的 deferred_candidates（方向、种子词、预筛评级、为何值得后续重拾）。它们不是淘汰，而是**留给后续 trigger 优先深挖的方向**，由后端写入 [待观察] 日记沉淀进记忆。只有真正弱/死的方向才写 elimination_log。
-6. **全部方向都弱**：直接 EARLY_REJECT，在 prescreen_log 说明依据，不要硬深挖。
-
-## ProductSelector 清洗字段映射
-- 产品选品/查竞品稳定字段：asin、parent_asin、title、image_url、price、parent_sales、child_sales、review_count、monthly_new_reviews、rating、fba_fee、profit_margin、weight_info、pkg_weight_info、putaway_date、seller_count。原样保留到 candidate_products。
-- 关键词选品/反查稳定字段：monthly_searches、monthly_purchases、purchase_rate、growth_rate、yearly_growth、recent_3_month_growth、supply_demand_ratio、products、avg_price、avg_reviews、aba_click_share、aba_conversion_share、ppc_bid.low/mid/high。汇总到 keyword_market_summary，并把中位/主入口 PPC 写成 ppc_bid_mid。
-- 关键词转化率稳定字段：click_conversion_rate、ppc_bid.low/mid/high、cpa.low/mid/high、product_price.low/avg/high、acos.max/avg/min、ad_budget。汇总到 conversion_rate_matrix，并在最优方向摘要中显式给 raw_click_conversion_rate、ppc_bid_mid、ppc_bid_high、cpa_mid、acos_avg。
-- 不要只把评分关键字段埋在表格里；对价格、PPC、CVR、FBA、BOM、包装、头程这些会影响评分的字段，必须在 profitability_raw_estimates 或方向摘要里再给一份扁平汇总。
-
-## 冷门/利基方向纪律（重要）
-低搜索量、低成交量**本身不是 EARLY_REJECT 的理由**。无人做的冷门细分常是"先入场"机会（竞争弱、头部未垄断、评论壁垒低）。预筛时区分：
-- **真死方向**（可 EARLY_REJECT）：需求几乎为零且无趋势、品类萎缩、或触红线（合规/重货/侵权/利润倒挂）。
-- **冷门机会**（应保留深挖）：需求小但稳定或上升、需供比好（商品数 < 搜索量）、痛点/场景清晰、头部不集中。
-判断小而美优先看需供比、增长趋势（含往年同期）、头部集中度、痛点清晰度，而不是绝对搜索量。
-
-## 硬性约束
-- ProductSelector 数据命令最多 9 次（横向体检每方向 1-2 次×最多3方向 ≈ 6 次，深挖最优方向 ≤3 次；留 1 次缓冲。不要在弱方向上超额抓取）
-- 遇到 429/500、账号错误、验证码、页面阻断等系统级错误立即停止，写 failed 或 partial raw，绝不循环重试
-- 普通冷门长尾词空结果不是失败结论：允许同义词/父词重试 1 次；同类数据连续 2 次为空后写入 unfetchable_gaps
-- 不要死板遵循固定流程，灵活 Pivot（关键词、价格带、市场），但回环补采只能补 reviewer 指定字段
-
-## 数据采集原则
-1. **Level 1 方向体检**: 优先抓关键词选品、竞品基础表（便宜入口）。判断需求、购买、PPC、CVR、价格带、评论门槛、FBA占比、头部集中度。
-2. **Level 2 候选验证**: 只有方向胜出时，再做关键词反查、Amazon 商品页、Amazon 评论；同时补齐最优方向的竞品 FBA 样本分布和包装/重量尺寸摘要。
-3. **Level 3 回环补采**: 只补 brief/loopback_request 指定的 tool、keyword、asin、field；保留旧 raw，合并写回，overwrite=true。
-4. **证据最小化**: raw 输出聚合摘要、样本统计、异常说明和 source_map，不塞长评论原文或超长关键词表。
-5. **果断早停**: 如果低客单价高 PPC、需求低供给高、Review/ABA 高集中、FBA/price>25%、红线品类或广告明显倒挂，允许 EARLY_REJECT。
-
 ${counterInstruction}
-
-## 交付要求
-成功、部分成功或可评估的空结果，都在 [[TaskComplete]] 后输出 raw_data_pack YAML；系统阻断或完全不可执行时输出 failed_data_pack YAML 并说明原因。后端会自动写 raw/failed。raw_data_pack 必须包含：
-- route_decision (EARLY_REJECT | PIVOT | DEEPEN | READY_FOR_FORGE)
-- prescreen_log（每个候选方向的关键指标、强/中/弱评级、为何胜出或落选）
-- deferred_candidates（过线但本轮未深挖的方向：方向、种子词、预筛评级、为何值得后续重拾；这些不是淘汰）
-- data_audit_inputs.tools_called / sample_counts / unfetchable_gaps / outlier_notes
-- keyword_market_summary / competitor_summary / profitability_raw_estimates / review_insight_summary
-- review_insight_summary 中尽量给出 scene_vs_function_signal：评论高频词偏"好看/送礼/氛围/设计"还是偏"能用/结实/尺寸/功能"，供熔炉判定 listing_leverage
-- source_map / evidence_matrix / elimination_log
-- conversion_rate_matrix 与 candidate_products 旧字段仍要保留，方便兼容旧报告读取
-- 每个候选 ASIN 必须带 Amazon URL、售价、月销量或销量口径、review_count、rating、FBA费用或缺失说明
-- profitability_raw_estimates 必须拆分：fba_fee_samples / fba_fee_estimate_usd（来自 SellerSprite 竞品样本或基于样本估算）与 bom_estimate_per_set_usd（无法抓取，只能估算区间）。不要把 BOM 写入 unfetchable_gaps；FBA 只有在产品选品/查竞品都拿不到样本时才写入 unfetchable_gaps。
 
 ${completionInstruction}
 
@@ -1108,13 +1090,12 @@ ${completionInstruction}
     }
 
     return `你是破壁_熔炉（ProductSelectionReviewer），市场评审专家。请执行一次自动选品证据评审任务。
+请务必严格遵守你的系统提示词（如全局判决准则、Hard Gates审计、打分与数学校验原则、Listing场景代入杠杆以及交付格式要求）。
 
 run_id: ${safeRunId}
 raw_stage: raw
 success_stage: scored
 failure_stage: failed
-
-${callRhythmInstruction}
 
 ## 你的任务
 系统已在本 prompt 中注入 raw。请审计取证节点交付的证据，在 [[TaskComplete]] 后输出 scored_candidate_pack。
@@ -1125,53 +1106,6 @@ ${extraInstruction ? `\n【后端补充指令】\n${extraInstruction}` : ''}
 【后端自动加载的 raw / 鹰眼取证交接数据】
 ${rawContent}
 ==================================================
-
-## 全局判决准则
-进行”全局拼图判定”：
-- **DROP_AND_RESELECT**: 现有数据足以判断该批候选没潜力（利润低、易碎、合规风险高），或 Scout 明确标记 FETCHED_EMPTY（抓取后无有效数据）→ 彻底重选方向
-- **LOOPBACK_TO_SCOUT**: 产品有明显潜力，但缺失关键决策数据 → 打回补采
-- **PUBLISH_FINAL**: 核心证据充足，潜力明确，评分估计合格 → 放行发布
-
-## 评审打分与数学校验原则
-你必须先执行 Hard Gates，然后输出四个分数：
-- OpportunityScore：产品机会分
-- DataReliabilityScore：数据置信度分
-- ExecutionFitScore：小卖家执行适配分
-- FinalScore：最终排序分
-
-SellerSprite click_conversion_rate 是行业参考，必须保守修正。默认按小卖家/新品：base_cvr=min(raw*0.50,0.08)，stress_cvr=min(raw*0.35,0.06)。PPC 基础用 mid，压力用 high；只有单个 ppc_bid 时用 1.15x/1.35x。
-
-空数据不是自动失败。ProductSelector 可通过 SellerSprite 产品选品/查竞品拿到竞品 fba_fee、利润率、包装/重量尺寸样本；若 raw 完全缺少这些 FBA 样本，你可以对 fba_fee_samples 发起一次 LOOPBACK_TO_SCOUT。BOM/落地采购成本不是 ProductSelector 可抓字段，不得为 BOM 发起回环；只能要求给出材料与套装假设下的保守区间并降置信度。
-
-## 后端 v3 字段对齐
-financial_factors 请尽量输出这些后端稳定识别字段，避免同义字段造成默认值回退：
-- selling_price 或 main_band_anchor_usd
-- bom_estimate_per_set_usd
-- shipping_cost 或 head_freight_usd
-- fba_fee_estimate_usd
-- packaging_estimate_usd
-- referral_fee_pct
-- return_reserve_pct
-- storage_reserve_usd
-- raw_click_conversion_rate
-- ppc_bid 与 ppc_bid_stress
-
-## Listing 场景代入杠杆（listing_leverage_score，重要）
-本卖家的核心优势是 Listing 呈现能力（主图、A+、场景代入）显著强于同档竞品。但这个优势只在"购买决策由场景/情绪/呈现驱动"的产品上有效，对"纯功能/规格驱动"的产品意义不大。你必须输出 listing_leverage_score（0-1）供后端放大差异化机会分：
-- 偏 1（高杠杆）：摆件、装饰、玩具、礼品、家居氛围、收纳美学等——评论高频词偏"好看/送礼/氛围/搭配/设计"，主图与场景图能强烈影响转化。
-- 偏 0（低杠杆）：锤子、扳手、线缆、替换件、纯工具件——评论高频词偏"能用/结实/尺寸/兼容/功能"，listing 做得再好也难拉开差距。
-- 判定依据：优先用 Scout 的 review_insight_summary.scene_vs_function_signal 与差评痛点类型；无评论样本时按品类常识保守取 0.4-0.6 并说明口径。
-
-## 输出要求
-必须包含：
-- analysis_status (SUCCESS | PARTIAL | DATA_CORRUPTED)
-- final_disposition (verdict: RECOMMEND | WATCHLIST | RESEARCH_GAP | REJECT | DATA_INSUFFICIENT)
-- post_forge_action (action: PUBLISH_FINAL | LOOPBACK_TO_SCOUT | DROP_AND_RESELECT)
-- listing_leverage_score（0-1，场景代入弹性，附一句判定理由）
-- loopback_request（如回环，必须指定 missing_field/requested_tool/target_keywords/target_asins/required_fields/max_additional_tool_calls/stop_after_this_loop）
-- hard_gates / scores / score_inputs / multipliers / financial_factors / data_reliability_audit
-- business_analysis / product_optimization_directions / key_risks / kill_criteria / next_validation_steps / elimination_summary
-- 旧字段 demand_volume、differentiation_feasibility、competition_severity、compliance_risk、complexity_severity、data_confidence、financial_factors.click_conversion_rate、financial_factors.ppc_bid 仍要保留
 
 ${completionInstruction}
 
@@ -2608,6 +2542,7 @@ async function autoExtractHandoffForState(state = {}) {
     if (!briefContent) {
       return { extracted: false, completed: true, failed: true, errorText: 'coordinator completed without extractable SelectionBrief content' };
     }
+    await autoSelectionDeleteRunFile({ stage: 'failed', run_id: runId }).catch(() => { });
     await autoSelectionWriteRunFile({ stage: 'brief', run_id: runId, content: briefContent, overwrite: true });
     logWorkflowEvent(`[AutoExtractor] 从 AgentTask [${task.name}] 中成功自动提取并写回 brief 文件！`);
     return { extracted: true, stage: 'brief', task };
@@ -2623,14 +2558,18 @@ async function autoExtractHandoffForState(state = {}) {
       await fs.access(resolveAutoSelectionFile(successStage, runId));
       return { extracted: true, stage: successStage, already_exists: true };
     } catch (_) { }
-    try {
-      await fs.access(resolveAutoSelectionFile('failed', runId));
-      return { extracted: true, stage: 'failed', already_exists: true };
-    } catch (_) { }
+    const failedInfo = await statAutoSelectionFile('failed', runId);
+    if (failedInfo.exists) {
+      if (isHandoffFresh(failedInfo, state.dispatched_at)) {
+        return { extracted: true, stage: 'failed', already_exists: true };
+      }
+      await discardStaleFailedHandoff(runId, state.dispatched_at, `${successStage} 等待新交付`);
+    }
     const task = await findLatestCompletedAgentTask(runId, agentName, sinceMs);
     if (!task) return { extracted: false };
     const successPack = extractPackFromReport(task.report, successMarker);
     if (task.status === 'Succeed' && successPack) {
+      await autoSelectionDeleteRunFile({ stage: 'failed', run_id: runId }).catch(() => { });
       await autoSelectionWriteRunFile({ stage: successStage, run_id: runId, content: successPack, overwrite: true });
       logWorkflowEvent(`[AutoExtractor] 从 AgentTask [${task.name}] 中成功自动提取并写回 ${successStage} 文件！`);
       return { extracted: true, stage: successStage, task };
@@ -2905,14 +2844,15 @@ async function detectWorkerDeliveryFailure(runId, status, sinceMs = 0) {
     if (did) {
       try {
         const ar = JSON.parse(await fs.readFile(path.join(VCP_ROOT_DIR, 'VCPAsyncResults', `AgentAssistant-${did}.json`), 'utf8'));
-        errText = `${ar.status || ''} ${ar.message || ''}`;
+        if (ar.status === 'Failed') {
+          errText = ar.message || 'worker task Failed';
+        }
       } catch (_) { }
     }
     if (!errText) errText = best.content.includes('任务状态:** Failed') ? 'worker task Failed' : '';
-    // Only treat as a delivery failure if the task actually Failed, or Succeeded-but-no-output
-    // (the latter is a worker that finished its turn without writing — also a real failure).
-    const failed = best.content.includes('任务状态:** Failed');
-    if (!failed && !errText) return { found: false };
+    // Only treat as a delivery failure if the task actually Failed.
+    const failed = best.content.includes('任务状态:** Failed') || !!errText;
+    if (!failed) return { found: false };
     return { found: true, errorText: errText, errType: classifyErrorType(errText) };
   } catch (_) {
     return { found: false };
@@ -3028,6 +2968,7 @@ async function advanceRun(runId) {
 async function advancePendingBrief(runId) {
   const state = await claimRun(runId, 'coordinator:brief');
   if (!state) return;
+  await autoSelectionDeleteRunFile({ stage: 'failed', run_id: runId }).catch(() => { });
 
   let strategyContent = '';
   try {
@@ -3086,6 +3027,7 @@ async function advanceBriefing(runId) {
 
   const state = await claimRun(runId, 'backend:dispatch_scout');
   if (!state) return;
+  await autoSelectionDeleteRunFile({ stage: 'failed', run_id: runId }).catch(() => { });
   await commitTransition(state, APS_STATE.SCOUTING, 'brief ready -> scout dispatched');
   await dispatchScout(runId);
 }
@@ -3094,7 +3036,20 @@ async function advanceBriefing(runId) {
 // write hook calls triggerImmediateWorkflowTick -> advanceRun sees raw and moves to SCORING.
 // Here we only check: has raw appeared? If yes, classify route_decision and transition.
 async function advanceScouting(runId) {
-  await autoExtractHandoffForState(await readRunState(runId));
+  let currentState = await readRunState(runId);
+  await autoExtractHandoffForState(currentState);
+  currentState = await readRunState(runId) || currentState;
+
+  const failedInfo = await statAutoSelectionFile('failed', runId);
+  if (failedInfo.exists) {
+    if (!isHandoffFresh(failedInfo, currentState?.dispatched_at)) {
+      await discardStaleFailedHandoff(runId, currentState?.dispatched_at, 'SCOUTING 检测到旧失败交接');
+    } else {
+      const state = await claimRun(runId, 'backend:scout_failed');
+      if (state) await commitTransition(state, APS_STATE.FAILED, 'scout wrote failed handoff');
+      return;
+    }
+  }
 
   try {
     await fs.access(resolveAutoSelectionFile('failed', runId));
@@ -3137,6 +3092,7 @@ async function advanceScouting(runId) {
   }
 
   // Normal: raw is ready for the forge. Move to SCORING and dispatch the reviewer.
+  await autoSelectionDeleteRunFile({ stage: 'failed', run_id: runId }).catch(() => { });
   await commitTransition(state, APS_STATE.SCORING, `raw ready (route=${route || 'DEEPEN'})`);
   await dispatchReviewer(runId);
 }
@@ -3144,7 +3100,20 @@ async function advanceScouting(runId) {
 // SCORING: reviewer runs via AgentAssistant; when it writes scored, the scoring engine has
 // already run inside autoSelectionWriteRunFile. We just detect scored and move to EVALUATING.
 async function advanceScoring(runId) {
-  await autoExtractHandoffForState(await readRunState(runId));
+  let currentState = await readRunState(runId);
+  await autoExtractHandoffForState(currentState);
+  currentState = await readRunState(runId) || currentState;
+
+  const failedInfo = await statAutoSelectionFile('failed', runId);
+  if (failedInfo.exists) {
+    if (!isHandoffFresh(failedInfo, currentState?.dispatched_at)) {
+      await discardStaleFailedHandoff(runId, currentState?.dispatched_at, 'SCORING 检测到旧失败交接');
+    } else {
+      const state = await claimRun(runId, 'backend:reviewer_failed');
+      if (state) await commitTransition(state, APS_STATE.FAILED, 'reviewer wrote failed handoff');
+      return;
+    }
+  }
 
   try {
     await fs.access(resolveAutoSelectionFile('failed', runId));
@@ -3285,6 +3254,8 @@ async function advancePublishing(runId) {
   const verdictZh = verdictMap[verdictEn] || verdictEn;
 
   const prompt = `你好，破壁_枢纽。一个选品 run 已通过后端裁决，需要你发布研报并写日记。
+请务必严格遵守你的系统提示词中关于报告结构、发帖规范与日记沉淀格式的要求。
+
 【本轮裁决结论】：${verdictZh}
 
 ==================================================
@@ -3300,28 +3271,17 @@ run_id: ${runId}
 
 1. 直接使用上方“系统自动加载的 Scored 研报数据”。不要调用 AutoProductSelection 读文件命令，也不要用 FileOperator/ServerFileOperator 直读路径。
 
-2. 发布论坛帖子（VCPForum），发到「自动选品推荐板块」。这是辅助商业决策 of 研报，读者要在 3 分钟内判断"要不要投入真金白银验证"。标题：【${verdictZh}】选品研报：[产品方向] | 综合 XX/100（区间 YY-ZZ）。
-   【发帖可读性与表达规范（重要）】：
-   - 裁决汉化：正文与标题中严禁直接输出英文裁决状态（如 WATCHLIST/RECOMMEND/ACCEPTED 等），统一使用中文（如【列入观察】/【推荐立项】/【不予立项】）。
-   - 专业术语本土化：每个英文/专业指标首次出现紧跟中文解释（如"Unit Contribution（单件毛利，卖一个净赚多少）"、"ACOS（广告花费占销售额比例）"）。每个关键数字后用一句大白话或通俗理解点明含义。
-   - 去黑话：正文一律将原格式中的章节“决策摘要 TL;DR”命名为“决策摘要（核心结论）”。
-   - 通俗化数据表头：“五支柱机会拆解”表格中，严禁使用“归一化值”与“权重”作为列名，统一改成“评估分（满分10分）”与“影响权重（重要性）”。
-   - 措辞高压红线：严禁在内容中使用“说人话”、“人话”这类低俗或态度傲慢的字眼。通俗解释时改用“通俗解释：”、“直观含义：”或“通俗理解：”等专业、谦逊且友好的词汇。
-   - 新增“十二、竞品清单与详情”章节：根据头部系统自动加载的“竞品候选数据 (candidate_products)”，制作一个精美的竞品对比表格，包含竞品主图、ASIN、价格、月销量、评论数、评分、badges 以及直达跳转链接（链接必须为 https://www.amazon.com/dp/{ASIN} ）。
-     【竞品图片展示说明】：严禁调用任何截图或浏览器工具。优先使用 candidate_products 列表中对应的 image_url 字段作为 Markdown 图片链接（格式如：![图片](url)）；如果 image_url 属性缺失或为空，则在主图一列显示文字“暂无图片”或“-”，绝对不要使用已被亚马逊封锁的 legacy 链接（如 images.amazon.com/images/P/{ASIN}...）。
-   - 新增“评分依据与双评分口径”小节，放在决策摘要之后或五支柱之前。必须同时解释：
-     1) 熔炉业务评审分：OpportunityScore / DataReliabilityScore / ExecutionFitScore / FinalScore，各自代表什么，为什么这样打；
-     2) 后端 v3 棱镜分：point_estimate、pessimistic/optimistic 区间、overall_trust、五支柱 demand/competition/profit/differentiation/execution 及权重；
-     3) 若两者不一致，明确说明差异来源：熔炉是“活的业务判断/排序分”，更重视数据缺口与执行纪律；后端是“固定数学安全阀/区间模型”，把风险体现在不确定区间和 trust 中。两者都要保留，不能只展示较高分。
+2. 发布论坛帖子（VCPForum），发到「自动选品推荐板块」。标题中应包含：【${verdictZh}】选品研报。报告结构和内容格式需遵循你系统提示词中的“战略原则”、“最终报告”与“最终报告结构与内容”。
 
-   正文从 scored 提取真实数据，缺失写"未取得"，按 v3 口径组织：①决策摘要（核心结论）（含裁决+推荐动作、point_estimate与区间[pessimistic,optimistic]及overall_trust、成立理由与翻车点）②评分依据与双评分口径（熔炉业务分 + 后端棱镜分，解释差异）③五支柱拆解（需求/竞争余地/利润/差异化/执行的评估分与影响权重）④卖家Listing场景代入杠杆(listing_leverage_score及依据)⑤市场需求证据⑥竞争结构证据⑦利润与广告容错(费用表/UnitContribution/base-stress CVR-PPC-CPA/BreakEvenACOS/ad ratio)⑧差异化低成本改良⑨风险盘点(逐条标严重度)⑩数据置信度审计⑪Kill Criteria与Next Validation Plan⑫本轮淘汰与待观察记录⑬竞品清单与详情。
+   【两套分数分口径并列展示（重要）】scored 数据里含两套互补的分数，研报必须分别标注、并列呈现，不要混为一谈：
+   - **后端棱镜分（纯数学口径）**：来自 backend_math_scoring.v3_interval_decision 的 point_estimate 点估计与置信区间 [pessimistic_score, optimistic_score]。这是代码层冷血高效的几何平均结果，标题“综合 XX/100（区间 YY-ZZ）”取自这里。
+   - **熔炉评审分（业务口径）**：来自熔炉 scored_candidate_pack 的 OpportunityScore / DataReliabilityScore / ExecutionFitScore / FinalScore。这是在棱镜数学之上多加一层业务判断的结果。
+   - 两者角度不同、可能不完全一致，这是正常的；请各自标注口径来源，让读者看到“数学怎么算”和“评审怎么判”两个视角。最终中文裁决（${verdictZh}）以熔炉裁决为准。
+   - 裁决语义必须保持一致：推荐立项 = 当前工具链证据足够好，值得进入人工验证/立项验证；列入观察 = ProductSelector 可抓关键证据缺失/冲突或核心假设仍会显著改变结论。BOM 询价、USPTO/专利排雷、真人打样、Seller Central 最终 FBA 实测未完成时，只能写入 Next Validation Plan / Kill Criteria，不得写“因此定档观察而非推荐”。
 
-3. 写入选品公共日记本（DailyNote.create）。本轮只写一条合并主结论日记，极简，不要复制研报全文。必须显式传 Date 参数（YYYY-MM-DD）。Tag 行必须是 Content 最后一行。格式：
-   [${verdictZh}] 产品方向 - 核心原因
-   outcome: ${verdictZh} / product_direction: / primary_reason: / secondary_reason: / category: / price_band: / risk_tags: / opportunity_tags:
-   Tag: #状态 #主要风险 #机会标签
+3. 写入选品公共日记本（DailyNote.create）。内容必须极致精简，严格按照系统提示词中规定的 [${verdictZh}] 产品方向 - 核心原因 极简格式以及 Tag 尾行规则进行，确保传入 Date 参数。
 
-4. 完成发帖与日记后，输出 [[TaskComplete]]。后端会自动归档并结束本轮。
+4. 完成发帖与日记后，输出 [[TaskComplete]]。
 
 注意：发帖和日记内容必须从 scored 提取，不要编造。${scoredDroppedBlock}${scoredDeferredBlock}`;
 
@@ -3419,6 +3379,7 @@ async function spawnReselectRun(prevState, reason) {
 
 // Dispatch the scout for a run (brief must already exist). Used for loopback top-ups.
 async function dispatchScout(runId) {
+  await autoSelectionDeleteRunFile({ stage: 'failed', run_id: runId }).catch(() => { });
   const dispatch = await autoSelectionPrepareDispatch({ worker: 'scout', run_id: runId, overwrite_lock: true });
   if (dispatch.success && dispatch.agent_assistant_request) {
     await callAgentAssistant(dispatch.agent_assistant_request);
@@ -3427,6 +3388,7 @@ async function dispatchScout(runId) {
 
 // Dispatch the reviewer (forge) for a run whose raw is ready.
 async function dispatchReviewer(runId, opts = {}) {
+  await autoSelectionDeleteRunFile({ stage: 'failed', run_id: runId }).catch(() => { });
   const dispatch = await autoSelectionPrepareDispatch({
     worker: 'reviewer', run_id: runId, overwrite_lock: true,
     force_decision_mode: opts.forceDecision === true,
@@ -3574,7 +3536,7 @@ async function delegateToCoordinator(taskType, runId, prompt) {
       agent_name: '破壁_枢纽',
       prompt: finalPrompt,
       temporary_contact: false,
-      task_delegation: true,
+      task_delegation: taskType === 'create_brief',
       inject_tools: taskType === 'create_brief' ? '' : 'VCPForum,DailyNote'
     });
 
@@ -3769,6 +3731,49 @@ function findFirstNumber(content, keys = [], defaultValue = null) {
   return defaultValue;
 }
 
+function normalizeScore100(value, defaultValue = 50) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return defaultValue;
+  // Reviewer score_inputs have appeared in both 0-100 and 0-1 forms. Treat
+  // fractional scores as ratios so "0.80" means 80, not near-zero demand.
+  if (n > 0 && n <= 1) return n * 100;
+  return clampNumber(n);
+}
+
+function normalizeSeverity10(value, defaultValue = 5) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return defaultValue;
+  // Severity/risk fields are documented as 0-10, but older reviewer outputs used
+  // 0-1 ratios. Keep exact 1 as low severity for backwards-compatible 0-10 inputs.
+  if (n >= 0 && n < 1) return n * 10;
+  if (n > 10) return n / 10;
+  return n;
+}
+
+function stripGeneratedScoringAnnotations(content) {
+  const text = String(content || '');
+  const frontMatterMatch = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!frontMatterMatch) return text;
+
+  const lines = frontMatterMatch[1].split('\n');
+  const cleanLines = [];
+  let skipMode = false;
+  for (const line of lines) {
+    if (/^(action|original_action|total_score|backend_math_validation|backend_math_validation_v2|backend_math_scoring|warnings)\s*:/i.test(line)) {
+      skipMode = true;
+      continue;
+    }
+    if (skipMode && line.length > 0 && !/^\s/.test(line)) {
+      skipMode = false;
+    }
+    if (!skipMode && line.trim()) cleanLines.push(line);
+  }
+
+  const body = text.slice(frontMatterMatch[0].length);
+  const cleanFrontMatter = cleanLines.join('\n').trim();
+  return cleanFrontMatter ? `---\n${cleanFrontMatter}\n---${body}` : body;
+}
+
 function parseCostMetricValue(rawSpan) {
   const text = String(rawSpan || '');
   const rangeMatch = text.match(/\$?\s*(-?\d+(?:\.\d+)?)\s*(?:-|~|–|—|至|到|to)\s*\$?\s*(-?\d+(?:\.\d+)?)/i);
@@ -3827,11 +3832,161 @@ function costFromRateOrDefault(content, rateKeys = [], sellingPrice = 0, default
   return sellingPrice * defaultRate;
 }
 
-function hasAnyNumber(content, keys = []) {
-  return keys.some(key =>
-    Number.isFinite(parseFloatValue(content, key, NaN)) ||
-    Number.isFinite(parseFloatValue(content, `estimated_${key}`, NaN))
+function normalizeScore100WithAudit(value, defaultValue, fieldName, audit = []) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return clampNumber(defaultValue);
+  const normalized = clampNumber(normalizeScore100(n, defaultValue));
+  if (n > 0 && n <= 1) {
+    audit.push(`${fieldName}: ${n} 按 0-1 比例归一化为 ${normalized.toFixed(1)}/100`);
+  } else if (n < 0 || n > 100) {
+    audit.push(`${fieldName}: ${n} 超出 0-100，已钳制为 ${normalized.toFixed(1)}/100`);
+  }
+  return normalized;
+}
+
+function normalizeSeverity10WithAudit(value, defaultValue, fieldName, audit = []) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return clampNumber(defaultValue, 0, 10);
+  const normalized = clampNumber(normalizeSeverity10(n, defaultValue), 0, 10);
+  if (n >= 0 && n < 1) {
+    audit.push(`${fieldName}: ${n} 按 0-1 比例归一化为 ${normalized.toFixed(1)}/10`);
+  } else if (n > 10) {
+    audit.push(`${fieldName}: ${n} 按旧百分制严重度归一化为 ${normalized.toFixed(1)}/10`);
+  }
+  return normalized;
+}
+
+function readScore100Input(content, keys, defaultValue, fieldName, audit) {
+  const raw = findFirstNumber(content, keys, null);
+  return raw !== null
+    ? normalizeScore100WithAudit(raw, defaultValue, fieldName, audit)
+    : clampNumber(defaultValue);
+}
+
+function readSeverity10Input(content, keys, defaultValue, fieldName, audit) {
+  const raw = findFirstNumber(content, keys, null);
+  return raw !== null
+    ? normalizeSeverity10WithAudit(raw, defaultValue, fieldName, audit)
+    : clampNumber(defaultValue, 0, 10);
+}
+
+function buildCanonicalScoringInput(content) {
+  const text = String(content || '');
+  const inputNormalizationWarnings = [];
+
+  const oldDemand = findFirstNumber(text, ['demand_volume'], null);
+  const oldDifferentiation = findFirstNumber(text, ['differentiation_feasibility'], null);
+
+  const competitionSeverity = readSeverity10Input(
+    text,
+    ['competition_severity', 'CompetitionSeverity'],
+    5,
+    'competition_severity',
+    inputNormalizationWarnings
   );
+  const complianceRisk = readSeverity10Input(
+    text,
+    ['compliance_risk', 'ComplianceRisk'],
+    3,
+    'compliance_risk',
+    inputNormalizationWarnings
+  );
+  const complexitySeverity = readSeverity10Input(
+    text,
+    ['complexity_severity', 'ComplexitySeverity'],
+    5,
+    'complexity_severity',
+    inputNormalizationWarnings
+  );
+
+  const demandScore = readScore100Input(
+    text,
+    ['demand_score', 'DemandScore'],
+    oldDemand !== null ? oldDemand * 4 : 50,
+    'demand_score',
+    inputNormalizationWarnings
+  );
+  const growthScore = readScore100Input(
+    text,
+    ['growth_score', 'GrowthScore'],
+    50,
+    'growth_score',
+    inputNormalizationWarnings
+  );
+  const differentiationScore = readScore100Input(
+    text,
+    ['differentiation_score', 'DifferentiationScore'],
+    oldDifferentiation !== null ? oldDifferentiation * 4 : 50,
+    'differentiation_score',
+    inputNormalizationWarnings
+  );
+  const marketEntryDefault = clampNumber(100 - competitionSeverity * 8 - complexitySeverity * 3, 0, 100);
+  const marketEntryScore = readScore100Input(
+    text,
+    ['market_entry_score', 'MarketEntryScore'],
+    marketEntryDefault,
+    'market_entry_score',
+    inputNormalizationWarnings
+  );
+
+  const sourceReliability = findFirstNumber(text, ['source_reliability_score'], null);
+  const freshness = findFirstNumber(text, ['freshness_score'], null);
+  const sampleCoverage = findFirstNumber(text, ['sample_coverage_score'], null);
+  const crossSource = findFirstNumber(text, ['cross_source_consistency_score'], null);
+  const fieldCompleteness = findFirstNumber(text, ['field_completeness_score'], null);
+  const outlierControl = findFirstNumber(text, ['outlier_control_score'], null);
+  const explicitDataReliability = findFirstNumber(text, ['data_reliability_score', 'DataReliabilityScore'], null);
+  const oldDataConfidence = findFirstNumber(text, ['data_confidence'], null);
+
+  let dataReliabilityScore;
+  if (explicitDataReliability !== null) {
+    dataReliabilityScore = normalizeScore100WithAudit(
+      explicitDataReliability,
+      55,
+      'data_reliability_score',
+      inputNormalizationWarnings
+    );
+  } else if ([sourceReliability, freshness, sampleCoverage, crossSource, fieldCompleteness, outlierControl].some(value => value !== null)) {
+    dataReliabilityScore =
+      0.20 * normalizeScore100WithAudit(sourceReliability ?? 55, 55, 'source_reliability_score', inputNormalizationWarnings) +
+      0.15 * normalizeScore100WithAudit(freshness ?? 55, 55, 'freshness_score', inputNormalizationWarnings) +
+      0.20 * normalizeScore100WithAudit(sampleCoverage ?? 55, 55, 'sample_coverage_score', inputNormalizationWarnings) +
+      0.20 * normalizeScore100WithAudit(crossSource ?? 55, 55, 'cross_source_consistency_score', inputNormalizationWarnings) +
+      0.15 * normalizeScore100WithAudit(fieldCompleteness ?? 55, 55, 'field_completeness_score', inputNormalizationWarnings) +
+      0.10 * normalizeScore100WithAudit(outlierControl ?? 55, 55, 'outlier_control_score', inputNormalizationWarnings);
+  } else if (oldDataConfidence !== null) {
+    dataReliabilityScore = [35, 50, 70, 85][clampNumber(Math.round(oldDataConfidence), 0, 3)] || 35;
+  } else {
+    dataReliabilityScore = 55;
+  }
+
+  const explicitExecutionFit = findFirstNumber(text, ['execution_fit_score', 'ExecutionFitScore'], null);
+  const executionFitScore = explicitExecutionFit !== null
+    ? normalizeScore100WithAudit(explicitExecutionFit, 100 - complexitySeverity * 8, 'execution_fit_score', inputNormalizationWarnings)
+    : clampNumber(100 - complexitySeverity * 8);
+
+  const listingLeverageRaw = findFirstRate(
+    text,
+    ['listing_leverage_score', 'ListingLeverageScore', 'listing_leverage', 'ListingLeverage'],
+    null
+  );
+  const listingLeverage = listingLeverageRaw !== null
+    ? clamp01(listingLeverageRaw)
+    : clamp01(SCORING_CONFIG.listing_leverage_default);
+
+  return {
+    demandScore,
+    growthScore,
+    differentiationScore,
+    marketEntryScore,
+    competitionSeverity,
+    complianceRisk,
+    complexitySeverity,
+    dataReliabilityScore: clampNumber(dataReliabilityScore),
+    executionFitScore: clampNumber(executionFitScore),
+    listingLeverage,
+    inputNormalizationWarnings
+  };
 }
 
 function smoothMultiplier(value, start, end, high, low) {
@@ -3919,7 +4074,7 @@ function weightedGeometricMean(pillars, floor) {
 }
 
 function calculateScoringModel(content) {
-  const text = String(content || '');
+  const text = stripGeneratedScoringAnnotations(content);
   const warnings = [];
   const missingCriticalFields = new Set();
   // Distortion signals collected as inputs are consumed. Cold/niche products often
@@ -3930,16 +4085,20 @@ function calculateScoringModel(content) {
   // surfaced so decideBackendAction treats a low score as "low confidence" rather
   // than "proven bad economics".
   const distortionSignals = [];
-
-  const oldDemand = findFirstNumber(text, ['demand_volume'], null);
-  const oldDifferentiation = findFirstNumber(text, ['differentiation_feasibility'], null);
-  const demandScore = findFirstNumber(text, ['demand_score', 'DemandScore'], oldDemand !== null ? oldDemand * 4 : 50);
-  const growthScore = findFirstNumber(text, ['growth_score', 'GrowthScore'], 50);
-  const differentiationScore = findFirstNumber(text, ['differentiation_score', 'DifferentiationScore'], oldDifferentiation !== null ? oldDifferentiation * 4 : 50);
-  const competitionSeverity = clampNumber(findFirstNumber(text, ['competition_severity', 'CompetitionSeverity'], 5), 0, 10);
-  const complianceRisk = clampNumber(findFirstNumber(text, ['compliance_risk', 'ComplianceRisk'], 3), 0, 10);
-  const complexitySeverity = clampNumber(findFirstNumber(text, ['complexity_severity', 'ComplexitySeverity'], 5), 0, 10);
-  const marketEntryScore = findFirstNumber(text, ['market_entry_score', 'MarketEntryScore'], clampNumber(100 - competitionSeverity * 8 - complexitySeverity * 3, 0, 100));
+  const canonicalInput = buildCanonicalScoringInput(text);
+  const {
+    demandScore,
+    growthScore,
+    differentiationScore,
+    marketEntryScore,
+    competitionSeverity,
+    complianceRisk,
+    complexitySeverity,
+    listingLeverage
+  } = canonicalInput;
+  if (canonicalInput.inputNormalizationWarnings.length) {
+    warnings.push(`score_inputs 量纲已由后端统一归一化：${canonicalInput.inputNormalizationWarnings.join('；')}`);
+  }
 
   const potentialScore = clampNumber(
     0.30 * clampNumber(demandScore) +
@@ -4176,46 +4335,11 @@ function calculateScoringModel(content) {
   else mCompliance = 0.05;
   if (complianceRisk >= 8) warnings.push(`合规/侵权/平台风险极高 (compliance_risk=${complianceRisk})。`);
 
-  const explicitOpportunityScore = findFirstNumber(text, ['opportunity_score', 'OpportunityScore'], null);
-  const opportunityScore = clampNumber(
-    explicitOpportunityScore !== null && !hasAnyNumber(text, [
-      'demand_score',
-      'DemandScore',
-      'growth_score',
-      'GrowthScore',
-      'differentiation_score',
-      'DifferentiationScore',
-      'market_entry_score',
-      'MarketEntryScore'
-    ])
-      ? explicitOpportunityScore
-      : potentialScore * mProfitEffective * mCompetition * mCompliance
-  );
+  // v2 全乘法链机会分（potentialScore × M_profit × M_competition × M_compliance）已废弃。
+  // 后端唯一机会口径 = v3《棱镜》几何平均 point_estimate（见下方 Layer 2-4）。
+  // 这里不再计算 v2 opportunityScore，避免与 v3 口径并存造成"分数混乱"。
 
-  const sourceReliability = findFirstNumber(text, ['source_reliability_score'], null);
-  const freshness = findFirstNumber(text, ['freshness_score'], null);
-  const sampleCoverage = findFirstNumber(text, ['sample_coverage_score'], null);
-  const crossSource = findFirstNumber(text, ['cross_source_consistency_score'], null);
-  const fieldCompleteness = findFirstNumber(text, ['field_completeness_score'], null);
-  const outlierControl = findFirstNumber(text, ['outlier_control_score'], null);
-  const explicitDataReliability = findFirstNumber(text, ['data_reliability_score', 'DataReliabilityScore'], null);
-  const oldDataConfidence = findFirstNumber(text, ['data_confidence'], null);
-  let dataReliabilityScore;
-  if (explicitDataReliability !== null) {
-    dataReliabilityScore = explicitDataReliability;
-  } else if ([sourceReliability, freshness, sampleCoverage, crossSource, fieldCompleteness, outlierControl].some(value => value !== null)) {
-    dataReliabilityScore =
-      0.20 * clampNumber(sourceReliability ?? 55) +
-      0.15 * clampNumber(freshness ?? 55) +
-      0.20 * clampNumber(sampleCoverage ?? 55) +
-      0.20 * clampNumber(crossSource ?? 55) +
-      0.15 * clampNumber(fieldCompleteness ?? 55) +
-      0.10 * clampNumber(outlierControl ?? 55);
-  } else if (oldDataConfidence !== null) {
-    dataReliabilityScore = [35, 50, 70, 85][clampNumber(Math.round(oldDataConfidence), 0, 3)] || 35;
-  } else {
-    dataReliabilityScore = 55;
-  }
+  let dataReliabilityScore = canonicalInput.dataReliabilityScore;
   dataReliabilityScore = clampNumber(dataReliabilityScore - missingCriticalFields.size * 6);
   if (/unfetchable_gaps[\s\S]{0,2000}-\s*\S/i.test(text)) {
     dataReliabilityScore = clampNumber(dataReliabilityScore - 5);
@@ -4261,8 +4385,7 @@ function calculateScoringModel(content) {
   }
   const confidence = confidenceMultiplier(dataReliabilityScore);
 
-  const explicitExecutionFit = findFirstNumber(text, ['execution_fit_score', 'ExecutionFitScore'], null);
-  const executionFitScore = clampNumber(explicitExecutionFit !== null ? explicitExecutionFit : (100 - complexitySeverity * 8));
+  const executionFitScore = canonicalInput.executionFitScore;
   const mExecutionFit = executionMultiplier(executionFitScore);
 
   const hardGateTriggered = detectHardGateFromContent(text, complianceRisk) || estimatedUnitContribution <= 0;
@@ -4270,10 +4393,6 @@ function calculateScoringModel(content) {
 
   // --- v3 pillar aggregation (weighted geometric mean + listing leverage) ---
   const cfg = SCORING_CONFIG;
-  // listing_leverage: how scene/emotion-driven the buy decision is (0=pure spec/function,
-  // 1=pure 代入感/decor/gift). Reviewer may set listing_leverage_score directly; else default.
-  const leverageRaw = findFirstRate(text, ['listing_leverage_score', 'ListingLeverageScore', 'listing_leverage', 'ListingLeverage'], null);
-  const listingLeverage = leverageRaw !== null ? clamp01(leverageRaw) : clamp01(cfg.listing_leverage_default);
 
   // Each pillar normalized to [0,1].
   const demandPillar = clamp01(0.45 * (clampNumber(demandScore) / 100) +
@@ -4329,7 +4448,21 @@ function calculateScoringModel(content) {
     overallTrust: Number(overallTrust.toFixed(3)),
     listingLeverage: Number(listingLeverage.toFixed(3)),
     pillars: pillars.map(p => ({ key: p.key, value: Number(p.value.toFixed(3)), weight: p.weight })),
-    opportunityScore: Math.round(opportunityScore),
+    canonicalScoreInputs: {
+      demand_score: Math.round(demandScore),
+      growth_score: Math.round(growthScore),
+      differentiation_score: Math.round(differentiationScore),
+      market_entry_score: Math.round(marketEntryScore),
+      competition_severity: Number(competitionSeverity.toFixed(1)),
+      compliance_risk: Number(complianceRisk.toFixed(1)),
+      complexity_severity: Number(complexitySeverity.toFixed(1)),
+      data_reliability_score: Math.round(dataReliabilityScore),
+      execution_fit_score: Math.round(executionFitScore),
+      listing_leverage_score: Number(listingLeverage.toFixed(3))
+    },
+    inputNormalizationWarnings: canonicalInput.inputNormalizationWarnings,
+    // opportunityScore 现在等于 v3 棱镜点估计（不再是 v2 乘法链），保留字段名只为旧读取器兼容。
+    opportunityScore: Math.round(pointEstimate),
     dataReliabilityScore: Math.round(dataReliabilityScore),
     executionFitScore: Math.round(executionFitScore),
     finalScore: totalScore,
@@ -4453,7 +4586,7 @@ function updateScoredContentWithMath(content, scoreResults, action, originalActi
   let skipMode = false;
   for (const line of lines) {
     const trimmed = line.trim();
-    if (/^(action|total_score|backend_math_validation|backend_math_validation_v2|warnings)\s*:/i.test(line)) {
+    if (/^(action|total_score|backend_math_validation|backend_math_validation_v2|backend_math_scoring|warnings)\s*:/i.test(line)) {
       skipMode = true;
       continue;
     }
@@ -4474,8 +4607,7 @@ function updateScoredContentWithMath(content, scoreResults, action, originalActi
     `  scoring_version: ${scoreResults.scoringVersion}`,
     `  total_score: ${scoreResults.totalScore}`,
     `  final_score: ${scoreResults.finalScore}`,
-    `backend_math_validation_v2:`,
-    `  opportunity_score: ${scoreResults.opportunityScore}`,
+    `backend_math_scoring:`,
     `  data_reliability_score: ${scoreResults.dataReliabilityScore}`,
     `  execution_fit_score: ${scoreResults.executionFitScore}`,
     `  final_score: ${scoreResults.finalScore}`,
@@ -4485,6 +4617,9 @@ function updateScoredContentWithMath(content, scoreResults, action, originalActi
     `  data_distortion_suspected: ${scoreResults.dataDistortionSuspected === true}`,
     ...(scoreResults.distortionSignals && scoreResults.distortionSignals.length
       ? ['  distortion_signals:', ...scoreResults.distortionSignals.map(s => `    - "${yamlString(s)}"`)]
+      : []),
+    ...(scoreResults.inputNormalizationWarnings && scoreResults.inputNormalizationWarnings.length
+      ? ['  input_normalization:', ...scoreResults.inputNormalizationWarnings.map(s => `    - "${yamlString(s)}"`)]
       : []),
     ...(scoreResults.scoringVersion === 'v3'
       ? [
@@ -4499,13 +4634,11 @@ function updateScoredContentWithMath(content, scoreResults, action, originalActi
         ...(scoreResults.pillars || []).map(p => `    ${p.key}: ${p.value} (w=${p.weight})`)
       ]
       : []),
-    `  multipliers:`,
+    // 仅保留 v3 profit 支柱实际消费的利润乘数；v2 的 competition/compliance/confidence/execution
+    // 乘数已不参与 v3 几何平均评分，删除以免混入第三套口径。
+    `  profit_multipliers:`,
     `    profit: ${scoreResults.mProfit.toFixed(3)}`,
     `    profit_effective: ${scoreResults.mProfitEffective.toFixed(3)}`,
-    `    competition: ${scoreResults.mCompetition.toFixed(3)}`,
-    `    compliance: ${scoreResults.mCompliance.toFixed(3)}`,
-    `    confidence: ${scoreResults.mConfidence.toFixed(3)}`,
-    `    execution_fit: ${scoreResults.mExecutionFit.toFixed(3)}`,
     `  financials:`,
     `    selling_price: ${scoreResults.sellingPrice.toFixed(2)}`,
     `    bom_cost: ${scoreResults.bomCost.toFixed(2)}`,
