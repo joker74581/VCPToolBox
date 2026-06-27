@@ -51,6 +51,10 @@
         "description": "Search the local SellerSprite US category index for precise product-research subcategories. This command does not open Chrome and does not apply product filters. Use it when the product keyword is a specific product shape or is likely cross-category (for example coffee, case, cover, rack, storage), when all-category results are mixed, or when the user asks to limit a product category. Parameters: query/keyword, maxResults default 8, leafOnly default true, optional topCategory. Return candidates with enPath, cnPath, full nodeIdPath, productCount, depth, isLeaf, score. Pick the best nodeIdPath and pass it to run_sellersprite_research together with the original keywords and price/sales/review filters. Do not use this command for run_sellersprite_keyword_research; keyword research only supports top-level departments."
       },
       {
+        "command": "resolve_sellersprite_category_path",
+        "description": "Resolve a SellerSprite category breadcrumb or nodeIdPath to the local category index without opening Chrome. Parameters: nodeIdPath, enPath, cnPath, or query. Returns the canonical nodeIdPath, enPath, cnPath, topCategory, match type, confidence, and alternatives. Useful for validating category breadcrumbs extracted from product-research DOM rows."
+      },
+      {
         "command": "run_sellersprite_competitor_lookup",
         "description": "Run SellerSprite competitor-lookup: build https://www.sellersprite.com/v3/competitor-lookup with market, monthName default bsr_sales_nearly, ASIN/product URL, keywords, includeBrands, includeSellers, optional nodeIdPaths, then open through ChromeBridge and return the same token-efficient merged ASIN table as run_sellersprite_research. Key parameters: asin/asins/product_url, keywords, brand/includeBrands, seller/includeSellers, market, size, maxCandidates, result_mode. Debug/full or include_candidates=true returns raw candidate JSON."
       },

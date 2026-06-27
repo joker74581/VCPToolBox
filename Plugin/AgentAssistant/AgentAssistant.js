@@ -98,10 +98,10 @@ function migrateEnvToJson() {
         const fixEscaped = (val) => {
             if (typeof val !== 'string') return val;
             return val.replace(/\\"/g, '"')
-                      .replace(/\\'/g, "'")
-                      .replace(/\\\\/g, '\\')
-                      .replace(/\\n/g, '\n')
-                      .replace(/\\r/g, '\r');
+                .replace(/\\'/g, "'")
+                .replace(/\\\\/g, '\\')
+                .replace(/\\n/g, '\n')
+                .replace(/\\r/g, '\r');
         };
 
         const configJson = {
@@ -265,23 +265,23 @@ function awardAgentPoints(agentBaseName, agentName, points, reason) {
                 scores = JSON.parse(fileContent);
             }
         }
-        
+
         if (!scores[agentBaseName]) {
             scores[agentBaseName] = { name: agentName, totalPoints: 0, history: [] };
         }
-        
+
         scores[agentBaseName].totalPoints += points;
         scores[agentBaseName].history.push({
             time: new Date().toISOString(),
             pointsDelta: points,
             reason: reason
         });
-        
+
         // 保留最近 50 条历史获取记录
         if (scores[agentBaseName].history.length > 50) {
             scores[agentBaseName].history.shift();
         }
-        
+
         fs.writeFileSync(AGENT_SCORES_FILE, JSON.stringify(scores, null, 4), 'utf-8');
         if (DEBUG_MODE) console.error(`[AgentAssistant] Awarded ${points} points to ${agentName}. Total: ${scores[agentBaseName].totalPoints}`);
     } catch (e) {

@@ -5,7 +5,11 @@ const { normalizeArgs, parseBoolean, SUPPORTED_TOP_LEVEL_CATEGORIES } = require(
 const { normalizeKeywordArgs, normalizeKeywordReverseArgs, normalizeKeywordConversionRateArgs } = require('./lib/keywordFilterNormalizer');
 const { parsePageInfo, parseKeywordPageInfo, normalizeKeywordTableData, normalizeKeywordReverseTableData, normalizeKeywordConversionRateTableData } = require('./lib/pageInfoParser');
 const { getSite, listSites } = require('./lib/siteRegistry');
-const { searchSellerSpriteCategories, getSellerSpriteCategoryIndexInfo } = require('./lib/sellerspriteCategorySearch');
+const {
+  searchSellerSpriteCategories,
+  resolveSellerSpriteCategoryPath,
+  getSellerSpriteCategoryIndexInfo
+} = require('./lib/sellerspriteCategorySearch');
 
 let pluginConfig = {};
 let debugMode = false;
@@ -75,8 +79,12 @@ const PRODUCT_CANDIDATE_FIELDS = [
   'pkg_weight_info',
   'category_top',
   'category_path',
+  'category_en_path',
+  'category_cn_path',
   'category_node_id_path',
-  'category_top_node_id'
+  'category_top_node_id',
+  'category_match_source',
+  'category_match_confidence'
 ];
 
 function nowIso() {
@@ -462,6 +470,14 @@ function buildSummary({ url, parsed, normalized, warnings = [], title = '# 卖�
         sellerDetails.push(`包装: ${item.pkg_weight_info}`);
       }
       const sellerCol = sellerDetails.length > 0 ? sellerDetails.join('<br>') : '-';
+      const categoryDetails = [];
+      if (item.category_path || item.category_en_path || item.category_top) {
+        categoryDetails.push(item.category_path || item.category_en_path || item.category_top);
+      }
+      if (item.category_node_id_path) {
+        categoryDetails.push(`<small>${item.category_node_id_path}</small>`);
+      }
+      const categoryCol = categoryDetails.length > 0 ? categoryDetails.join('<br>') : '-';
 
       const cells = [
         index + 1,
@@ -477,7 +493,7 @@ function buildSummary({ url, parsed, normalized, warnings = [], title = '# 卖�
         fbaCol,
         putawayCol,
         sellerCol,
-        escapeMarkdownCell(item.category_top || item.category_path)
+        escapeMarkdownCell(categoryCol)
       ];
       lines.push(`| ${cells.map(escapeMarkdownCell).join(' | ')} |`);
     });
@@ -1080,6 +1096,100 @@ function extractAsinFromProductText(text, data = {}) {
   return match ? match[0].toUpperCase() : null;
 }
 
+function firstMatchText(text, pattern) {
+  const match = String(text || '').match(pattern);
+  return match ? normalizeCellText(match[1]).replace(/^[:：]\s*/, '').trim() : '';
+}
+
+function extractSellerSpriteCategoryEvidence(row) {
+  const data = row?.data || {};
+  const sourceText = [
+    data.category_path,
+    data.category_en_path,
+    data.category_cn_path,
+    row?.text,
+    row?.detail,
+    Array.isArray(row?.values) ? row.values.join(' ') : ''
+  ].filter(Boolean).join(' ');
+
+  const enPath = data.category_en_path || data.category_path || firstMatchText(
+    sourceText,
+    /浏览(?:该类目商品|同类目)\s*[:：]?\s*([\s\S]{2,260}?)(?=\s*(?:中文类目名|所属类目|市场周期|SPR|标题密度|$))/i
+  );
+  const cnPath = data.category_cn_path || firstMatchText(
+    sourceText,
+    /中文类目名\s*[:：]?\s*([\s\S]{2,180}?)(?=\s*(?:浏览该类目商品|浏览同类目|所属类目|市场周期|SPR|标题密度|$))/i
+  );
+
+  return {
+    enPath: enPath || '',
+    cnPath: cnPath || ''
+  };
+}
+
+function resolveProductCategory(row) {
+  const data = row?.data || {};
+  if (data.category_node_id_path) {
+    const resolved = resolveSellerSpriteCategoryPath({
+      nodeIdPath: data.category_node_id_path,
+      enPath: data.category_en_path || data.category_path,
+      cnPath: data.category_cn_path
+    });
+    const category = resolved?.category;
+    if (category?.nodeIdPath) {
+      return {
+        category_top: category.topCategory?.en || data.category_top || null,
+        category_path: category.enPath || data.category_path || data.category_en_path || null,
+        category_en_path: category.enPath || data.category_en_path || data.category_path || null,
+        category_cn_path: category.cnPath || data.category_cn_path || null,
+        category_node_id_path: category.nodeIdPath,
+        category_top_node_id: category.topCategory?.nodeId || data.category_top_node_id || null,
+        category_match_source: category.match?.type || data.category_match_source || 'dom_breadcrumb_href',
+        category_match_confidence: category.match?.confidence ?? data.category_match_confidence ?? 1
+      };
+    }
+    return {
+      category_path: data.category_path || data.category_en_path || null,
+      category_en_path: data.category_en_path || data.category_path || null,
+      category_cn_path: data.category_cn_path || null,
+      category_node_id_path: data.category_node_id_path,
+      category_top_node_id: data.category_top_node_id || null,
+      category_top: data.category_top || null,
+      category_match_source: data.category_match_source || 'dom_data',
+      category_match_confidence: data.category_match_confidence || null
+    };
+  }
+
+  const evidence = extractSellerSpriteCategoryEvidence(row);
+  if (!evidence.enPath && !evidence.cnPath) return null;
+
+  const resolved = resolveSellerSpriteCategoryPath({
+    enPath: evidence.enPath,
+    cnPath: evidence.cnPath
+  });
+  const category = resolved?.category;
+  if (!category?.nodeIdPath) {
+    return {
+      category_path: evidence.enPath || null,
+      category_en_path: evidence.enPath || null,
+      category_cn_path: evidence.cnPath || null,
+      category_match_source: 'dom_text_unresolved',
+      category_match_confidence: 0
+    };
+  }
+
+  return {
+    category_top: category.topCategory?.en || null,
+    category_path: category.enPath || evidence.enPath || null,
+    category_en_path: category.enPath || evidence.enPath || null,
+    category_cn_path: category.cnPath || evidence.cnPath || null,
+    category_node_id_path: category.nodeIdPath,
+    category_top_node_id: category.topCategory?.nodeId || null,
+    category_match_source: category.match?.type || 'dom_text',
+    category_match_confidence: category.match?.confidence ?? null
+  };
+}
+
 function normalizeProductTableData(tableData, maxCandidates) {
   const headers = Array.isArray(tableData?.headers) ? tableData.headers.map(normalizeCellText) : [];
   const rows = Array.isArray(tableData?.rows) ? tableData.rows : [];
@@ -1172,10 +1282,10 @@ function normalizeProductTableData(tableData, maxCandidates) {
       if (row.data.image_url) result.image_url = row.data.image_url;
     }
 
-    if (row?.data?.category_top) result.category_top = row.data.category_top;
-    if (row?.data?.category_path) result.category_path = row.data.category_path;
-    if (row?.data?.category_node_id_path) result.category_node_id_path = row.data.category_node_id_path;
-    if (row?.data?.category_top_node_id) result.category_top_node_id = row.data.category_top_node_id;
+    const resolvedCategory = resolveProductCategory(row);
+    if (resolvedCategory) {
+      Object.assign(result, resolvedCategory);
+    }
     return result;
   }).filter(Boolean);
 }
@@ -1264,6 +1374,20 @@ async function handleSearchSellerSpriteCategories(args) {
     success: result.success !== false,
     query: result.query,
     result_count: Array.isArray(result.categories) ? result.categories.length : 0
+  };
+  return result;
+}
+
+async function handleResolveSellerSpriteCategoryPath(args) {
+  const result = resolveSellerSpriteCategoryPath(args);
+  lastRun = {
+    command: 'resolve_sellersprite_category_path',
+    site: 'sellersprite',
+    timestamp: nowIso(),
+    success: result.success !== false,
+    enPath: result.enPath,
+    cnPath: result.cnPath,
+    nodeIdPath: result.category?.nodeIdPath || null
   };
   return result;
 }
@@ -3639,6 +3763,8 @@ async function processToolCall(args = {}) {
         return await handleBuildSellerSpriteUrl(args);
       case 'search_sellersprite_categories':
         return await handleSearchSellerSpriteCategories(args);
+      case 'resolve_sellersprite_category_path':
+        return await handleResolveSellerSpriteCategoryPath(args);
       case 'run_sellersprite_competitor_lookup':
         return await enqueueBrowserTask(command, () => runSellerSpriteCompetitorLookup(args));
       case 'build_sellersprite_competitor_url':
@@ -3675,6 +3801,7 @@ async function processToolCall(args = {}) {
             'run_sellersprite_research',
             'build_sellersprite_url',
             'search_sellersprite_categories',
+            'resolve_sellersprite_category_path',
             'run_sellersprite_competitor_lookup',
             'build_sellersprite_competitor_url',
             'run_sellersprite_keyword_research',

@@ -1,0 +1,1077 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AutoProductSelection 自动选品系统演示</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #121a2d;
+      --panel-2: #18243a;
+      --ink: #f5f7fb;
+      --muted: #c4ccdc;
+      --dim: #8f9bb2;
+      --cyan: #35d6d0;
+      --green: #72e08b;
+      --amber: #ffcc66;
+      --orange: #ff8f5f;
+      --red: #ff647c;
+      --blue: #7aa7ff;
+      --line: rgba(255, 255, 255, 0.14);
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      background:
+        radial-gradient(circle at 14% 18%, rgba(53, 214, 208, 0.12), transparent 28%),
+        radial-gradient(circle at 86% 78%, rgba(255, 204, 102, 0.10), transparent 28%),
+        linear-gradient(135deg, #080c17 0%, var(--bg) 46%, #10131f 100%);
+      color: var(--ink);
+      font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      overflow: hidden;
+    }
+
+    body::before,
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    body::before {
+      background:
+        linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.026) 1px, transparent 1px);
+      background-size: 64px 64px;
+      mask-image: linear-gradient(180deg, rgba(0,0,0,0.65), rgba(0,0,0,0.12));
+      animation: gridDrift 22s linear infinite;
+    }
+
+    body::after {
+      background: linear-gradient(180deg, transparent, rgba(53,214,208,0.10), transparent);
+      height: 34vh;
+      top: -38vh;
+      opacity: 0.52;
+      animation: scanSweep 8s ease-in-out infinite;
+    }
+
+    .deck {
+      height: 100vh;
+      width: 100vw;
+      overflow: hidden;
+      position: relative;
+      z-index: 1;
+    }
+
+    .slide {
+      display: none;
+      height: 100vh;
+      width: 100vw;
+      padding: 4.4vh 5.2vw;
+      position: absolute;
+      inset: 0;
+    }
+
+    .slide.active {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 2.8vh;
+      animation: slideIn 360ms cubic-bezier(.2,.7,.2,1);
+    }
+
+    .slide.active header,
+    .slide.active .content,
+    .slide.active footer {
+      animation: liftIn 420ms cubic-bezier(.2,.7,.2,1) both;
+    }
+
+    .slide.active .content { animation-delay: 80ms; }
+    .slide.active footer { animation-delay: 150ms; }
+
+    .slide.active .card,
+    .slide.active .node,
+    .slide.active .list li,
+    .slide.active .matrix div,
+    .slide.active .score-bar {
+      animation: itemRise 460ms cubic-bezier(.2,.7,.2,1) both;
+    }
+
+    .slide.active .card:nth-child(2),
+    .slide.active .node:nth-child(3),
+    .slide.active .list li:nth-child(2),
+    .slide.active .score-bar:nth-child(2) { animation-delay: 80ms; }
+    .slide.active .card:nth-child(3),
+    .slide.active .node:nth-child(5),
+    .slide.active .list li:nth-child(3),
+    .slide.active .score-bar:nth-child(3) { animation-delay: 140ms; }
+    .slide.active .card:nth-child(4),
+    .slide.active .node:nth-child(7),
+    .slide.active .list li:nth-child(4),
+    .slide.active .score-bar:nth-child(4) { animation-delay: 200ms; }
+    .slide.active .score-bar:nth-child(5) { animation-delay: 260ms; }
+
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateX(18px) scale(0.992); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes liftIn {
+      from { opacity: 0; transform: translateY(14px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes itemRise {
+      from { opacity: 0; transform: translateY(18px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes gridDrift {
+      from { background-position: 0 0, 0 0; }
+      to { background-position: 64px 64px, 64px 64px; }
+    }
+
+    @keyframes scanSweep {
+      0%, 12% { transform: translateY(0); opacity: 0; }
+      45% { opacity: 0.48; }
+      88%, 100% { transform: translateY(150vh); opacity: 0; }
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 32px;
+      min-height: 88px;
+    }
+
+    .kicker {
+      color: var(--cyan);
+      font-size: clamp(22px, 1.7vw, 30px);
+      font-weight: 800;
+      letter-spacing: 0;
+      margin-bottom: 12px;
+    }
+
+    h1, h2, h3, p { margin: 0; }
+    h1 {
+      font-size: clamp(58px, 6.4vw, 112px);
+      line-height: 0.96;
+      letter-spacing: 0;
+      max-width: 1180px;
+    }
+
+    h2 {
+      font-size: clamp(44px, 4.2vw, 74px);
+      line-height: 1.06;
+      letter-spacing: 0;
+      max-width: 1260px;
+    }
+
+    h3 {
+      font-size: clamp(30px, 2.3vw, 42px);
+      line-height: 1.12;
+      letter-spacing: 0;
+    }
+
+    p, li, .big-text {
+      font-size: clamp(27px, 2.05vw, 38px);
+      line-height: 1.36;
+      letter-spacing: 0;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: clamp(22px, 1.65vw, 30px);
+      line-height: 1.36;
+    }
+
+    .tiny {
+      color: var(--dim);
+      font-size: clamp(18px, 1.25vw, 22px);
+      line-height: 1.35;
+    }
+
+    .content {
+      align-self: center;
+      min-height: 0;
+    }
+
+    .title-layout {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 4vw;
+      align-items: center;
+    }
+
+    .hero-mark {
+      height: min(58vh, 640px);
+      border: 2px solid var(--line);
+      background:
+        linear-gradient(145deg, rgba(53, 214, 208, 0.16), transparent 34%),
+        linear-gradient(320deg, rgba(255, 100, 124, 0.13), transparent 42%),
+        rgba(18, 26, 45, 0.86);
+      box-shadow: var(--shadow);
+      position: relative;
+      overflow: hidden;
+      border-radius: 8px;
+      animation: panelGlow 5s ease-in-out infinite;
+    }
+
+    .hero-mark::before,
+    .hero-mark::after {
+      content: "";
+      position: absolute;
+      border: 2px solid rgba(255,255,255,0.16);
+      transform: rotate(34deg);
+    }
+
+    .hero-mark::before {
+      width: 70%;
+      height: 70%;
+      left: 16%;
+      top: 13%;
+      background: linear-gradient(135deg, rgba(122, 167, 255, 0.18), transparent);
+    }
+
+    .hero-mark::after {
+      width: 42%;
+      height: 42%;
+      left: 28%;
+      top: 29%;
+      background: rgba(255, 204, 102, 0.10);
+    }
+
+    .hero-stack {
+      position: absolute;
+      inset: 11%;
+      display: grid;
+      grid-template-rows: repeat(4, 1fr);
+      gap: 18px;
+      transform: rotate(-4deg);
+    }
+
+    .hero-stack span {
+      border: 1px solid rgba(255,255,255,0.2);
+      background: rgba(8, 12, 23, 0.55);
+      display: flex;
+      align-items: center;
+      padding-left: 30px;
+      font-size: clamp(26px, 2vw, 36px);
+      font-weight: 800;
+      animation: dataBlink 4.8s ease-in-out infinite;
+    }
+
+    .hero-stack span:nth-child(2) { animation-delay: 350ms; }
+    .hero-stack span:nth-child(3) { animation-delay: 700ms; }
+    .hero-stack span:nth-child(4) { animation-delay: 1050ms; }
+
+    .tag-row { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 34px; }
+    .tag {
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.06);
+      color: var(--muted);
+      padding: 10px 16px;
+      font-size: clamp(21px, 1.5vw, 28px);
+      font-weight: 700;
+      border-radius: 4px;
+    }
+
+    .grid-2, .grid-3, .grid-4 {
+      display: grid;
+      gap: 24px;
+      align-items: stretch;
+    }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .card {
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(24, 36, 58, 0.92), rgba(18, 26, 45, 0.92));
+      border-radius: 8px;
+      padding: 28px;
+      box-shadow: 0 14px 40px rgba(0,0,0,0.20);
+      min-width: 0;
+      transition: transform 180ms ease, border-color 180ms ease, background 180ms ease;
+    }
+
+    .card:hover {
+      transform: translateY(-4px);
+      border-color: rgba(53, 214, 208, 0.36);
+      background: linear-gradient(180deg, rgba(28, 44, 70, 0.96), rgba(18, 26, 45, 0.94));
+    }
+
+    .card h3 { margin-bottom: 18px; }
+    .card p { color: var(--muted); }
+    .accent-cyan { border-top: 8px solid var(--cyan); }
+    .accent-green { border-top: 8px solid var(--green); }
+    .accent-amber { border-top: 8px solid var(--amber); }
+    .accent-red { border-top: 8px solid var(--red); }
+    .accent-blue { border-top: 8px solid var(--blue); }
+    .accent-orange { border-top: 8px solid var(--orange); }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      gap: 16px;
+      align-items: center;
+    }
+
+    .node {
+      min-height: 190px;
+      border: 1px solid var(--line);
+      background: rgba(18, 26, 45, 0.88);
+      border-radius: 8px;
+      padding: 22px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .node::after {
+      content: "";
+      position: absolute;
+      inset: auto 14% 0;
+      height: 3px;
+      background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+      opacity: 0.78;
+      animation: nodePulse 3.2s ease-in-out infinite;
+    }
+
+    .node strong {
+      font-size: clamp(27px, 2vw, 38px);
+      line-height: 1.1;
+      display: block;
+      margin-bottom: 12px;
+    }
+
+    .node span {
+      color: var(--muted);
+      font-size: clamp(20px, 1.45vw, 28px);
+      line-height: 1.25;
+    }
+
+    .arrow {
+      color: var(--cyan);
+      font-size: clamp(34px, 3vw, 52px);
+      text-align: center;
+      font-weight: 900;
+    }
+
+    .list {
+      display: grid;
+      gap: 22px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .list li {
+      border-left: 8px solid var(--cyan);
+      background: rgba(255,255,255,0.055);
+      padding: 20px 24px;
+      border-radius: 6px;
+    }
+
+    .list li:nth-child(2) { border-left-color: var(--amber); }
+    .list li:nth-child(3) { border-left-color: var(--green); }
+    .list li:nth-child(4) { border-left-color: var(--red); }
+    .list li:nth-child(5) { border-left-color: var(--blue); }
+
+    .matrix {
+      display: grid;
+      grid-template-columns: 0.8fr repeat(3, 1fr);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: rgba(18, 26, 45, 0.8);
+    }
+
+    .matrix div {
+      padding: 20px;
+      border-right: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      min-height: 92px;
+      display: flex;
+      align-items: center;
+      font-size: clamp(24px, 1.8vw, 34px);
+      line-height: 1.25;
+    }
+
+    .matrix div:nth-child(4n) { border-right: none; }
+    .matrix .head {
+      color: var(--cyan);
+      font-weight: 900;
+      background: rgba(53, 214, 208, 0.08);
+    }
+
+    .formula {
+      border: 1px solid rgba(53, 214, 208, 0.38);
+      background: rgba(53, 214, 208, 0.08);
+      color: var(--ink);
+      border-radius: 8px;
+      padding: 28px 32px;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: clamp(30px, 2.5vw, 48px);
+      line-height: 1.28;
+      overflow-wrap: anywhere;
+    }
+
+    .score-bars { display: grid; gap: 20px; }
+    .score-bar {
+      display: grid;
+      grid-template-columns: 260px 1fr 90px;
+      gap: 18px;
+      align-items: center;
+    }
+
+    .score-bar span {
+      font-size: clamp(23px, 1.7vw, 32px);
+      color: var(--muted);
+    }
+
+    .track {
+      height: 30px;
+      background: rgba(255,255,255,0.10);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    .fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--cyan), var(--green));
+      transform-origin: left center;
+      animation: barBreath 3.8s ease-in-out infinite;
+    }
+
+    .decision {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .decision .card { min-height: 280px; }
+    .big-number {
+      display: block;
+      font-size: clamp(56px, 5vw, 88px);
+      line-height: 0.95;
+      font-weight: 900;
+      color: var(--cyan);
+      margin-bottom: 18px;
+    }
+
+    footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      color: var(--dim);
+      min-height: 38px;
+    }
+
+    .controls {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+
+    button {
+      appearance: none;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.08);
+      color: var(--ink);
+      border-radius: 4px;
+      min-width: 54px;
+      height: 44px;
+      font-size: 24px;
+      cursor: pointer;
+    }
+
+    button:hover { background: rgba(53,214,208,0.18); }
+    .progress {
+      height: 6px;
+      position: fixed;
+      left: 0;
+      bottom: 0;
+      width: 100%;
+      background: rgba(255,255,255,0.10);
+    }
+    .progress span {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: linear-gradient(90deg, var(--cyan), var(--amber), var(--red));
+      transition: width 180ms ease;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .progress span::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.65), transparent);
+      transform: translateX(-100%);
+      animation: progressShine 2.6s ease-in-out infinite;
+    }
+
+    code {
+      color: var(--amber);
+      font-family: "SFMono-Regular", Consolas, monospace;
+    }
+
+    .quote {
+      font-size: clamp(34px, 3vw, 54px);
+      line-height: 1.24;
+      font-weight: 850;
+      padding: 36px;
+      border-left: 10px solid var(--amber);
+      background: rgba(255, 204, 102, 0.08);
+      border-radius: 8px;
+      animation: quoteGlow 4.8s ease-in-out infinite;
+    }
+
+    .source-list {
+      display: grid;
+      gap: 16px;
+      color: var(--muted);
+      font-size: clamp(22px, 1.6vw, 30px);
+      line-height: 1.35;
+    }
+
+    @media (max-width: 980px) {
+      body { overflow: auto; }
+      .deck { height: auto; overflow: visible; }
+      .slide, .slide.active {
+        position: relative;
+        min-height: 100vh;
+        height: auto;
+        display: grid;
+      }
+      .slide { display: none; }
+      .title-layout, .grid-2, .grid-3, .grid-4, .decision {
+        grid-template-columns: 1fr;
+      }
+      .flow { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); }
+      .matrix { grid-template-columns: 1fr; }
+      .matrix div { border-right: none; }
+      .score-bar { grid-template-columns: 1fr; }
+    }
+
+    @keyframes panelGlow {
+      0%, 100% { box-shadow: var(--shadow); }
+      50% { box-shadow: 0 28px 96px rgba(53, 214, 208, 0.20); }
+    }
+
+    @keyframes dataBlink {
+      0%, 100% { border-color: rgba(255,255,255,0.2); color: var(--ink); }
+      48%, 56% { border-color: rgba(53,214,208,0.62); color: #ffffff; }
+    }
+
+    @keyframes nodePulse {
+      0%, 100% { transform: scaleX(0.25); opacity: 0.18; }
+      50% { transform: scaleX(1); opacity: 0.86; }
+    }
+
+    @keyframes barBreath {
+      0%, 100% { filter: saturate(1); }
+      50% { filter: saturate(1.35) brightness(1.12); }
+    }
+
+    @keyframes progressShine {
+      0%, 35% { transform: translateX(-100%); }
+      70%, 100% { transform: translateX(100%); }
+    }
+
+    @keyframes quoteGlow {
+      0%, 100% { border-left-color: var(--amber); }
+      50% { border-left-color: var(--cyan); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 1ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 1ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
+
+    @media print {
+      body { overflow: visible; background: #fff; color: #111; }
+      .deck { height: auto; overflow: visible; }
+      .slide, .slide.active {
+        display: grid;
+        position: relative;
+        page-break-after: always;
+        background: #0b1020;
+        color: var(--ink);
+      }
+      footer .controls, .progress { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="deck" aria-live="polite">
+    <section class="slide active">
+      <header>
+        <div>
+          <div class="kicker">AutoProductSelection · VCPToolBox</div>
+          <h1>自动选品系统演示</h1>
+        </div>
+      </header>
+      <div class="content title-layout">
+        <div>
+          <p class="big-text">从“抓数据后总结”升级为一套可回环、可审计、会沉淀经验的选品决策系统。</p>
+          <div class="tag-row">
+            <span class="tag">三 Agent 协作</span>
+            <span class="tag">Min Evidence Pack</span>
+            <span class="tag">v3 棱镜评分</span>
+            <span class="tag">公共记忆闭环</span>
+          </div>
+        </div>
+        <div class="hero-mark" aria-hidden="true">
+          <div class="hero-stack">
+            <span>Brief / 假设</span>
+            <span>Raw / 取证</span>
+            <span>Scored / 审判</span>
+            <span>Diary / 记忆</span>
+          </div>
+        </div>
+      </div>
+      <footer><span>适合投影阅读：正文大字号、单页单主题</span><span>← → 翻页</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">一句话</div><h2>这不是爬虫，是小卖家选品决策流水线</h2></div></header>
+      <div class="content">
+        <div class="quote">系统把“市场机会、数据可信度、执行适配、广告压力、历史经验”拆开判断，再用后端数学安全阀兜住误判。</div>
+      </div>
+      <footer><span>核心目标：推荐进入人工验证，而不是替代人工下单</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">全链路</div><h2>从触发到沉淀：一个闭环</h2></div></header>
+      <div class="content">
+        <div class="flow">
+          <div class="node accent-blue"><strong>触发</strong><span>定时任务或手动启动</span></div>
+          <div class="arrow">›</div>
+          <div class="node accent-cyan"><strong>枢纽</strong><span>读策略与记忆，生成 Brief</span></div>
+          <div class="arrow">›</div>
+          <div class="node accent-green"><strong>鹰眼</strong><span>调用 ProductSelector，输出 raw</span></div>
+          <div class="arrow">›</div>
+          <div class="node accent-amber"><strong>熔炉</strong><span>审计评分，输出 scored</span></div>
+        </div>
+        <div style="height:24px"></div>
+        <div class="flow">
+          <div class="node accent-red"><strong>后端</strong><span>棱镜安全阀：发布 / 回环 / 换方向</span></div>
+          <div class="arrow">›</div>
+          <div class="node accent-orange"><strong>枢纽</strong><span>发布研报，写公共日记</span></div>
+          <div class="arrow">›</div>
+          <div class="node accent-cyan"><strong>记忆</strong><span>下轮自动召回经验与避坑</span></div>
+          <div class="arrow">›</div>
+          <div class="node accent-blue"><strong>下一轮</strong><span>更少重复，更快收敛</span></div>
+        </div>
+      </div>
+      <footer><span>状态机：PENDING_BRIEF → BRIEFING → SCOUTING → SCORING → EVALUATING → PUBLISHING → DONE</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">三位 Agent</div><h2>权限分离，让每个判断更干净</h2></div></header>
+      <div class="content grid-3">
+        <article class="card accent-cyan">
+          <h3>破壁_枢纽</h3>
+          <p>战略协调者。创建 SelectionBrief，发布最终研报，写入选品公共日记本。</p>
+        </article>
+        <article class="card accent-green">
+          <h3>破壁_鹰眼</h3>
+          <p>研究取证员。只负责调用 ProductSelector，产出最小可判断证据包。</p>
+        </article>
+        <article class="card accent-amber">
+          <h3>破壁_熔炉</h3>
+          <p>证据审判员。零工具运行，只读 raw，做 Hard Gates、四分制和终态裁决。</p>
+        </article>
+      </div>
+      <footer><span>后端负责状态流转、锁、回环、归档和数学安全阀</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">记忆能力</div><h2>公共日记本是系统的长期选品脑</h2></div></header>
+      <div class="content grid-2">
+        <article class="card accent-cyan">
+          <h3>它记什么</h3>
+          <ul class="list">
+            <li>[淘汰] 最近失败方向与具体死因</li>
+            <li>[待观察] 预筛过线但本轮未深挖的机会</li>
+            <li>[经验] 跨产品可复用的避坑规则和成功模式</li>
+          </ul>
+        </article>
+        <article class="card accent-amber">
+          <h3>它不是什么</h3>
+          <ul class="list">
+            <li>不是销量、PPC、CVR、FBA 的证据来源</li>
+            <li>不能替代本轮 ProductSelector 取证</li>
+            <li>不能把一个月前的失败永久拉黑整个大类</li>
+          </ul>
+        </article>
+      </div>
+      <footer><span>记忆入口：选品公共日记本 + TagMemo + AIMemo</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">记忆的作用</div><h2>三位 Agent 使用记忆的方式不同</h2></div></header>
+      <div class="content matrix">
+        <div class="head">角色</div><div class="head">使用记忆</div><div class="head">边界</div><div class="head">系统收益</div>
+        <div>枢纽</div><div>选方向、避重复、重拾待观察</div><div>不凭记忆推荐</div><div>Brief 更少撞旧坑</div>
+        <div>鹰眼</div><div>决定先查哪里、何时早停</div><div>数据必须来自本轮工具</div><div>取证更省成本</div>
+        <div>熔炉</div><div>识别历史风险模式，转成 Kill Criteria</div><div>Hard Gate 必须回指 raw</div><div>裁决更稳健</div>
+      </div>
+      <footer><span>[淘汰] 看最近一个月；[经验] 永久参考；[待观察] 是机会池，不是命令清单</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">策略创建</div><h2>枢纽先把“模糊选品”变成可验证 Brief</h2></div></header>
+      <div class="content grid-2">
+        <article class="card accent-blue">
+          <h3>输入</h3>
+          <ul class="list">
+            <li>Strategy Profile 自动注入</li>
+            <li>公共日记本历史经验</li>
+            <li>当前 run_id 与宽泛探索规则</li>
+          </ul>
+        </article>
+        <article class="card accent-cyan">
+          <h3>输出</h3>
+          <ul class="list">
+            <li>研究假设、目标场景、目标客户</li>
+            <li>2-3 个真正不同的候选方向</li>
+            <li>英文种子词、价格带、排除红线</li>
+            <li>给鹰眼的 Level-1 / Level-2 取证任务</li>
+          </ul>
+        </article>
+      </div>
+      <footer><span>枢纽提出假设，不直接做商业推荐</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">鹰眼取证</div><h2>先便宜横扫，再只深挖最优方向</h2></div></header>
+      <div class="content decision">
+        <article class="card accent-cyan">
+          <span class="big-number">L1</span>
+          <h3>方向体检</h3>
+          <p>关键词需求、转化率、产品选品、类目收敛、可比标杆初判。</p>
+        </article>
+        <article class="card accent-green">
+          <span class="big-number">L2</span>
+          <h3>候选验证</h3>
+          <p>竞品、FBA 样本、反查词、商品页、评论痛点，只给有潜力方向；可比性缺口要做 ≥2 个真同类标杆平行反查。</p>
+        </article>
+        <article class="card accent-amber">
+          <span class="big-number">L3</span>
+          <h3>回环补采</h3>
+          <p>只补熔炉指定字段，保留旧 raw，禁止泛泛“继续调研”。</p>
+        </article>
+      </div>
+      <footer><span>目标：Min Evidence Pack，而不是堆满不可读数据</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">可比性</div><h2>不能让错误标杆污染经济性结论</h2></div></header>
+      <div class="content grid-2">
+        <article class="card accent-red">
+          <h3>风险</h3>
+          <p>Top ASIN 可能只是流量高，但形态、价格带、成熟度都不可比。拿它当标杆会高估自然流量和广告容错。</p>
+        </article>
+        <article class="card accent-green">
+          <h3>守卫</h3>
+          <p>鹰眼输出 <code>comparable_anchors</code>，熔炉禁止使用 <code>not_comparable</code> 标杆进入综合分；自然流量红利不能单锚自证。</p>
+        </article>
+      </div>
+      <div style="height:28px"></div>
+      <div class="formula">anchor_reverse_verified = ≥2 个真同类 comparable ASIN 反查共同支撑</div>
+      <footer><span>争议 Top1 不能作为唯一证据；细分类目 nodeIdPath 用来补足同类盘面</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">熔炉审判</div><h2>先 Hard Gates，再输出四类分数</h2></div></header>
+      <div class="content grid-2">
+        <article class="card accent-red">
+          <h3>Hard Gates 一票否决</h3>
+          <ul class="list">
+            <li>侵权、医疗补剂、服装鞋帽、禁售</li>
+            <li>超大件、重货、高认证、高售后</li>
+            <li>负贡献利润、资金不可承受</li>
+          </ul>
+        </article>
+        <article class="card accent-blue">
+          <h3>人工验证项不等于硬门</h3>
+          <ul class="list">
+            <li>BOM 询价、专利排雷、真人打样</li>
+            <li>Seller Central FBA 最终实测</li>
+            <li>写入 Next Validation Plan 与 Kill Criteria</li>
+          </ul>
+        </article>
+      </div>
+      <footer><span>RECOMMEND = 值得进入人工验证 / 立项验证，不是直接下单生产</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">四分制</div><h2>把“机会好不好”拆成三个问题和一个排序</h2></div></header>
+      <div class="content grid-4">
+        <article class="card accent-cyan"><h3>OpportunityScore</h3><p>市场本身有没有机会：需求、增长、差异化、进入窗口。</p></article>
+        <article class="card accent-amber"><h3>DataReliabilityScore</h3><p>我们有多确定：来源、样本、字段完整、多源一致。</p></article>
+        <article class="card accent-green"><h3>ExecutionFitScore</h3><p>小卖家能不能做：资金、供应链、上架、售后、迭代。</p></article>
+        <article class="card accent-blue"><h3>FinalScore</h3><p>熔炉业务排序参考分，用于推荐档位和报告表达。</p></article>
+      </div>
+      <footer><span>市场不错但关键假设未闭合，且有正期权价值，才进入待观察</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">后端棱镜</div><h2>代码层安全阀：五支柱加权几何平均</h2></div></header>
+      <div class="content">
+        <div class="score-bars">
+          <div class="score-bar"><span>Demand</span><div class="track"><div class="fill" style="width:82%"></div></div><span>0.25</span></div>
+          <div class="score-bar"><span>Competition</span><div class="track"><div class="fill" style="width:70%"></div></div><span>0.20</span></div>
+          <div class="score-bar"><span>Profit</span><div class="track"><div class="fill" style="width:64%"></div></div><span>0.25</span></div>
+          <div class="score-bar"><span>Differentiation</span><div class="track"><div class="fill" style="width:76%"></div></div><span>0.18</span></div>
+          <div class="score-bar"><span>Execution</span><div class="track"><div class="fill" style="width:68%"></div></div><span>0.12</span></div>
+        </div>
+        <div style="height:30px"></div>
+        <div class="formula">Opportunity = WeightedGeoMean(五支柱) × 合规软降权</div>
+      </div>
+      <footer><span>几何平均修复旧版“多个中等分相乘后坍缩”的问题</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">利润与广告</div><h2>系统看的是单件贡献利润，不是热度</h2></div></header>
+      <div class="content grid-2">
+        <article class="card accent-cyan">
+          <h3>UnitContribution</h3>
+          <p>售价 - 平台佣金 - BOM - 头程 - FBA - 包装 - 退货预留 - 优惠券 - 仓储预留。</p>
+        </article>
+        <article class="card accent-red">
+          <h3>保守压力测试</h3>
+          <p>SellerSprite CVR 会折减；PPC 会放大；广告派生字段失真时降置信，不单独硬淘汰。</p>
+        </article>
+      </div>
+      <div style="height:28px"></div>
+      <div class="formula">paid_traffic_ratio &lt; 0.60 只接受 anchor_reverse_verified + ≥2 个 source_asins</div>
+      <footer><span>单锚、不可比 ASIN、或无 basis 下调都会被钳回 0.60 并标失真</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">卖家优势</div><h2>Listing 场景代入能力被显式数学化</h2></div></header>
+      <div class="content grid-2">
+        <article class="card accent-green">
+          <h3>适合放大</h3>
+          <p>摆件、玩具、礼品、家居氛围、强场景图能影响购买决策的产品。</p>
+        </article>
+        <article class="card accent-blue">
+          <h3>不适合放大</h3>
+          <p>锤子、线缆、替换件、规格和功能主导的产品，Listing 优势有限。</p>
+        </article>
+      </div>
+      <div style="height:28px"></div>
+      <div class="formula">diff_effective = diff_base + L × seller_skill × (1 - diff_base) × gain</div>
+      <footer><span>熔炉输出 listing_leverage_score；后端用它影响差异化支柱</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">区间决策</div><h2>不是单点切割，而是点估计 ± 不确定带</h2></div></header>
+      <div class="content decision">
+        <article class="card accent-red">
+          <span class="big-number">&lt; 42</span>
+          <h3>乐观都不及格</h3>
+          <p>预算内 DROP_AND_RESELECT；硬门永远优先。</p>
+        </article>
+        <article class="card accent-amber">
+          <span class="big-number">中间</span>
+          <h3>交给业务裁决</h3>
+          <p>由熔炉 verdict 决定推荐或待观察；WATCHLIST 只给有正期权价值且关键假设未闭合的方向。</p>
+        </article>
+        <article class="card accent-green">
+          <span class="big-number">≥ 62</span>
+          <h3>悲观也过线</h3>
+          <p>熔炉 RECOMMEND 可以成立，进入人工验证。</p>
+        </article>
+      </div>
+      <footer><span>后端防误杀、防数学错误；中间区间不静默淘汰，但也不自动塞进观察池</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">回环守卫</div><h2>回环只补关键缺口，禁止无限研究</h2></div></header>
+      <div class="content grid-2">
+        <article class="card accent-green">
+          <h3>允许</h3>
+          <ul class="list">
+            <li>Critical Gap 或最多一次 Important Gap</li>
+            <li>指定字段、工具、关键词或 ASIN</li>
+            <li>高价值候选缺 ≥2 个真同类标杆反查证据</li>
+          </ul>
+        </article>
+        <article class="card accent-red">
+          <h3>禁止</h3>
+          <ul class="list">
+            <li>同字段已补采，或已在 unfetchable_gaps</li>
+            <li>只写“继续调研”但没有具体请求</li>
+            <li>超过 global / scout 回环上限</li>
+          </ul>
+        </article>
+      </div>
+      <footer><span>广告洗白类失真无法回环治愈时，终局降档为待观察发布</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">推荐档位</div><h2>强度写入 recommendation_tier，不扩展 verdict</h2></div></header>
+      <div class="content matrix">
+        <div class="head">熔炉 FinalScore</div><div class="head">verdict</div><div class="head">展示档位</div><div class="head">含义</div>
+        <div>65 - 74</div><div>RECOMMEND</div><div>可以尝试</div><div>轻量可行动</div>
+        <div>75 - 84</div><div>RECOMMEND</div><div>推荐</div><div>值得立项验证</div>
+        <div>≥ 85</div><div>RECOMMEND</div><div>强烈推荐</div><div>机会与执行都强</div>
+        <div>≥ 85 + 后端点估 ≥ 75</div><div>RECOMMEND</div><div>极力推荐</div><div>业务与数学双强</div>
+      </div>
+      <footer><span>WATCHLIST = 有正期权价值但关键假设未闭合；BLOCKED / DATA_INSUFFICIENT 是阻断类展示</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">最终研报</div><h2>给人看的不是一个分数，而是一条证据链</h2></div></header>
+      <div class="content grid-2">
+        <article class="card accent-cyan">
+          <h3>必须并列展示</h3>
+          <ul class="list">
+            <li>熔炉业务四分</li>
+            <li>后端棱镜点估计与区间</li>
+            <li>利润、CVR、PPC、CPA 压力测试</li>
+            <li>recommendation_tier.display 中文强度</li>
+          </ul>
+        </article>
+        <article class="card accent-amber">
+          <h3>必须给出行动边界</h3>
+          <ul class="list">
+            <li>缺口与假设</li>
+            <li>可比 / 不可比标杆与自一致检查</li>
+            <li>Kill Criteria</li>
+            <li>Next Validation Plan</li>
+            <li>本轮淘汰记录与经验标签</li>
+          </ul>
+        </article>
+      </div>
+      <footer><span>报告用于“下一步怎么验证”，不是让读者盲信单一分数</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">记忆复利</div><h2>每一轮结束，系统都会变得更不重复</h2></div></header>
+      <div class="content">
+        <ul class="list">
+          <li><strong>[淘汰]</strong> 记录具体死因和已试关键词，让下轮避开重复探测。</li>
+          <li><strong>[待观察]</strong> 保存过线但未深挖方向，让下轮优先重拾机会池。</li>
+          <li><strong>[经验]</strong> 沉淀跨产品规律，例如重量、退货、认证、广告倒挂阈值。</li>
+          <li><strong>Tag 行</strong> 把状态、产品核心词、死因或机会标签变成可检索入口。</li>
+        </ul>
+      </div>
+      <footer><span>这就是 agent 记忆对整套系统的真实作用：降重复、提早停、稳裁决、促收敛</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">系统边界</div><h2>它负责高置信参考，不负责替你承担商业风险</h2></div></header>
+      <div class="content grid-3">
+        <article class="card accent-green"><h3>能做</h3><p>快速筛掉明显不适合方向，浮现值得人工验证的机会。</p></article>
+        <article class="card accent-amber"><h3>要谨慎</h3><p>SellerSprite 广告派生字段、冷门长尾词、自然流量假设。</p></article>
+        <article class="card accent-red"><h3>仍需人工</h3><p>BOM 询价、专利排雷、真人打样、Seller Central 最终 FBA 实测。</p></article>
+      </div>
+      <footer><span>系统的强项是把“该验证什么”讲清楚</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">演示收束</div><h2>可以这样讲给团队听</h2></div></header>
+      <div class="content">
+        <ul class="list">
+          <li>枢纽负责把策略与记忆转成可抓取 Brief。</li>
+          <li>鹰眼负责用最少工具拿到可判断证据，并显式标记可比 / 不可比标杆。</li>
+          <li>熔炉负责业务裁决，先硬门再四分，再做 self_consistency_check。</li>
+          <li>后端棱镜负责数学审计、区间决策、回环守卫，以及广告洗白降档。</li>
+          <li>公共日记本负责把每轮结果变成下轮可召回的经验。</li>
+        </ul>
+      </div>
+      <footer><span>一句话：让选品从“灵感 + 表格”变成“证据 + 记忆 + 安全阀”</span></footer>
+    </section>
+
+    <section class="slide">
+      <header><div><div class="kicker">资料来源</div><h2>本演示稿依据的本地文件</h2></div></header>
+      <div class="content source-list">
+        <div><code>Plugin/AutoProductSelection/SELECTION_LOGIC.md</code>：业务逻辑、取证分层、评分与回环规则。</div>
+        <div><code>Plugin/AutoProductSelection/SCORING_MODEL.md</code>：v3《棱镜》数学模型、五支柱、区间决策。</div>
+        <div><code>Agent/破壁_枢纽.txt</code>：Brief、发帖、日记沉淀与记忆纪律。</div>
+        <div><code>Agent/破壁_鹰眼.txt</code>：ProductSelector 取证、可比标杆、Min Evidence Pack。</div>
+        <div><code>Agent/破壁_熔炉.txt</code>：Hard Gates、四分制、Listing 杠杆、自一致检查。</div>
+        <div><code>Plugin/AutoProductSelection/AutoProductSelection.js</code>：状态机、后端派发、发布注入、记忆汇总。</div>
+      </div>
+      <footer><span>结束</span></footer>
+    </section>
+  </main>
+
+  <div class="progress" aria-hidden="true"><span id="progress"></span></div>
+
+  <script>
+    const slides = Array.from(document.querySelectorAll('.slide'));
+    const progress = document.getElementById('progress');
+    let index = 0;
+
+    function buildFooter(slide, i) {
+      const footer = slide.querySelector('footer');
+      if (!footer || footer.dataset.ready) return;
+      const left = footer.firstElementChild || document.createElement('span');
+      if (!footer.firstElementChild) footer.appendChild(left);
+      const controls = document.createElement('div');
+      controls.className = 'controls';
+      controls.innerHTML = `
+        <button type="button" aria-label="上一页" data-action="prev">‹</button>
+        <span class="tiny">${i + 1} / ${slides.length}</span>
+        <button type="button" aria-label="下一页" data-action="next">›</button>
+      `;
+      footer.appendChild(controls);
+      footer.dataset.ready = 'true';
+    }
+
+    slides.forEach(buildFooter);
+
+    function show(next) {
+      index = Math.max(0, Math.min(slides.length - 1, next));
+      slides.forEach((slide, i) => slide.classList.toggle('active', i === index));
+      progress.style.width = `${((index + 1) / slides.length) * 100}%`;
+      history.replaceState(null, '', `#${index + 1}`);
+    }
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
+        event.preventDefault();
+        show(index + 1);
+      }
+      if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
+        event.preventDefault();
+        show(index - 1);
+      }
+      if (event.key === 'Home') show(0);
+      if (event.key === 'End') show(slides.length - 1);
+    });
+
+    document.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-action]');
+      if (!button) return;
+      show(index + (button.dataset.action === 'next' ? 1 : -1));
+    });
+
+    const hashIndex = Number(String(location.hash).replace('#', '')) - 1;
+    show(Number.isFinite(hashIndex) ? hashIndex : 0);
+  </script>
+</body>
+</html>

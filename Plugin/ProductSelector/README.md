@@ -318,8 +318,12 @@
 - `seller_count`
 - `category_top`
 - `category_path`
+- `category_en_path`
+- `category_cn_path`
 - `category_node_id_path`
 - `category_top_node_id`
+- `category_match_source`
+- `category_match_confidence`
 
 ### 关键词选品保留字段
 

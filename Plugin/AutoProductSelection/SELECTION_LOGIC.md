@@ -46,8 +46,8 @@ Brief 应包含：
 
 鹰眼分三层取证：
 
-- Level 1：方向体检。优先关键词选品、关键词转化率、产品/竞品表。
-- Level 2：候选验证。仅当 Level 1 有潜力时补关键词反查、Amazon 商品页和评论。
+- Level 1：方向体检。优先关键词选品、关键词转化率、产品/竞品表。当方向是具体形态、或种子词天然跨类目时，先用 `search_sellersprite_categories` 取细分类目 `nodeIdPath` 再做产品选品/查竞品，从源头把盘面收敛到同类产品（这是抬高标杆可比性的最廉价手段；`nodeIdPaths` 只对产品选品/查竞品有效，且必须由该命令解析、不得自拼）。并基于已抓到的 `candidate_products` 字段（形态/标题、价格带、`review_count`/`putaway_date` 成熟度）廉价产出 `comparable_anchors` 候选清单：从证据里筛出与目标方向**真正同类**（形态、价格带、经营成熟度都可比）的 ASIN，并**反向标记**那些被引用为 Top/标杆但其实不可比的 ASIN。这一步只做判断、不做关键词反查。
+- Level 2：候选验证。仅当 Level 1 有潜力时补关键词反查、Amazon 商品页和评论。当熔炉通过 `loopback_request` 指出可比性证据缺口时，本层对 **≥2 个**真同类标杆（不含想被推翻的争议 Top1）做定向关键词反查，平行验证自然/广告流量结构。
 - Level 3：回环补采。只补熔炉指定字段，保留旧 raw，合并写回。
 
 空数据规则：
@@ -74,6 +74,8 @@ Brief 应包含：
 ## 熔炉评分输出
 
 熔炉必须先 Hard Gates，再评分。四个分数必须同时输出，不能只输出总分。
+
+引用任何 ASIN 作为赛道结论的证据前，熔炉要先确认它与目标方向可比；被标为 `not_comparable` 的 ASIN 不得作为经济性基准。出 verdict 前，熔炉还要做一次 `self_consistency_check`：主动扫描“是否存在被自己否定（如承认不可比、承认数据冲突）却又被采用进综合分的证据”。这是路径无关的最后一道保险——发现矛盾即在 `self_consistency_check.conflicts` 列出并置 `passed: false`，后端会据此触发回环。
 
 ### 0. Hard Gates
 
@@ -200,9 +202,30 @@ ExecutionFitScore =
 这意味着：
 
 - 机会高但 ProductSelector 可抓的关键证据仍然弱，不能直接 `RECOMMEND`，通常进入 `WATCHLIST` 或具体回环。
-- 数据可靠但机会弱，可以终态 `REJECT` 或观察发布。
+- 数据可靠但机会弱，应终态 `REJECT` / `DROP_AND_RESELECT`；只有具备正期权价值且有明确翻盘假设时才发布观察。
 - 市场不错但小卖家做不动，不能 `RECOMMEND`。
-- 平庸但不确定的方向不应静默淘汰，通常发布为 WATCHLIST 供人工验证。
+- `WATCHLIST` 不是“不能推荐就先放着”的缓冲池。它只用于：无 Hard Gate、无证实负贡献利润、仍有正期权价值，但缺少一个会显著改变结论的关键证据；必须写明升级条件与淘汰条件。
+
+### 5. verdict 三态与推荐强度
+
+底层 `verdict` 只保留三态：
+
+- `RECOMMEND`：可行动，进入人工验证/立项验证。
+- `WATCHLIST`：待观察，具备正期权价值但关键假设未闭合。
+- `REJECT` / `DATA_INSUFFICIENT`：阻断，硬红线、负贡献、系统性不可评估或机会弱且无翻盘假设。
+
+推荐强度不扩展 verdict，而写入 `recommendation_tier`：
+
+| 条件 | verdict | tier label | 中文 |
+|------|---------|------------|------|
+| `FinalScore 65-74` | `RECOMMEND` | `CAN_TRY` | 可以尝试 |
+| `FinalScore 75-84` | `RECOMMEND` | `RECOMMEND` | 推荐 |
+| `FinalScore >=85` | `RECOMMEND` | `STRONG_RECOMMEND` | 强烈推荐 |
+| `FinalScore >=85` 且后端 `point_estimate >=75` | `RECOMMEND` | `TOP_RECOMMEND` | 极力推荐 |
+| 有正期权价值但关键假设未闭合 | `WATCHLIST` | `WATCHLIST` | 待观察 |
+| 阻断类 | `REJECT` / `DATA_INSUFFICIENT` | `BLOCKED` / `DATA_INSUFFICIENT` | 阻断 / 数据不足 |
+
+后端发布层会读取该字段；若熔炉漏写，后端会按 `FinalScore` 与棱镜 `point_estimate` 兜底推导展示强度。数学算法本身不因 tier 改变。
 
 ## 后端数学安全阀
 
@@ -320,6 +343,10 @@ stress_ad_ratio = blended_stress_cpa / UnitContribution
 estimated_acos = base_cpa / selling_price
 ```
 
+`paid_traffic_ratio` 采用非对称证据规则：保守默认（0.60）免费，但**调低它是乐观动作**——它会摊薄每单广告成本，足以把倒挂的 `base_ad_ratio` 洗成健康值。因此只有当熔炉给出 `paid_traffic_ratio_basis: anchor_reverse_verified`、且 `source_asins` 列出**≥2 个互不相同、都标可比**的真同类标杆反查证据（不能只用想被推翻的争议 Top1 一个）时，后端才接受低于默认的 `paid_traffic_ratio`；否则后端会把它**钳回保守默认 0.60** 并记一条失真信号。数值无论写成扁平 `paid_traffic_ratio` 还是嵌套在 `paid_traffic_ratio_basis.value`，后端都会读到；单锚自证、或拿争议 Top1 当唯一证据，都视同无证据。换句话说，“自然流量红利”这类乐观叙事必须有 ≥2 个真同类反查支撑，不能自证。
+
+当出现多个口径的 `base_ad_ratio`（保守 CVR 口径、行业派生口径、对标反证口径）时，后端综合取**最保守值**（最高倒挂）进入模型，而不是允许挑乐观值；多口径极差过大（如最高/最低 > 2x）本身就是失真信号，会降低数据置信度。
+
 如果：
 
 ```text
@@ -371,6 +398,15 @@ complexity_severity: 0-10，用于补算 market_entry 和 execution_fit
 ```
 
 `compliance_risk >= 9` 会被后端视作 Hard Gate。
+
+### 失真与自相矛盾安全网
+
+`data_distortion_suspected` 命中后会下调数据置信度，并让 `RECOMMEND` 在预算内回环补一次干净证据，而不是直接发布。它覆盖两类信号：
+
+- **数值异常**（原有）：成本/PPC/CPA 超过售价、`click_conversion_rate` 异常偏高（>40%）或偏低（<0.2%）、`acos` 异常偏高（>150%）。
+- **内部逻辑自相矛盾**（新增）：研报自己否定却仍采用的证据，例如熔炉 `self_consistency_check.passed: false`、`comparable_anchors` 中存在 `not_comparable` 标杆却被当作经济性基准、无 `anchor_reverse_verified` 证据（或证据不足 ≥2 个可比标杆）却下调 `paid_traffic_ratio`、多口径 `base_ad_ratio` 极差过大。
+
+第二类是本系统从“数据本身异常”扩展到“推导链自相矛盾”的关键：一份承认证据不可比却仍据此立项的研报，即便每个数字都在合理区间，也会被识别为失真并触发回环。其中“广告洗白”子类（钳回 `paid_traffic_ratio` 或可比性矛盾）若已无法回环治愈（预算耗尽或强制裁决），终局会被**降档为 WATCHLIST 发布**，发帖与日记都按观察口径，而不是按 RECOMMEND 强发——这是“运动员/裁判分离”的最后一道闸，专门兜住本次 Solar Lantern 这种“单锚自证 + force_decision 强出推荐”的翻车。
 
 ## 后端注入字段
 
@@ -444,18 +480,18 @@ warnings:
 当 `post_forge_action.action = PUBLISH_FINAL` 时：
 
 - Hard Gate 触发：改成 `DROP_AND_RESELECT`。
-- `data_distortion_suspected=true` 且 `verdict=RECOMMEND`：优先 `LOOPBACK_TO_HAWKEYE` 补一次干净数据；若重选预算耗尽则终态发布谨慎报告。
+- `data_distortion_suspected=true` 且 `verdict=RECOMMEND`：优先 `LOOPBACK_TO_HAWKEYE` 补一次干净/可比数据；无法再回环时（预算耗尽或强制裁决），普通数值失真终态发布谨慎报告，“广告洗白”子类（钳回 `paid_traffic_ratio`／可比性矛盾）终态**降档为 WATCHLIST 发布**。
 - `optimistic_score < APS_SCORE_DROP_CEILING`（默认 42）：连乐观估计都不及格，才允许 `DROP_AND_RESELECT`；若熔炉已选择 `WATCHLIST` / `RESEARCH_GAP` / `DATA_INSUFFICIENT` 这类终态谨慎裁决，则维持发布。
 - `pessimistic_score >= APS_SCORE_RECOMMEND_FLOOR`（默认 62）：悲观估计也过线，熔炉的 `RECOMMEND` 可以成立。
-- 其余中间区间：`PUBLISH_FINAL`，作为观察/人工验证报告浮现，不静默淘汰。
+- 其余中间区间：`PUBLISH_FINAL`，由熔炉 verdict 决定推荐或待观察；若是 `WATCHLIST`，必须具备正期权价值与明确升级/淘汰条件，不静默淘汰。
 
 因此：
 
-- `WATCHLIST` 可以发布观察报告。
+- `WATCHLIST` 可以发布观察报告，但仅限有正期权价值的方向。
 - `RESEARCH_GAP` 可以发布数据缺口报告。
 - `DATA_INSUFFICIENT` 可以发布阻断报告。
 - 硬红线和证实负贡献利润不能发布为 `RECOMMEND`。
-- 广告压力偏高但贡献利润为正时是软风险，通常把裁决拉向 `WATCHLIST` 或扩大区间不确定性，而不是直接 DROP。
+- 广告压力偏高但贡献利润为正时是软风险，可把有机会价值的方向拉向 `WATCHLIST` 或扩大区间不确定性；若机会弱且无翻盘假设，应淘汰而不是进入观察池。
 
 ## 回环守卫
 
@@ -464,6 +500,8 @@ warnings:
 - 只用于 Critical Gap 或最多一次 Important Gap。
 - 必须输出具体 `loopback_request`。
 - 必须指定字段、工具、关键词或 ASIN。
+
+“高价值候选缺真同类标杆反查证据”是一类合法的 Critical Gap：当方向已进入候选 `RECOMMEND` 区间，但经济性结论依赖一个未经真同类反查证成的乐观假设（典型是下调 `paid_traffic_ratio` 的“自然流量红利”叙事，或 Top 标杆被标为 `not_comparable`）时，值得回环让鹰眼 Level 2 反查 **≥2 个可比标杆**（平行验证，不含想被推翻的争议 Top1）。低价值候选不触发回环，直接用保守默认值降档为观察。这就是按候选价值分流、控制工具调用成本的混合策略。注意：单锚自证不构成证据，且即便靠 `force_decision` 强行收口，后端也会把这类“广告洗白”终局降档为 WATCHLIST，而不是放它以 RECOMMEND 发布。
 
 禁止回环：
 

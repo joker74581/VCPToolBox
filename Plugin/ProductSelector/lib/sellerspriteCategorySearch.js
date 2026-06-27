@@ -34,6 +34,10 @@ function normalizeText(value) {
     .trim();
 }
 
+function normalizeCompactText(value) {
+  return normalizeText(value).replace(/\s+/g, '');
+}
+
 function splitPath(value) {
   return String(value || '')
     .split('>')
@@ -75,6 +79,8 @@ function loadCategoryIndex() {
         _normalizedCnPath: normalizeText(item.cnPath),
         _normalizedLeafEn: normalizeText(leafEn),
         _normalizedLeafCn: normalizeText(leafCn),
+        _compactEnPath: normalizeCompactText(item.enPath),
+        _compactCnPath: normalizeCompactText(item.cnPath),
         _searchable: searchable,
         _topSearchable: normalizeText(`${item.topEn || ''} ${item.topCn || ''} ${item.topNodeId || ''}`)
       };
@@ -241,6 +247,136 @@ function searchSellerSpriteCategories(options = {}) {
   };
 }
 
+function toCategoryCandidate(category, rank = 1, extra = {}) {
+  return {
+    rank,
+    nodeId: category.nodeId,
+    nodeIdPath: category.nodeIdPath,
+    enPath: category.enPath,
+    cnPath: category.cnPath,
+    depth: category.depth,
+    isLeaf: category.isLeaf,
+    productCount: category.productCount,
+    topCategory: {
+      nodeId: category.topNodeId,
+      en: category.topEn,
+      cn: category.topCn
+    },
+    ...extra
+  };
+}
+
+function resolveSellerSpriteCategoryPath(options = {}) {
+  const enPath = String(options.enPath || options.en_path || '').trim();
+  const cnPath = String(options.cnPath || options.cn_path || '').trim();
+  const query = String(options.query || options.text || '').trim();
+  const topCategory = options.topCategory || options.top_category || options.categories || options.category;
+  const index = loadCategoryIndex();
+  const warnings = [];
+
+  const normalizedEn = normalizeText(enPath);
+  const normalizedCn = normalizeText(cnPath);
+  const compactEn = normalizeCompactText(enPath);
+  const compactCn = normalizeCompactText(cnPath);
+  const normalizedQuery = normalizeText(query);
+  const compactQuery = normalizeCompactText(query);
+  const nodeIdPath = String(options.nodeIdPath || options.node_id_path || options.categoryNodeIdPath || '').trim();
+
+  if (!normalizedEn && !normalizedCn && !normalizedQuery && !nodeIdPath) {
+    return {
+      success: false,
+      command: 'resolve_sellersprite_category_path',
+      error: 'Missing category path text. Pass enPath/cnPath, nodeIdPath, or query.',
+      warnings
+    };
+  }
+
+  const candidates = [];
+  for (const category of index.categories) {
+    if (!matchesTopCategory(category, topCategory)) continue;
+    let match = null;
+    let confidence = 0;
+
+    if (nodeIdPath && category.nodeIdPath === nodeIdPath) {
+      match = 'node_id_path_exact';
+      confidence = 1;
+    } else if (nodeIdPath && category.nodeId === nodeIdPath) {
+      match = 'node_id_exact';
+      confidence = 0.98;
+    } else if (normalizedEn && category._normalizedEnPath === normalizedEn) {
+      match = 'en_path_exact';
+      confidence = 1;
+    } else if (normalizedCn && category._normalizedCnPath === normalizedCn) {
+      match = 'cn_path_exact';
+      confidence = 1;
+    } else if (compactEn && category._compactEnPath === compactEn) {
+      match = 'en_path_compact_exact';
+      confidence = 0.98;
+    } else if (compactCn && category._compactCnPath === compactCn) {
+      match = 'cn_path_compact_exact';
+      confidence = 0.98;
+    } else if (normalizedQuery && (category._normalizedEnPath === normalizedQuery || category._normalizedCnPath === normalizedQuery)) {
+      match = 'query_path_exact';
+      confidence = 0.95;
+    } else if (compactQuery && (category._compactEnPath === compactQuery || category._compactCnPath === compactQuery)) {
+      match = 'query_path_compact_exact';
+      confidence = 0.93;
+    }
+
+    if (!match) continue;
+    candidates.push({ category, match, confidence });
+  }
+
+  candidates.sort((a, b) =>
+    b.confidence - a.confidence ||
+    Number(b.category.isLeaf === true) - Number(a.category.isLeaf === true) ||
+    Number(b.category.productCount || 0) - Number(a.category.productCount || 0)
+  );
+
+  if (candidates.length === 0) {
+    warnings.push('No exact SellerSprite category path match was found. Fall back to search_sellersprite_categories with a product-shape query.');
+    return {
+      success: false,
+      command: 'resolve_sellersprite_category_path',
+      enPath: enPath || undefined,
+      cnPath: cnPath || undefined,
+      nodeIdPath: nodeIdPath || undefined,
+      query: query || undefined,
+      topCategory: topCategory || undefined,
+      category: null,
+      warnings
+    };
+  }
+
+  const winner = candidates[0];
+  if (candidates.length > 1) {
+    warnings.push(`Multiple exact category matches found (${candidates.length}); selected the strongest leaf/product-count match.`);
+  }
+
+  return {
+    success: true,
+    command: 'resolve_sellersprite_category_path',
+    enPath: enPath || undefined,
+    cnPath: cnPath || undefined,
+    nodeIdPath: nodeIdPath || undefined,
+    query: query || undefined,
+    topCategory: topCategory || undefined,
+    category: toCategoryCandidate(winner.category, 1, {
+      match: {
+        type: winner.match,
+        confidence: winner.confidence
+      }
+    }),
+    alternatives: candidates.slice(1, 5).map((item, index) => toCategoryCandidate(item.category, index + 2, {
+      match: {
+        type: item.match,
+        confidence: item.confidence
+      }
+    })),
+    warnings
+  };
+}
+
 function getSellerSpriteCategoryIndexInfo() {
   const index = loadCategoryIndex();
   return {
@@ -254,5 +390,6 @@ function getSellerSpriteCategoryIndexInfo() {
 
 module.exports = {
   searchSellerSpriteCategories,
+  resolveSellerSpriteCategoryPath,
   getSellerSpriteCategoryIndexInfo
 };

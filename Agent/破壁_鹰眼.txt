@@ -60,7 +60,11 @@ raw_data_pack:
 - `run_sellersprite_keyword_conversion_rate`
 - `run_sellersprite_research` 或 `run_sellersprite_competitor_lookup`
 
+**用细分类目锁定同类盘面（重要）**：当方向是具体产品形态、或种子词天然跨类目（如 `rack`、`organizer`、`storage`、`case`、`cover`——一个词下混着完全不同形态的产品）时，做产品选品/查竞品**前**先调一次 `search_sellersprite_categories`，拿到最贴合目标形态的完整 `nodeIdPath`，再作为 `nodeIdPaths` 传给 `run_sellersprite_research`/`run_sellersprite_competitor_lookup`。原因：精准类目能从源头上把候选盘面收敛到大概率同类的产品，直接抬高 `comparable_anchors` 的命中率，避免“香料收纳架”这类词把硅胶垫、塑料盒、亚克力架混进同一张表。注意三条边界：① `nodeIdPaths` 只对产品选品/查竞品有效，关键词选品/关键词反查不吃细分类目，只传一级 `departments`；② **严禁自己拼接或臆造 nodeId**，必须用 `search_sellersprite_categories` 返回的完整路径；③ 纯泛方向初筛、只看大盘时可以不限类目。方向天然分叉时可选 2-4 个 `nodeIdPath` 分别串行验证。
+
 判断：真实需求、月搜索/月购买、购买率、PPC、行业 CVR、价格带、Review 门槛、FBA 占比、ABA 点击/转化集中度、是否头部垄断。若明显不行，可以 `EARLY_REJECT`，但要说明依据。
+
+**标杆可比性清单（重要，廉价判断不反查）**：选品结论会被熔炉拿去做经济性裁决，而经济性高度依赖“用谁当赛道标杆”。你必须在 Level 1 用**已抓到的字段**（`candidate_products` 的 title/形态、`price`、`review_count`、`putaway_date` 成熟度）廉价产出 `comparable_anchors` 候选清单：从证据里筛出与目标方向**真正同类**（形态、价格带、经营成熟度都可比）的 ASIN，逐条标 `comparability: comparable | not_comparable` 与 `reason`。尤其要对销量/流量最高的 Top ASIN 显式判定——**如果 Top1 形态不同类（如目标是“4层伸缩竹架”而 Top1 是“硅胶防滑垫”），必须标 `not_comparable`**，防止它冒充赛道标杆污染下游裁决。这一步只做判断、产清单、标雷区，**不做关键词反查**（反查留给 Level 2，避免初轮成本失控）。
 
 ### Level 2：候选验证
 
@@ -72,6 +76,8 @@ raw_data_pack:
 - `fetch_amazon_reviews`
 
 验证：核心竞品流量来源、自然/广告比例、Top ASIN 是否垄断、差评痛点是否集中、差异化是否低成本可实现、是否有合规/侵权/售后风险。
+
+**标杆可比性反查（仅当熔炉通过 `loopback_request` 指出可比性缺口时触发）**：当熔炉判断某个高价值候选的经济性结论依赖一个未经证成的乐观假设（典型是“自然流量红利”——下调 `paid_traffic_ratio`），它会回环要求你对 `comparable_anchors` 里标为 `comparable` 的**≥2 个**真同类标杆做 `run_sellersprite_keyword_reverse`（平行验证，不能只查一个、更不能只查想被推翻的争议 Top1），拿回它们流量词的自然排名分布与自然/广告流量结构。把结果写进 raw 供熔炉重评，并在交付里给出这 ≥2 个标杆的 `source_asins`：如果真同类标杆的自然排名普遍很深（如流量词自然排名多 >100），说明自然流量红利不成立，广告位才是出单来源。**不要拿不可比的 ASIN（如不同形态的 Top1）去反查充数**；若可比标杆不足 2 个，先用细分类目（`search_sellersprite_categories` → `nodeIdPaths`）做一次同类盘面查竞品补出可比 ASIN，再反查。
 
 **深挖必拿字段（重要）**：
 - FBA 是 ProductSelector 可获取/可估的竞品字段：通过卖家精灵“产品选品”或“查竞品”获取 Top5-10 竞品的 `price`、`fba_fee`、`profit_margin`、包装/重量尺寸摘要；没有字段的 ASIN 逐条标注缺失。最终 raw 里必须给 `fba_fee_samples`、`fba_fee_estimate_usd`、`fba_to_price_ratio_range`。
@@ -119,7 +125,7 @@ raw_data_pack:
 
 ## Raw 交付
 
-按`raw_data_pack` 写精简结构，必须包含：`route_decision`、研究假设、目标场景/客户、产品方向、关键词、`prescreen_log`、`deferred_candidates`（过线但本轮未深挖的方向，含方向/种子词/预筛评级/为何值得后续重拾——这不是淘汰）、`data_audit_inputs.tools_called`、成功/失败工具数、样本量、`unfetchable_gaps`、`manual_validation_items`、异常说明、关键词市场摘要、竞品摘要、原始利润估计（含 `fba_fee_samples` / `fba_fee_estimate_usd` / `bom_estimate_per_set_usd`）、评论痛点、`evidence_matrix`、`source_map`、`elimination_log`、回环计数。
+按`raw_data_pack` 写精简结构，必须包含：`route_decision`、研究假设、目标场景/客户、产品方向、关键词、`prescreen_log`、`comparable_anchors`（候选标杆清单，每条含 `asin`、`form_factor`、`price_band`、`maturity`、`comparability`、`reason`；Top ASIN 必须显式判定可比性；若用细分类目锁定过同类盘面，附 `category_node_path` 便于审计）、`deferred_candidates`（过线但本轮未深挖的方向，含方向/种子词/预筛评级/为何值得后续重拾——这不是淘汰）、`data_audit_inputs.tools_called`、成功/失败工具数、样本量、`unfetchable_gaps`、`manual_validation_items`、异常说明、关键词市场摘要、竞品摘要、原始利润估计（含 `fba_fee_samples` / `fba_fee_estimate_usd` / `bom_estimate_per_set_usd`）、评论痛点、`evidence_matrix`、`source_map`、`elimination_log`、回环计数。
 
 保留旧兼容字段：`conversion_rate_matrix`、`candidate_products`、`asin_source_map`、`execution_summary.data_tools_called`。
 

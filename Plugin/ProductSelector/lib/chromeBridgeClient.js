@@ -570,6 +570,94 @@ class ChromeBridgeClient {
         return rows;
       }
 
+      function findExpandedProductRow(row) {
+        let cursor = row?.nextElementSibling || null;
+        for (let i = 0; cursor && i < 3; i++) {
+          if (cursor.querySelector?.('.el-table__expanded-cell, .table-expand, .card-expand, .product-type')) {
+            return cursor;
+          }
+          cursor = cursor.nextElementSibling;
+        }
+        return null;
+      }
+
+      function extractNodeIdPathFromHref(href) {
+        if (!href) return '';
+        try {
+          const url = new URL(href, location.href);
+          const direct = url.searchParams.get('nodeIdPath');
+          if (direct) return cleanText(direct);
+          const paths = url.searchParams.get('nodeIdPaths');
+          if (!paths) return '';
+          try {
+            const parsed = JSON.parse(paths);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              return cleanText(parsed[parsed.length - 1]);
+            }
+          } catch (_) {
+            const match = paths.match(/\\d+(?::\\d+)*/g);
+            return match && match.length > 0 ? match[match.length - 1] : '';
+          }
+        } catch (_) {
+          const direct = String(href).match(/[?&]nodeIdPath=([^&#]+)/);
+          if (direct) return decodeURIComponent(direct[1]);
+          const paths = String(href).match(/[?&]nodeIdPaths=([^&#]+)/);
+          if (paths) {
+            const decoded = decodeURIComponent(paths[1]);
+            const match = decoded.match(/\\d+(?::\\d+)*/g);
+            return match && match.length > 0 ? match[match.length - 1] : '';
+          }
+        }
+        return '';
+      }
+
+      function extractCategorySegmentsFromLinks(container) {
+        if (!container) return [];
+        return Array.from(container.querySelectorAll('a[href*="nodeIdPaths"], a.type'))
+          .map(anchor => cleanText(anchor.innerText || anchor.textContent || ''))
+          .filter(text => text && !/BS榜单|新品榜|市场分析|找相似|查专利|Tiktok|1688|Alibaba/i.test(text));
+      }
+
+      function extractCnCategorySegments(container) {
+        if (!container) return [];
+        const text = cleanText(container.innerText || container.textContent || '')
+          .replace(/^中文类目名\\s*[:：]?\\s*/i, '');
+        if (!text) return [];
+        return text.split(/\\s+/).map(item => item.trim()).filter(Boolean);
+      }
+
+      function extractSellerSpriteCategoryData(row) {
+        const expandedRow = findExpandedProductRow(row);
+        const scope = expandedRow || row;
+        if (!scope) return {};
+
+        const productType = scope.querySelector('.product-type');
+        const cnType = scope.querySelector('.product-type-cn');
+        const categoryLinks = Array.from(scope.querySelectorAll('a[href*="nodeIdPaths"], a[href*="nodeIdPath="]'));
+        const nodeIdPath = categoryLinks
+          .map(anchor => extractNodeIdPathFromHref(anchor.getAttribute('href') || anchor.href || ''))
+          .filter(Boolean)
+          .sort((a, b) => b.length - a.length)[0] || '';
+        const enSegments = extractCategorySegmentsFromLinks(productType);
+        const cnSegments = extractCnCategorySegments(cnType);
+        const result = {};
+        if (enSegments.length > 0) {
+          result.category_path = enSegments.join(' > ');
+          result.category_en_path = result.category_path;
+          result.category_top = enSegments[0];
+        }
+        if (cnSegments.length > 0) {
+          result.category_cn_path = cnSegments.join(' > ');
+        }
+        if (nodeIdPath) {
+          result.category_node_id_path = nodeIdPath;
+          result.category_top_node_id = nodeIdPath.split(':')[0] || '';
+          result.category_match_source = 'dom_breadcrumb_href';
+          result.category_match_confidence = 1;
+        }
+        return result;
+      }
+
       function buildRow(row, index, headers) {
         const cells = getVisibleCells(row);
         const values = cells.length > 0
@@ -622,6 +710,8 @@ class ChromeBridgeClient {
         if (badges.length > 0) {
           data.badges = badges;
         }
+        const categoryData = extractSellerSpriteCategoryData(row);
+        Object.assign(data, categoryData);
         row.querySelectorAll('[data-keyword], [data-asin], [data-clipboard]').forEach(element => {
           const keyword = element.getAttribute('data-keyword');
           const asin = element.getAttribute('data-asin');

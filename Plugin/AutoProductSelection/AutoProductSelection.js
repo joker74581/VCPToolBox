@@ -3161,6 +3161,22 @@ async function advanceEvaluating(runId) {
     return;
   }
 
+  if (action === 'PUBLISH_AS_WATCHLIST') {
+    // Terminal downgrade: a RECOMMEND whose economics rest on an unproven ad wash
+    // (optimistic paid_traffic_ratio / comparability contradiction) that can no longer
+    // be cured by a loopback. Rewrite the verdict to WATCHLIST in the scored file so the
+    // publisher and diary reflect the downgrade, then publish. Evidence/verdict separation.
+    try {
+      const downgraded = downgradeVerdictToWatchlist(scoredContent, scoreResults.distortionSignals);
+      await autoSelectionWriteRunFile({ stage: 'scored', run_id: runId, content: downgraded, overwrite: true, action: 'PUBLISH_FINAL' });
+    } catch (e) {
+      logWorkflowEvent(`[StateMachine] ${runId}: WATCHLIST 降档写回失败(${e.message})，仍按 WATCHLIST 发布。`);
+    }
+    await commitTransition(state, APS_STATE.PUBLISHING, `decided PUBLISH as WATCHLIST (ad-wash downgrade, score ${scoreResults.totalScore})`);
+    await advancePublishing(runId);
+    return;
+  }
+
   if (action === 'LOOPBACK_TO_HAWKEYE') {
     const counters = parseLoopbackCounters(scoredContent);
     const guard = evaluateLoopbackGuard(scoredContent, rawContent, counters);
@@ -3242,21 +3258,24 @@ async function advancePublishing(runId) {
     scoredContent = '(无法读取 scored 文件)';
   }
 
-  const verdictEn = String(extractScalarValue(scoredContent, 'verdict') || 'WATCHLIST').trim().toUpperCase();
+  const verdictEn = String(extractFinalVerdict(scoredContent) || extractScalarValue(scoredContent, 'verdict') || 'WATCHLIST').trim().toUpperCase();
+  const tier = extractRecommendationTier(scoredContent, verdictEn, calculateScoringModel(scoredContent));
   const verdictMap = {
-    'ACCEPTED': '推荐立项',
-    'RECOMMEND': '推荐立项',
-    'WATCHLIST': '列入观察',
+    'ACCEPTED': '推荐',
+    'RECOMMEND': '推荐',
+    'WATCHLIST': '待观察',
     'REJECTED': '不予立项',
     'DROP': '不予立项',
     'DATA_INSUFFICIENT': '数据不足'
   };
-  const verdictZh = verdictMap[verdictEn] || verdictEn;
+  const verdictZh = tier.display || verdictMap[verdictEn] || verdictEn;
 
   const prompt = `你好，破壁_枢纽。一个选品 run 已通过后端裁决，需要你发布研报并写日记。
 请务必严格遵守你的系统提示词中关于报告结构、发帖规范与日记沉淀格式的要求。
 
 【本轮裁决结论】：${verdictZh}
+【底层 verdict】：${verdictEn}
+【推荐强度 tier】：${tier.label}${tier.basis ? `（${tier.basis}）` : ''}
 
 ==================================================
 【系统自动加载的 Scored 研报数据（无需调用工具读取，直接以此为准）】：
@@ -3276,8 +3295,8 @@ run_id: ${runId}
    【两套分数分口径并列展示（重要）】scored 数据里含两套互补的分数，研报必须分别标注、并列呈现，不要混为一谈：
    - **后端棱镜分（纯数学口径）**：来自 backend_math_scoring.v3_interval_decision 的 point_estimate 点估计与置信区间 [pessimistic_score, optimistic_score]。这是代码层冷血高效的几何平均结果，标题“综合 XX/100（区间 YY-ZZ）”取自这里。
    - **熔炉评审分（业务口径）**：来自熔炉 scored_candidate_pack 的 OpportunityScore / DataReliabilityScore / ExecutionFitScore / FinalScore。这是在棱镜数学之上多加一层业务判断的结果。
-   - 两者角度不同、可能不完全一致，这是正常的；请各自标注口径来源，让读者看到“数学怎么算”和“评审怎么判”两个视角。最终中文裁决（${verdictZh}）以熔炉裁决为准。
-   - 裁决语义必须保持一致：推荐立项 = 当前工具链证据足够好，值得进入人工验证/立项验证；列入观察 = ProductSelector 可抓关键证据缺失/冲突或核心假设仍会显著改变结论。BOM 询价、USPTO/专利排雷、真人打样、Seller Central 最终 FBA 实测未完成时，只能写入 Next Validation Plan / Kill Criteria，不得写“因此定档观察而非推荐”。
+   - 两者角度不同、可能不完全一致，这是正常的；请各自标注口径来源，让读者看到“数学怎么算”和“评审怎么判”两个视角。底层 verdict 以熔炉裁决为准；标题强度（${verdictZh}）来自 recommendation_tier 或后端兜底推导。
+   - 裁决语义必须保持一致：可以尝试/推荐/强烈推荐/极力推荐 = 当前工具链证据足够好，值得进入人工验证/立项验证；待观察 = 有正期权价值，但 ProductSelector 可抓关键证据缺失/冲突或核心假设仍会显著改变结论。BOM 询价、USPTO/专利排雷、真人打样、Seller Central 最终 FBA 实测未完成时，只能写入 Next Validation Plan / Kill Criteria，不得写“因此定档观察而非推荐”。
 
 3. 写入选品公共日记本（DailyNote.create）。内容必须极致精简，严格按照系统提示词中规定的 [${verdictZh}] 产品方向 - 核心原因 极简格式以及 Tag 尾行规则进行，确保传入 Date 参数。
 
@@ -3536,7 +3555,9 @@ async function delegateToCoordinator(taskType, runId, prompt) {
       agent_name: '破壁_枢纽',
       prompt: finalPrompt,
       temporary_contact: false,
-      task_delegation: taskType === 'create_brief',
+      // Coordinator jobs must be background delegations. Synchronous publish/blocking
+      // calls can hold the workflow driver until forum/diary tool work finishes.
+      task_delegation: true,
       inject_tools: taskType === 'create_brief' ? '' : 'VCPForum,DailyNote'
     });
 
@@ -3832,6 +3853,54 @@ function costFromRateOrDefault(content, rateKeys = [], sellingPrice = 0, default
   return sellingPrice * defaultRate;
 }
 
+function findFirstStringField(content, keys = [], defaultValue = '') {
+  // Pull a short scalar string value (enum / flag) such as paid_traffic_ratio_basis.
+  for (const key of keys) {
+    const regex = new RegExp(`\\b${escapeRegExp(key)}\\s*:\\s*['"]?([A-Za-z0-9_\\-]+)`, 'i');
+    const match = String(content || '').match(regex);
+    if (match && match[1]) return match[1].trim();
+  }
+  return defaultValue;
+}
+
+function extractFieldBlock(content, key, maxChars = 600) {
+  // Grab a bounded window starting right after `key:`. Used to read INTO a nested mapping
+  // (e.g. paid_traffic_ratio_basis:\n  value: 0.45\n  source_asins: [...]) that the
+  // reviewer emits as an object rather than the flat scalar the legacy parser expected.
+  const text = String(content || '');
+  const m = text.match(new RegExp(`\\b${escapeRegExp(key)}\\s*:`, 'i'));
+  if (!m) return '';
+  const start = m.index + m[0].length;
+  return text.slice(start, start + maxChars);
+}
+
+function countSourceAnchors(content) {
+  // Count DISTINCT source ASINs declared under source_asins (inline array or block list).
+  // Parallel verification means ≥2 distinct same-category anchors; a single anchor
+  // (especially the contested Top1 itself) is not enough to wash an upside-down ad ratio.
+  const block = extractFieldBlock(content, 'source_asins', 300);
+  if (!block) return 0;
+  const stop = block.search(/\n\s*[A-Za-z_][A-Za-z0-9_]*\s*:/);
+  const scoped = stop > 0 ? block.slice(0, stop) : block;
+  const asins = scoped.match(/\bB[0-9A-Z]{9}\b/gi) || [];
+  return new Set(asins.map(a => a.toUpperCase())).size;
+}
+
+function findAllNumbersForKey(content, key) {
+  // Every parsed occurrence of a field (raw magnitude, no percent heuristic), used to
+  // detect multiple base_ad_ratio口径 so the backend can take the most conservative
+  // (most upside-down) value and flag a wide spread as a distortion signal.
+  const values = [];
+  const regex = new RegExp(`\\b${escapeRegExp(key)}\\s*:\\s*['"]?([^\\r\\n#'"]+)`, 'gi');
+  const text = String(content || '');
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    const num = parseMetricValue(match[1]);
+    if (num !== null && Number.isFinite(num)) values.push(num);
+  }
+  return values;
+}
+
 function normalizeScore100WithAudit(value, defaultValue, fieldName, audit = []) {
   const n = Number(value);
   if (!Number.isFinite(n)) return clampNumber(defaultValue);
@@ -4001,6 +4070,79 @@ function extractFinalVerdict(content = '') {
   const match = text.match(/final_disposition[\s\S]{0,600}?\bverdict\s*:\s*['"]?([A-Z_]+)['"]?/i) ||
     text.match(/\bverdict\s*:\s*['"]?(RECOMMEND|WATCHLIST|RESEARCH_GAP|REJECT|DATA_INSUFFICIENT)['"]?/i);
   return match?.[1] ? String(match[1]).trim().toUpperCase() : '';
+}
+
+function extractRecommendationTier(content = '', verdict = '', scoreResults = null) {
+  const text = String(content || '');
+  const displayMap = {
+    CAN_TRY: '可以尝试',
+    RECOMMEND: '推荐',
+    STRONG_RECOMMEND: '强烈推荐',
+    TOP_RECOMMEND: '极力推荐',
+    WATCHLIST: '待观察',
+    BLOCKED: '阻断',
+    DATA_INSUFFICIENT: '数据不足'
+  };
+  const normalizeLabel = value => {
+    const label = String(value || '').trim().toUpperCase();
+    return displayMap[label] ? label : '';
+  };
+
+  const explicitLabel =
+    normalizeLabel(text.match(/recommendation_tier[\s\S]{0,260}?\blabel\s*:\s*['"]?([A-Z_]+)/i)?.[1]) ||
+    normalizeLabel(text.match(/\brecommendation_tier_label\s*:\s*['"]?([A-Z_]+)/i)?.[1]);
+  const explicitDisplay =
+    text.match(/recommendation_tier[\s\S]{0,260}?\bdisplay\s*:\s*['"]?([^\r\n#'"]+)/i)?.[1]?.trim() ||
+    text.match(/\brecommendation_tier_display\s*:\s*['"]?([^\r\n#'"]+)/i)?.[1]?.trim() ||
+    '';
+  if (explicitLabel) {
+    return {
+      label: explicitLabel,
+      display: explicitDisplay || displayMap[explicitLabel],
+      basis: '熔炉显式输出'
+    };
+  }
+
+  const normalizedVerdict = String(verdict || extractFinalVerdict(text) || '').trim().toUpperCase();
+  if (normalizedVerdict === 'WATCHLIST' || normalizedVerdict === 'RESEARCH_GAP') {
+    return { label: 'WATCHLIST', display: displayMap.WATCHLIST, basis: 'verdict=WATCHLIST' };
+  }
+  if (normalizedVerdict === 'DATA_INSUFFICIENT') {
+    return { label: 'DATA_INSUFFICIENT', display: displayMap.DATA_INSUFFICIENT, basis: 'verdict=DATA_INSUFFICIENT' };
+  }
+  if (normalizedVerdict === 'REJECT' || normalizedVerdict === 'REJECTED' || normalizedVerdict === 'DROP') {
+    return { label: 'BLOCKED', display: displayMap.BLOCKED, basis: 'verdict=REJECT' };
+  }
+
+  const finalScore = findFirstNumber(text, ['FinalScore', 'final_score'], scoreResults?.totalScore ?? null);
+  const backendPoint = scoreResults?.pointEstimate ?? findFirstNumber(text, ['point_estimate'], null);
+  if (normalizedVerdict === 'RECOMMEND' || normalizedVerdict === 'ACCEPTED') {
+    if (finalScore >= 85 && backendPoint >= 75) {
+      return { label: 'TOP_RECOMMEND', display: displayMap.TOP_RECOMMEND, basis: `FinalScore ${Math.round(finalScore)} + backend ${Math.round(backendPoint)}` };
+    }
+    if (finalScore >= 85) return { label: 'STRONG_RECOMMEND', display: displayMap.STRONG_RECOMMEND, basis: `FinalScore ${Math.round(finalScore)}` };
+    if (finalScore >= 75) return { label: 'RECOMMEND', display: displayMap.RECOMMEND, basis: `FinalScore ${Math.round(finalScore)}` };
+    if (finalScore >= 65) return { label: 'CAN_TRY', display: displayMap.CAN_TRY, basis: `FinalScore ${Math.round(finalScore)}` };
+    return { label: 'WATCHLIST', display: displayMap.WATCHLIST, basis: `FinalScore ${Math.round(finalScore)} <65` };
+  }
+  return { label: 'WATCHLIST', display: displayMap.WATCHLIST, basis: 'fallback' };
+}
+
+function downgradeVerdictToWatchlist(content = '', signals = []) {
+  // Force the published verdict / tier from RECOMMEND to WATCHLIST when the backend could
+  // not cure an ad-wash distortion. Rewrites the reviewer's own RECOMMEND tokens so the
+  // forum post + diary reflect WATCHLIST, and prepends an auditable downgrade note.
+  let text = String(content || '');
+  const reason = (signals && signals.length) ? signals.join('；') : '广告经济性依赖未经证成的乐观假设';
+  text = text
+    .replace(/(\bverdict\s*:\s*['"]?)RECOMMEND(['"]?)/gi, `$1WATCHLIST$2`)
+    .replace(/(\brecommendation_tier\s*:\s*[\s\S]{0,120}?\blabel\s*:\s*['"]?)(CAN_TRY|RECOMMEND|STRONG_RECOMMEND|TOP_RECOMMEND)(['"]?)/i, `$1WATCHLIST$3`)
+    .replace(/(\brecommendation_tier\s*:\s*[\s\S]{0,180}?\bdisplay\s*:\s*['"]?)(可以尝试|推荐|强烈推荐|极力推荐)(['"]?)/i, `$1待观察$3`);
+  const note = `\n# backend_terminal_downgrade: RECOMMEND -> WATCHLIST\n# reason: ${yamlString(reason)}\n# rule: 广告失真无法回环补采治愈时,终局降档为观察(运动员/裁判分离)。\n`;
+  // Drop the note right after the opening front-matter fence if present, else prepend.
+  const fence = text.match(/^---\r?\n/);
+  if (fence) return text.slice(0, fence[0].length) + note.trimStart() + text.slice(fence[0].length);
+  return note + text;
 }
 
 function detectHardGateFromContent(content = '', complianceRisk = 0) {
@@ -4266,12 +4408,75 @@ function calculateScoringModel(content) {
   // overstates ad cost and makes niche products look uneconomic. We assume only a
   // fraction of orders need a paid click (paid_traffic_ratio, default 0.6, overridable
   // via the raw field). The amortized ad cost per unit is CPA * paid_traffic_ratio.
-  const rawPaidRatio = findFirstRate(text, ['paid_traffic_ratio'], null);
-  const paidTrafficRatio = (rawPaidRatio !== null && rawPaidRatio > 0 && rawPaidRatio <= 1) ? rawPaidRatio : 0.6;
+  // The reviewer may emit the ratio flat (`paid_traffic_ratio: 0.45`) OR nested inside
+  // the basis object (`paid_traffic_ratio_basis:\n  value: 0.45`). Read both shapes —
+  // a shape mismatch must NOT let an unproven optimistic ratio slip through unflagged.
+  const basisBlock = extractFieldBlock(text, 'paid_traffic_ratio_basis', 400);
+  let rawPaidRatio = findFirstRate(text, ['paid_traffic_ratio'], null);
+  if (rawPaidRatio === null && basisBlock) {
+    rawPaidRatio = findFirstRate(basisBlock, ['value'], null);
+  }
+  const PAID_RATIO_DEFAULT = 0.6;
+  const PAID_RATIO_MIN_ANCHORS = 2;
+  // Asymmetric evidence rule. Keeping the conservative default (0.6) is free; LOWERING
+  // it is an optimistic move (it shrinks amortized ad cost and can wash an upside-down
+  // base_ad_ratio into a "healthy" one). A lower ratio is only trustworthy when it is
+  // backed by REAL same-category anchor reverse-lookups — and by PARALLEL verification:
+  // at least PAID_RATIO_MIN_ANCHORS distinct source ASINs, not the single contested Top1.
+  // The basis token is matched as a substring so reviewer variants like
+  // "anchor_reverse_verified_conservative" still count; but the anchor COUNT is what
+  // actually gates the optimistic value. Without that proof the backend clamps back to
+  // the conservative default and flags a contradiction, so a "natural-traffic dividend"
+  // narrative can never be self-asserted (or single-anchor-asserted) into a RECOMMEND.
+  let paidRatioBasis = findFirstStringField(text, ['paid_traffic_ratio_basis'], '').toLowerCase();
+  if ((!paidRatioBasis || paidRatioBasis === 'value') && basisBlock) {
+    paidRatioBasis = findFirstStringField(basisBlock, ['classification', 'basis'], '').toLowerCase();
+  }
+  const anchorCount = countSourceAnchors(text);
+  const basisClaimsAnchor = paidRatioBasis.includes('anchor_reverse_verified');
+  const paidRatioEvidenceBacked = basisClaimsAnchor && anchorCount >= PAID_RATIO_MIN_ANCHORS;
+  let paidTrafficRatio;
+  if (rawPaidRatio !== null && rawPaidRatio > 0 && rawPaidRatio <= 1) {
+    if (rawPaidRatio < PAID_RATIO_DEFAULT && !paidRatioEvidenceBacked) {
+      paidTrafficRatio = PAID_RATIO_DEFAULT;
+      const why = basisClaimsAnchor
+        ? `仅 ${anchorCount} 个真同类标杆反查（需≥${PAID_RATIO_MIN_ANCHORS} 个平行验证，且不能只用争议 Top1）`
+        : `缺少真同类标杆反查证据（paid_traffic_ratio_basis=${paidRatioBasis || '缺失'}≠anchor_reverse_verified）`;
+      distortionSignals.push(
+        `paid_traffic_ratio=${rawPaidRatio.toFixed(2)} 低于保守默认 ${PAID_RATIO_DEFAULT}，但${why}，已钳回保守默认值`
+      );
+    } else {
+      paidTrafficRatio = rawPaidRatio;
+    }
+  } else {
+    paidTrafficRatio = PAID_RATIO_DEFAULT;
+  }
   const blendedBaseCpa = baseCpa * paidTrafficRatio;
   const blendedStressCpa = stressCpa * paidTrafficRatio;
-  const baseAdRatio = estimatedUnitContribution > 0 ? blendedBaseCpa / estimatedUnitContribution : Infinity;
+  let baseAdRatio = estimatedUnitContribution > 0 ? blendedBaseCpa / estimatedUnitContribution : Infinity;
   const stressAdRatio = estimatedUnitContribution > 0 ? blendedStressCpa / estimatedUnitContribution : Infinity;
+
+  // Multi-口径 conservative selection. The reviewer may quote several base_ad_ratio
+  // figures (conservative-CVR口径, industry-derived口径, anchor-counter-evidence口径).
+  // Picking the optimistic one is exactly how this round was washed from 1.59 to 0.45.
+  // Take the MOST conservative (highest / most upside-down) value across the backend's
+  // own口径 and any the reviewer wrote, and treat a wide spread as a distortion signal.
+  const reportedAdRatios = findAllNumbersForKey(text, 'base_ad_ratio').filter(v => v > 0 && Number.isFinite(v));
+  if (reportedAdRatios.length) {
+    const candidates = [Number.isFinite(baseAdRatio) ? baseAdRatio : Math.max(...reportedAdRatios), ...reportedAdRatios];
+    const finiteCandidates = candidates.filter(v => Number.isFinite(v) && v > 0);
+    const mostConservative = Math.max(...finiteCandidates);
+    const mostOptimistic = Math.min(...finiteCandidates);
+    if (Number.isFinite(mostConservative) && mostConservative > baseAdRatio) {
+      baseAdRatio = mostConservative;
+    }
+    if (mostOptimistic > 0 && mostConservative / mostOptimistic > 2) {
+      distortionSignals.push(
+        `base_ad_ratio 多口径极差过大（${mostOptimistic.toFixed(2)}~${mostConservative.toFixed(2)}，>2x），` +
+        `已按最保守口径 ${mostConservative.toFixed(2)} 取值并降低置信度`
+      );
+    }
+  }
   // Ad-stress thresholds loosened: ad-economics inputs are the least reliable
   // SellerSprite fields, so a soft fail only annotates/downgrades — it never drops.
   const adStressTestFailed = stressAdRatio > 1.8 || baseAdRatio > 1.5;
@@ -4375,7 +4580,32 @@ function calculateScoringModel(content) {
     distortionSignals.push(`acos (${(reportedAcos * 100).toFixed(0)}%) 异常偏高，广告数据疑似失真，仅降权不淘汰`);
   }
 
+  // --- Internal logical contradiction (self-inconsistency) ---
+  // The original distortion net only covered *numeric* anomalies (a value out of a
+  // plausible range). This round failed a different way: the report ADMITTED its Top
+  // anchor was not comparable ("硅胶防滑垫" vs "4层伸缩竹架") yet still used its traffic
+  // structure as the basis for the whole verdict. That is a logic contradiction, not a
+  // bad number, so we treat it as a distortion signal too — routing RECOMMEND verdicts
+  // built on self-contradicting evidence back to a clean re-fetch instead of publishing.
+  if (/self_consistency_check[\s\S]{0,400}?\bpassed\s*:\s*false\b/i.test(text)) {
+    distortionSignals.push('熔炉 self_consistency_check.passed=false：存在被自己否定却仍被采用的证据');
+  }
+  // A not_comparable anchor present anywhere means the reviewer flagged at least one
+  // referenced ASIN as not同类. Combined with a lowered paid_traffic_ratio (the optimistic
+  // move that the asymmetric rule already guards) this is the exact contradiction pattern.
+  const hasNotComparableAnchor = /comparab(?:le|ility)\s*:\s*['"]?not_comparable/i.test(text);
+  if (hasNotComparableAnchor && !paidRatioEvidenceBacked && rawPaidRatio !== null && rawPaidRatio < PAID_RATIO_DEFAULT) {
+    distortionSignals.push('存在 not_comparable 标杆，却在无 anchor 反查证据下调低 paid_traffic_ratio：标杆可比性自相矛盾');
+  }
+
   const dataDistortionSuspected = distortionSignals.length > 0;
+  // The "ad wash" subset: distortion that specifically comes from an unproven attempt to
+  // lower paid_traffic_ratio or from comparability self-contradiction. This is the pattern
+  // that washes an upside-down base_ad_ratio into a healthy one. When it can no longer be
+  // cured by a loopback (budget spent / force_decision), the terminal verdict must be
+  // downgraded to WATCHLIST rather than published as RECOMMEND — evidence/verdict separation.
+  const adWashSuspected = distortionSignals.some(s =>
+    s.includes('paid_traffic_ratio') || s.includes('可比性') || s.includes('not_comparable'));
   if (dataDistortionSuspected) {
     // Distorted inputs are a reliability problem, not a verdict. Penalize
     // confidence so the score self-protects, but let the verdict path treat
@@ -4471,6 +4701,7 @@ function calculateScoringModel(content) {
     hardGateTriggered,
     adStressTestFailed,
     dataDistortionSuspected,
+    adWashSuspected,
     distortionSignals,
     mProfit,
     mProfitEffective,
@@ -4502,6 +4733,8 @@ function calculateScoringModel(content) {
     baseCpa,
     stressCpa,
     paidTrafficRatio,
+    paidTrafficRatioBasis: paidRatioBasis || 'default_conservative',
+    paidTrafficRatioEvidenceBacked: paidRatioEvidenceBacked,
     blendedBaseCpa,
     blendedStressCpa,
     estimatedAcos,
@@ -4537,15 +4770,22 @@ function decideBackendAction(originalAction, scoreResults, content = '', reselec
   // a possibly-good niche direction.
   if (scoreResults.dataDistortionSuspected) {
     if (verdict === 'RECOMMEND') {
-      // Don't publish a RECOMMEND built on distorted figures; try clean data once,
-      // unless the reselect budget is spent (then just publish the cautious result).
-      return budgetExhausted ? toTerminalPublish() : 'LOOPBACK_TO_HAWKEYE';
+      // A loopback can only cure this while we still have budget AND are not already
+      // locked into force_decision. Once we must terminate, an "ad wash" (an unproven
+      // optimistic paid_traffic_ratio / comparability contradiction) can never be
+      // published as RECOMMEND — downgrade it to WATCHLIST (evidence/verdict separation).
+      // Plain numeric distortion that survives to terminal is published cautiously as-is.
+      const mustTerminate = budgetExhausted || forceDecision;
+      if (scoreResults.adWashSuspected) {
+        return mustTerminate ? 'PUBLISH_AS_WATCHLIST' : 'LOOPBACK_TO_HAWKEYE';
+      }
+      return mustTerminate ? toTerminalPublish() : 'LOOPBACK_TO_HAWKEYE';
     }
     if (['WATCHLIST', 'RESEARCH_GAP', 'DATA_INSUFFICIENT', 'REJECT'].includes(verdict)) {
       return action;
     }
     // No clear verdict + distortion: re-fetch once rather than drop (budget permitting).
-    return budgetExhausted ? toTerminalPublish() : 'LOOPBACK_TO_HAWKEYE';
+    return (budgetExhausted || forceDecision) ? toTerminalPublish() : 'LOOPBACK_TO_HAWKEYE';
   }
 
   // --- v3 interval decision -------------------------------------------------
@@ -4656,6 +4896,8 @@ function updateScoredContentWithMath(content, scoreResults, action, originalActi
     `    base_cpa: ${scoreResults.baseCpa.toFixed(2)}`,
     `    stress_cpa: ${scoreResults.stressCpa.toFixed(2)}`,
     `    paid_traffic_ratio: ${scoreResults.paidTrafficRatio.toFixed(2)}`,
+    `    paid_traffic_ratio_basis: ${scoreResults.paidTrafficRatioBasis}`,
+    `    paid_traffic_ratio_evidence_backed: ${scoreResults.paidTrafficRatioEvidenceBacked === true}`,
     `    blended_base_cpa: ${scoreResults.blendedBaseCpa.toFixed(2)}`,
     `    blended_stress_cpa: ${scoreResults.blendedStressCpa.toFixed(2)}`,
     `    estimated_acos: ${scoreResults.estimatedAcos.toFixed(4)}`,

@@ -161,7 +161,12 @@ keywords:「始」mushroom lamp「末」
     - *BB (BuyBox 卖家)*: 当前获得 BuyBox 黄金购物车的卖家名称及所属国家/地区。
     - *LQS*: Listing 质量得分（LQS，满分 10 分）。
     - *属性 / 包装*: 商品实际入库重量与尺寸大小分段，以及含包装的规格属性（决定 FBA 配送费的基准）。
-13. **类目**: 商品所属的顶层大类名或底层完整类目路径。
+13. **类目**: 商品所属的顶层大类名或底层完整类目路径。若页面提供“浏览同类目”/“浏览该类目商品”/“中文类目名”，插件会尝试映射到本地 SellerSprite 类目索引，并返回 `category_path`、`category_en_path`、`category_cn_path`、`category_node_id_path`、`category_top_node_id`、`category_match_source`、`category_match_confidence`。鹰眼可用 `category_node_id_path` 反核对并二次锁定同类盘面。
+
+### 类目反核对字段
+- `category_match_source=dom_breadcrumb_href` 或 `node_id_path_exact` 表示路径来自 SellerSprite 展开行的类目链接/本地索引精确命中，可作为后续 `nodeIdPaths` 使用。
+- `category_match_confidence=1` 表示完整路径可精确对应本地 `sellersprite-category-index.json`；低于 1 或 `dom_text_unresolved` 时，只能作为提示，需再用 `search_sellersprite_categories` 或人工核对。
+- 若需要单独验证某条 DOM 中的类目路径，可调用 `resolve_sellersprite_category_path`，传 `nodeIdPath`、`enPath` 或 `cnPath`，它不打开浏览器。
 
 完整 `candidates` JSON 默认不返回；如需字段级排障，传 `include_candidates=true` 或 `result_mode=debug/full`。
 
